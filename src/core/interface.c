@@ -288,6 +288,9 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         return -1;
 
     memset(p, 0, sizeof(*p));
+    p->wan_count = cfg->wan_count;
+    if (p->wan_count > MAX_INTERFACES)
+        p->wan_count = MAX_INTERFACES;
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
@@ -318,32 +321,37 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize,
                             &p->local.fq, &p->local.cq, &ucfg));
 
-    xdp_try_detach(if_nametoindex(cfg->locals[0].ifname), cfg->locals[0].ifname);
-    xdp_try_detach(if_nametoindex(cfg->wans[0].ifname), cfg->wans[0].ifname);
-
     NE_TRY(open_port(p, &p->local, cfg->locals[0].ifname));
-    NE_TRY(open_port(p, &p->wan, cfg->wans[0].ifname));
+    for (int i = 0; i < p->wan_count; i++)
+        NE_TRY(open_port(p, &p->wans[i], cfg->wans[i].ifname));
 
     struct bpf_program *local_prog = NULL;
-    struct bpf_program *wan_prog = NULL;
     struct bpf_map *local_map = NULL;
-    struct bpf_map *wan_map = NULL;
     NE_TRY(open_bpf_object(cfg->bpf_file, &p->bpf_local,
                            "xdp_redirect_prog", &local_prog, "xsks_map", &local_map));
-    NE_TRY(open_bpf_object(cfg->bpf_wan_file, &p->bpf_wan,
-                           "xdp_wan_redirect_prog", &wan_prog, "wan_xsks_map", &wan_map));
-    update_wan_fake_ethertype(p->bpf_wan, cfg->fake_ethertype_ipv4);
 
     NE_TRY(bpf_xdp_attach(p->local.ifindex, bpf_program__fd(local_prog), p->xdp_flags, NULL));
     p->xdp_local_on = 1;
-    NE_TRY(bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(wan_prog), p->xdp_flags, NULL));
-    p->xdp_wan_on = 1;
 
     NE_TRY(update_xsk_map(p->local.xsk, bpf_map__fd(local_map)));
-    NE_TRY(update_xsk_map(p->wan.xsk, bpf_map__fd(wan_map)));
 
-    prefill_port(p, &p->local, NE_RING / 2);
-    prefill_port(p, &p->wan, NE_RING / 2);
+    for (int i = 0; i < p->wan_count; i++) {
+        struct bpf_program *wan_prog = NULL;
+        struct bpf_map *wan_map = NULL;
+        NE_TRY(open_bpf_object(cfg->bpf_wan_file, &p->bpf_wans[i],
+                               "xdp_wan_redirect_prog", &wan_prog, "wan_xsks_map", &wan_map));
+        update_wan_fake_ethertype(p->bpf_wans[i], cfg->fake_ethertype_ipv4);
+        NE_TRY(bpf_xdp_attach(p->wans[i].ifindex, bpf_program__fd(wan_prog), p->xdp_flags, NULL));
+        p->xdp_wan_on[i] = 1;
+        NE_TRY(update_xsk_map(p->wans[i].xsk, bpf_map__fd(wan_map)));
+    }
+
+    uint32_t prefill = NE_N_FRAMES / (uint32_t)(p->wan_count + 2);
+    if (prefill == 0)
+        prefill = 1;
+    prefill_port(p, &p->local, prefill);
+    for (int i = 0; i < p->wan_count; i++)
+        prefill_port(p, &p->wans[i], prefill);
     return 0;
 
 fail:
@@ -356,16 +364,22 @@ void ne_pair_close(struct ne_pair *p)
 {
     if (!p)
         return;
-    if (p->xdp_wan_on)
-        bpf_xdp_detach(p->wan.ifindex, p->xdp_flags, NULL);
+    for (int i = 0; i < p->wan_count; i++) {
+        if (p->xdp_wan_on[i])
+            bpf_xdp_detach(p->wans[i].ifindex, p->xdp_flags, NULL);
+    }
     if (p->xdp_local_on)
         bpf_xdp_detach(p->local.ifindex, p->xdp_flags, NULL);
-    if (p->bpf_wan)
-        bpf_object__close(p->bpf_wan);
+    for (int i = 0; i < p->wan_count; i++) {
+        if (p->bpf_wans[i])
+            bpf_object__close(p->bpf_wans[i]);
+    }
     if (p->bpf_local)
         bpf_object__close(p->bpf_local);
-    if (p->wan.xsk)
-        xsk_socket__delete(p->wan.xsk);
+    for (int i = 0; i < p->wan_count; i++) {
+        if (p->wans[i].xsk)
+            xsk_socket__delete(p->wans[i].xsk);
+    }
     if (p->local.xsk)
         xsk_socket__delete(p->local.xsk);
     if (p->umem)
@@ -376,7 +390,7 @@ void ne_pair_close(struct ne_pair *p)
     memset(p, 0, sizeof(*p));
 }
 
-static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max, uint8_t dir)
+static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max, uint8_t dir, uint8_t wan_idx)
 {
     uint32_t idx = 0;
     uint32_t n = xsk_ring_cons__peek(&port->rx, max, &idx);
@@ -385,6 +399,7 @@ static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max, 
         out[i].addr = d->addr;
         out[i].len = d->len;
         out[i].dir = dir;
+        out[i].wan_idx = wan_idx;
     }
     port->rx_packets += n;
     return (int)n;
@@ -392,12 +407,21 @@ static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max, 
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 {
-    return recv_port(&p->local, out, max, NE_DIR_LOCAL);
+    return recv_port(&p->local, out, max, NE_DIR_LOCAL, 0);
 }
 
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 {
-    return recv_port(&p->wan, out, max, NE_DIR_WAN);
+    uint32_t total = 0;
+    memset(p->wan_rx_pending, 0, sizeof(p->wan_rx_pending));
+    for (int i = 0; i < p->wan_count && total < max; i++) {
+        int n = recv_port(&p->wans[i], out + total, max - total, NE_DIR_WAN, (uint8_t)i);
+        if (n > 0) {
+            p->wan_rx_pending[i] = (uint32_t)n;
+            total += (uint32_t)n;
+        }
+    }
+    return (int)total;
 }
 
 void ne_recv_release_local(struct ne_pair *p, uint32_t n)
@@ -408,8 +432,12 @@ void ne_recv_release_local(struct ne_pair *p, uint32_t n)
 
 void ne_recv_release_wan(struct ne_pair *p, uint32_t n)
 {
-    if (n)
-        xsk_ring_cons__release(&p->wan.rx, n);
+    (void)n;
+    for (int i = 0; i < p->wan_count; i++) {
+        if (p->wan_rx_pending[i])
+            xsk_ring_cons__release(&p->wans[i].rx, p->wan_rx_pending[i]);
+        p->wan_rx_pending[i] = 0;
+    }
 }
 
 static void drain_cq(struct ne_port *port, struct ne_pool *pool)
@@ -432,7 +460,8 @@ void ne_drain_cq_local(struct ne_pair *p)
 
 void ne_drain_cq_wan(struct ne_pair *p)
 {
-    drain_cq(&p->wan, &p->pool);
+    for (int i = 0; i < p->wan_count; i++)
+        drain_cq(&p->wans[i], &p->pool);
 }
 
 static void refill_fq(struct ne_port *port, struct ne_pool *pool)
@@ -462,7 +491,8 @@ void ne_refill_fq_local(struct ne_pair *p)
 
 void ne_refill_fq_wan(struct ne_pair *p)
 {
-    refill_fq(&p->wan, &p->pool);
+    for (int i = 0; i < p->wan_count; i++)
+        refill_fq(&p->wans[i], &p->pool);
 }
 
 static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max_frame)
@@ -502,7 +532,9 @@ int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src)
     return tx_drain_port(&p->local, src, p->frame_size);
 }
 
-int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src)
+int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
 {
-    return tx_drain_port(&p->wan, src, p->frame_size);
+    if (!p || wan_idx < 0 || wan_idx >= p->wan_count)
+        return 0;
+    return tx_drain_port(&p->wans[wan_idx], src, p->frame_size);
 }

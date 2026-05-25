@@ -5,12 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define AES128_KEY_SIZE       16
-#define AES256_KEY_SIZE       32
 #define AES_MAX_KEY_SIZE      32
-#define AES128_BLOCK_SIZE     16
 #define AES128_IV_SIZE        16
-#define AES128_ROUND_KEY_SIZE 256
 
 #define ETH_HEADER_SIZE       14
 

@@ -2,6 +2,7 @@
 #define FORWARDER_H
 
 #include "interface.h"
+#include "flow_table.h"
 
 struct forwarder {
     struct app_config *cfg;
@@ -14,8 +15,10 @@ struct forwarder {
     struct ne_pair pair;
     struct ne_ring local_to_mid;
     struct ne_ring wan_to_mid;
-    struct ne_ring mid_to_wan;
+    struct ne_ring mid_to_wan[MAX_INTERFACES];
     struct ne_ring mid_to_local;
+    struct flow_table wan_flow_table;
+    int wan_flow_table_ready;
 
     pthread_t local_thread;
     pthread_t mid_thread;

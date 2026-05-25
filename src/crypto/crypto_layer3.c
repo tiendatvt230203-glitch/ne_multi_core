@@ -6,7 +6,6 @@
 #define IPV4_HDR_SIZE      20
 #define IPV4_PROTO_OFF     (ETH_HEADER_SIZE + 9)
 #define IPV4_TOTLEN_OFF    (ETH_HEADER_SIZE + 2)
-#define IPV4_CKSUM_OFF     (ETH_HEADER_SIZE + 10)
 #define TCP_CKSUM_OFF      16
 #define UDP_CKSUM_OFF      6
 

@@ -181,6 +181,16 @@ static uint32_t get_dest_ip(void *pkt_data, uint32_t pkt_len)
     return dst_ip;
 }
 
+static void init_wan_flow_table(struct forwarder *fwd)
+{
+    uint32_t windows[MAX_INTERFACES];
+    memset(windows, 0, sizeof(windows));
+    for (int i = 0; i < fwd->wan_count; i++)
+        windows[i] = fwd->cfg->wans[i].window_size;
+    flow_table_init(&fwd->wan_flow_table, windows, fwd->wan_count);
+    fwd->wan_flow_table_ready = 1;
+}
+
 static int same_topology(const struct app_config *a, const struct app_config *b)
 {
     if (!a || !b)
@@ -189,8 +199,13 @@ static int same_topology(const struct app_config *a, const struct app_config *b)
         return 0;
     if (a->local_count <= 0 || a->wan_count <= 0)
         return 0;
-    return strcmp(a->locals[0].ifname, b->locals[0].ifname) == 0 &&
-           strcmp(a->wans[0].ifname, b->wans[0].ifname) == 0;
+    if (strcmp(a->locals[0].ifname, b->locals[0].ifname) != 0)
+        return 0;
+    for (int i = 0; i < a->wan_count; i++) {
+        if (strcmp(a->wans[i].ifname, b->wans[i].ifname) != 0)
+            return 0;
+    }
+    return 1;
 }
 
 static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
@@ -209,11 +224,13 @@ static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
     memcpy(iface->dst_mac, dst_mac, MAC_LEN);
 }
 
-static int set_wan_l2(struct forwarder *fwd, uint8_t *pkt)
+static int set_wan_l2(struct forwarder *fwd, int wan_idx, uint8_t *pkt)
 {
     if (config_wan_bridge_mode(fwd->cfg))
         return 0;
-    const struct wan_config *wan = &fwd->cfg->wans[0];
+    if (wan_idx < 0 || wan_idx >= fwd->wan_count)
+        return -1;
+    const struct wan_config *wan = &fwd->cfg->wans[wan_idx];
     if (memcmp(wan->dst_mac, "\0\0\0\0\0\0", MAC_LEN) == 0)
         return -1;
     memcpy(pkt, wan->dst_mac, MAC_LEN);
@@ -244,27 +261,32 @@ static int emit_owned(struct forwarder *fwd, struct ne_ring *dst, struct ne_pack
 
 static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
                                   uint32_t frag0_len,
-                                  const uint8_t *frag1, uint32_t frag1_len)
+                                  const uint8_t *frag1, uint32_t frag1_len,
+                                  int wan_idx)
 {
-    uint32_t used = ne_ring_count(&fwd->mid_to_wan);
-    if (used + 2 > fwd->mid_to_wan.cap)
+    if (wan_idx < 0 || wan_idx >= fwd->wan_count)
+        return -1;
+    struct ne_ring *tx = &fwd->mid_to_wan[wan_idx];
+    uint32_t used = ne_ring_count(tx);
+    if (used + 2 > tx->cap)
         return -1;
     if (frag0_len > fwd->pair.frame_size || frag1_len > fwd->pair.frame_size)
         return -1;
 
-    struct ne_packet tail = { .len = frag1_len, .dir = NE_DIR_WAN };
+    struct ne_packet tail = { .len = frag1_len, .dir = NE_DIR_WAN, .wan_idx = (uint8_t)wan_idx };
     if (ne_frame_alloc(&fwd->pair, &tail.addr) != 0)
         return -1;
 
     memcpy(ne_packet_data(&fwd->pair, tail.addr), frag1, frag1_len);
     job->len = frag0_len;
     job->dir = NE_DIR_WAN;
+    job->wan_idx = (uint8_t)wan_idx;
 
-    if (ne_ring_try_push(&fwd->mid_to_wan, job) != 0) {
+    if (ne_ring_try_push(tx, job) != 0) {
         ne_frame_free(&fwd->pair, tail.addr);
         return -1;
     }
-    if (ne_ring_try_push(&fwd->mid_to_wan, &tail) != 0) {
+    if (ne_ring_try_push(tx, &tail) != 0) {
         ne_frame_free(&fwd->pair, tail.addr);
         __sync_fetch_and_add(&fwd->total_dropped, 1);
         __sync_fetch_and_add(&fwd->dropped_ring_full, 1);
@@ -273,7 +295,7 @@ static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
 }
 
 static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
-                                   const struct crypto_policy *cp)
+                                   const struct crypto_policy *cp, int wan_idx)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t pkt_len = job->len;
@@ -286,9 +308,9 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
                                       pkt, pkt_len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, pkt) != 0 || set_wan_l2(fwd, f2) != 0)
+        if (set_wan_l2(fwd, wan_idx, pkt) != 0 || set_wan_l2(fwd, wan_idx, f2) != 0)
             return -1;
-        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2) != 0)
+        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2, wan_idx) != 0)
             return -1;
         sent_split = 1;
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(pkt_len)) {
@@ -298,9 +320,9 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
                                    pkt, pkt_len, fwd->pair.frame_size, &l1,
                                    f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, pkt) != 0 || set_wan_l2(fwd, f2) != 0)
+        if (set_wan_l2(fwd, wan_idx, pkt) != 0 || set_wan_l2(fwd, wan_idx, f2) != 0)
             return -1;
-        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2) != 0)
+        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2, wan_idx) != 0)
             return -1;
         sent_split = 1;
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L4 && frag_need_split_l4(pkt_len)) {
@@ -310,9 +332,9 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
                                       pkt, pkt_len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, pkt) != 0 || set_wan_l2(fwd, f2) != 0)
+        if (set_wan_l2(fwd, wan_idx, pkt) != 0 || set_wan_l2(fwd, wan_idx, f2) != 0)
             return -1;
-        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2) != 0)
+        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2, wan_idx) != 0)
             return -1;
         sent_split = 1;
     }
@@ -332,6 +354,35 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
     return sent_split ? 1 : 0;
 }
 
+static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
+                                uint32_t src_ip, uint32_t dst_ip,
+                                uint16_t src_port, uint16_t dst_port,
+                                uint8_t proto, uint32_t pkt_len)
+{
+    if (!fwd || fwd->wan_count <= 0)
+        return -1;
+    if (profile_idx >= 0 && profile_idx < fwd->cfg->profile_count) {
+        struct profile_config *p = &fwd->cfg->profiles[profile_idx];
+        if (p->wan_count > 0) {
+            int wan_idx;
+            if (flow_ok && fwd->wan_flow_table_ready) {
+                wan_idx = flow_table_get_wan_profile(&fwd->wan_flow_table,
+                                                     src_ip, dst_ip, src_port, dst_port,
+                                                     proto, pkt_len,
+                                                     p->wan_indices, p->wan_count,
+                                                     p->wan_bandwidth_weight);
+            } else {
+                wan_idx = flow_table_pick_wan_per_packet(p->wan_indices,
+                                                         p->wan_bandwidth_weight,
+                                                         p->wan_count);
+            }
+            if (wan_idx >= 0 && wan_idx < fwd->wan_count)
+                return wan_idx;
+        }
+    }
+    return 0;
+}
+
 static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -340,11 +391,16 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
     uint8_t proto = 0;
     int flow_ok = (parse_flow(pkt, job.len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0);
     int profile_idx = config_select_profile_for_local(fwd->cfg, 0);
+    int wan_idx = select_wan_for_local(fwd, profile_idx, flow_ok,
+                                       src_ip, dst_ip, src_port, dst_port,
+                                       proto, job.len);
+    if (wan_idx < 0)
+        goto drop;
 
     if (config_wan_bridge_mode(fwd->cfg))
         bridge_mac_learn_rx(fwd, 0, pkt, job.len);
 
-    if (set_wan_l2(fwd, pkt) != 0)
+    if (set_wan_l2(fwd, wan_idx, pkt) != 0)
         goto drop;
 
     if (fwd->cfg->crypto_enabled) {
@@ -360,7 +416,7 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
             if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi])
                 goto drop;
             crypto_apply_from_policy(cp);
-            int enc_rc = encrypt_split_or_single(fwd, &job, cp);
+            int enc_rc = encrypt_split_or_single(fwd, &job, cp, wan_idx);
             if (enc_rc < 0)
                 goto drop;
             if (enc_rc > 0) {
@@ -371,7 +427,8 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
     }
 
     job.dir = NE_DIR_WAN;
-    if (emit_owned(fwd, &fwd->mid_to_wan, &job) == 0)
+    job.wan_idx = (uint8_t)wan_idx;
+    if (emit_owned(fwd, &fwd->mid_to_wan[wan_idx], &job) == 0)
         __sync_fetch_and_add(&fwd->local_to_wan, 1);
     return;
 
@@ -580,7 +637,8 @@ static void *wan_core_thread(void *arg)
     while (running) {
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
-        (void)ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan);
+        for (int wi = 0; wi < fwd->wan_count; wi++)
+            (void)ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
 
         int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
@@ -671,11 +729,18 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     if (ne_ring_init(&fwd->local_to_mid, NE_RING) != 0 ||
         ne_ring_init(&fwd->wan_to_mid, NE_RING) != 0 ||
-        ne_ring_init(&fwd->mid_to_wan, NE_RING) != 0 ||
         ne_ring_init(&fwd->mid_to_local, NE_RING) != 0) {
         forwarder_cleanup(fwd);
         return -1;
     }
+    for (int i = 0; i < fwd->wan_count; i++) {
+        if (ne_ring_init(&fwd->mid_to_wan[i], NE_RING) != 0) {
+            forwarder_cleanup(fwd);
+            return -1;
+        }
+    }
+
+    init_wan_flow_table(fwd);
 
     if (config_wan_bridge_mode(cfg))
         (void)bridge_mac_install(fwd);
@@ -705,6 +770,9 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
         fwd->wan_count = MAX_INTERFACES;
     if (config_wan_bridge_mode(cfg))
         (void)bridge_mac_install(fwd);
+    if (fwd->wan_flow_table_ready)
+        flow_table_cleanup(&fwd->wan_flow_table);
+    init_wan_flow_table(fwd);
     int rc = rebuild_crypto_runtime(cfg);
     pthread_mutex_unlock(&runtime_lock);
     return rc;
@@ -716,8 +784,13 @@ void forwarder_cleanup(struct forwarder *fwd)
         return;
     ne_ring_destroy(&fwd->local_to_mid);
     ne_ring_destroy(&fwd->wan_to_mid);
-    ne_ring_destroy(&fwd->mid_to_wan);
+    for (int i = 0; i < MAX_INTERFACES; i++)
+        ne_ring_destroy(&fwd->mid_to_wan[i]);
     ne_ring_destroy(&fwd->mid_to_local);
+    if (fwd->wan_flow_table_ready) {
+        flow_table_cleanup(&fwd->wan_flow_table);
+        fwd->wan_flow_table_ready = 0;
+    }
     ne_pair_close(&fwd->pair);
     bridge_mac_shutdown();
 }

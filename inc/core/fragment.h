@@ -19,11 +19,14 @@
 
 struct frag_entry {
     uint16_t pkt_id;
-    uint8_t  data[1600];
-    uint32_t data_len;
+    uint8_t  first[1600];
+    uint8_t  second[1600];
+    uint32_t first_len;
+    uint32_t second_len;
     uint8_t  eth_hdr[14];
     uint64_t timestamp_ns;
-    int      valid;
+    uint8_t  got_first;
+    uint8_t  got_second;
 };
 
 struct frag_table {

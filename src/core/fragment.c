@@ -28,9 +28,9 @@ static uint64_t get_time_ns(void) {
 void frag_table_gc(struct frag_table *ft) {
     uint64_t now = get_time_ns();
     for (int i = 0; i < FRAG_TABLE_SIZE; i++) {
-        if (ft->entries[i].valid &&
+        if ((ft->entries[i].got_first || ft->entries[i].got_second) &&
             (now - ft->entries[i].timestamp_ns) > FRAG_TIMEOUT_NS) {
-            ft->entries[i].valid = 0;
+            memset(&ft->entries[i], 0, sizeof(ft->entries[i]));
         }
     }
 }
@@ -52,18 +52,59 @@ static int frag_require_ipv4(const uint8_t *pkt, uint32_t pkt_len, int *ip_hdr_l
     return 0;
 }
 
-static int frag_store_pending(struct frag_entry *entry, uint16_t pkt_id,
-                              const uint8_t *eth, const uint8_t *data, uint32_t data_len,
-                              uint64_t now) {
-    if (data_len > sizeof(entry->data))
-        return -1;
+static void frag_prepare_entry(struct frag_entry *entry, uint16_t pkt_id, uint64_t now) {
+    if (entry->pkt_id != pkt_id ||
+        ((entry->got_first || entry->got_second) &&
+         (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS))
+        memset(entry, 0, sizeof(*entry));
     entry->pkt_id = pkt_id;
-    entry->data_len = data_len;
-    memcpy(entry->data, data, data_len);
-    memcpy(entry->eth_hdr, eth, 14);
     entry->timestamp_ns = now;
-    entry->valid = 1;
+}
+
+static int frag_store_first(struct frag_entry *entry, uint16_t pkt_id,
+                            const uint8_t *eth, const uint8_t *data, uint32_t data_len,
+                            uint64_t now) {
+    if (data_len > sizeof(entry->first))
+        return -1;
+    frag_prepare_entry(entry, pkt_id, now);
+    entry->first_len = data_len;
+    memcpy(entry->first, data, data_len);
+    memcpy(entry->eth_hdr, eth, 14);
+    entry->got_first = 1;
     return 0;
+}
+
+static int frag_store_second(struct frag_entry *entry, uint16_t pkt_id,
+                             const uint8_t *data, uint32_t data_len,
+                             uint64_t now) {
+    if (data_len > sizeof(entry->second))
+        return -1;
+    frag_prepare_entry(entry, pkt_id, now);
+    entry->second_len = data_len;
+    memcpy(entry->second, data, data_len);
+    entry->got_second = 1;
+    return 0;
+}
+
+static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len, int eth_len) {
+    if (!entry->got_first || !entry->got_second)
+        return 0;
+    if (entry->first_len + entry->second_len + (uint32_t)eth_len > 4096) {
+        memset(entry, 0, sizeof(*entry));
+        return -1;
+    }
+    int off = 0;
+    memcpy(out_buf, entry->eth_hdr, (size_t)eth_len);
+    off += eth_len;
+    memcpy(out_buf + off, entry->first, entry->first_len);
+    off += (int)entry->first_len;
+    if (entry->second_len > 0) {
+        memcpy(out_buf + off, entry->second, entry->second_len);
+        off += (int)entry->second_len;
+    }
+    *out_len = (uint32_t)off;
+    memset(entry, 0, sizeof(*entry));
+    return 1;
 }
 
 int frag_is_fragment(const struct app_config *cfg,
@@ -180,39 +221,20 @@ int frag_try_reassemble(struct frag_table *ft,
         if (inner_ip_hdr_len < 20 || payload_len < (uint32_t)inner_ip_hdr_len)
             return -1;
 
-        if (frag_store_pending(entry, pkt_id, pkt_data, payload, payload_len, now) != 0)
+        if (frag_store_first(entry, pkt_id, pkt_data, payload, payload_len, now) != 0)
             return -1;
-        return 0;
+        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        return joined;
     }
 
     if (frag_index == 1) {
-        if (!entry->valid || entry->pkt_id != pkt_id)
+        if ((entry->got_first || entry->got_second) && entry->pkt_id == pkt_id &&
+            (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS)
+            memset(entry, 0, sizeof(*entry));
+        if (frag_store_second(entry, pkt_id, payload, payload_len, now) != 0)
             return -1;
-        if ((now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
-            entry->valid = 0;
-            return -1;
-        }
-
-        uint32_t second_len = payload_len;
-        uint32_t first_len = entry->data_len;
-        if (first_len + second_len > 4096) {
-            entry->valid = 0;
-            return -1;
-        }
-
-        int off = 0;
-        memcpy(out_buf, entry->eth_hdr, 14);
-        off += 14;
-        memcpy(out_buf + off, entry->data, first_len);
-        off += (int)first_len;
-        if (second_len > 0) {
-            memcpy(out_buf + off, payload, second_len);
-            off += (int)second_len;
-        }
-
-        *out_len = (uint32_t)off;
-        entry->valid = 0;
-        return 1;
+        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        return joined;
     }
 
     return -1;
@@ -339,44 +361,31 @@ int frag_try_reassemble_l2(struct frag_table *ft,
         int ip_hdr_len = (inner[0] & 0x0F) * 4;
         if (ip_hdr_len < 20 || inner_len < (uint32_t)ip_hdr_len)
             return -1;
-        if (frag_store_pending(entry, pkt_id, pkt_data, inner, inner_len, now) != 0)
+        if (frag_store_first(entry, pkt_id, pkt_data, inner, inner_len, now) != 0)
             return -1;
-        return 0;
+        int joined = frag_emit_join(entry, out_buf, out_len, wire_eth);
+        if (joined < 0)
+            return -1;
+        if (joined == 0)
+            return 0;
+        out_buf[12] = 0x08;
+        out_buf[13] = 0x00;
+        return 1;
     }
 
     if (frag_index == 1) {
-        if (!entry->valid || entry->pkt_id != pkt_id)
+        if ((entry->got_first || entry->got_second) && entry->pkt_id == pkt_id &&
+            (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS)
+            memset(entry, 0, sizeof(*entry));
+        if (frag_store_second(entry, pkt_id, inner, inner_len, now) != 0)
             return -1;
-        if ((now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
-            entry->valid = 0;
+        int joined = frag_emit_join(entry, out_buf, out_len, wire_eth);
+        if (joined < 0)
             return -1;
-        }
-
-        uint32_t second_len = inner_len;
-        uint32_t first_len = entry->data_len;
-        uint32_t total_inner = first_len + second_len;
-        if (total_inner > 4096) {
-            entry->valid = 0;
-            return -1;
-        }
-
-        int off = 0;
-        memcpy(out_buf, entry->eth_hdr, (size_t)wire_eth);
-        off += wire_eth;
-
-        memcpy(out_buf + off, entry->data, first_len);
-        off += (int)first_len;
-
-        if (second_len > 0) {
-            memcpy(out_buf + off, inner, second_len);
-            off += (int)second_len;
-        }
-
+        if (joined == 0)
+            return 0;
         out_buf[12] = 0x08;
         out_buf[13] = 0x00;
-
-        *out_len = (uint32_t)off;
-        entry->valid = 0;
         return 1;
     }
 
@@ -513,43 +522,24 @@ int frag_try_reassemble_l4(struct frag_table *ft,
         if (inner_ip_hdr_len < 20 || plain_len < (uint32_t)inner_ip_hdr_len)
             return -1;
 
-        if (frag_store_pending(entry, pkt_id, pkt_data, plain, plain_len, now) != 0)
+        if (frag_store_first(entry, pkt_id, pkt_data, plain, plain_len, now) != 0)
             return -1;
-        return 0;
+        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        return joined;
     }
 
     if (frag_index == 1) {
-        if (!entry->valid || entry->pkt_id != pkt_id)
-            return -1;
-        if ((now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
-            entry->valid = 0;
-            return -1;
-        }
-
+        if ((entry->got_first || entry->got_second) && entry->pkt_id == pkt_id &&
+            (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS)
+            memset(entry, 0, sizeof(*entry));
         int wire_ports = crypto_layer4_wire_port_len();
         uint32_t second_half_len = payload_len > (uint32_t)wire_ports
                                        ? payload_len - (uint32_t)wire_ports
                                        : 0;
-        uint32_t first_plain_len = entry->data_len;
-        uint32_t total_plain = first_plain_len + second_half_len;
-
-        if (total_plain < 8 || total_plain > 4096) {
-            entry->valid = 0;
+        if (frag_store_second(entry, pkt_id, payload + wire_ports, second_half_len, now) != 0)
             return -1;
-        }
-
-        int off = 0;
-        memcpy(out_buf, entry->eth_hdr, 14);
-        off += 14;
-        memcpy(out_buf + off, entry->data, first_plain_len);
-        off += (int)first_plain_len;
-        if (second_half_len > 0)
-            memcpy(out_buf + off, payload + wire_ports, second_half_len);
-        off += (int)second_half_len;
-
-        *out_len = (uint32_t)off;
-        entry->valid = 0;
-        return 1;
+        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        return joined;
     }
 
     return -1;

@@ -10,39 +10,7 @@
 #define IPPROTO_UDP_VAL 17
 #define ETH_P_ARP_VAL 0x0806
 
-#define MAX_PROFILES_BPF 32
-#define MAX_ENCRYPT_PACK_BPF 128
-
-#define XDP_INGRESS_RATE_LIMIT 0
-#define XDP_RL_WINDOW_NS       1000000ULL
-#define XDP_RL_MAX_BYTES_PER_WINDOW 62500ULL
-
 #define NE_XSK_QUEUE_ID 0
-
-struct xdp_encrypt_rule {
-    __u32 src_net;
-    __u32 src_mask;
-    __u32 dst_net;
-    __u32 dst_mask;
-    __u32 flags;
-    __u8 protocol;
-    __u8 pad[3];
-    __s32 src_port_from;
-    __s32 src_port_to;
-    __s32 dst_port_from;
-    __s32 dst_port_to;
-};
-
-struct bpf_profile_meta {
-    __u32 enabled;
-    __u32 enc_start;
-    __u32 enc_num;
-};
-
-struct xdp_encrypt_ctrl {
-    __u32 profile_count;
-    __u32 require_filter;
-};
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -50,50 +18,6 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } stats_map SEC(".maps");
-
-#if XDP_INGRESS_RATE_LIMIT
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u64);
-} rl_last_reset_ns SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u64);
-} rl_byte_count SEC(".maps");
-#endif
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct xdp_encrypt_ctrl);
-} encrypt_ctrl_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, MAX_PROFILES_BPF);
-    __type(key, __u32);
-    __type(value, struct bpf_profile_meta);
-} profile_meta_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, MAX_ENCRYPT_PACK_BPF);
-    __type(key, __u32);
-    __type(value, struct xdp_encrypt_rule);
-} encrypt_rules_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 64);
-    __type(key, __u32);
-    __type(value, __u32);
-} ingress_profile_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
