@@ -213,12 +213,11 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     if (!key)
         return -1;
 
+    memmove(out_buf + enc_off, enc_plain, enc_plain_len);
     crypto_write_counter(out_buf, nonce, nonce_size, marker_byte,
                          packet_crypto_get_policy_id());
     out_buf[ETH_HEADER_SIZE + nonce_size] = L2_FRAG_MAGIC;
     l2_write_frag_tag(out_buf + ETH_HEADER_SIZE + nonce_size + 1, pkt_id, frag_index);
-
-    memcpy(out_buf + enc_off, enc_plain, enc_plain_len);
 
     if (is_gcm) {
         uint8_t tag[AES128_GCM_TAG_SIZE];

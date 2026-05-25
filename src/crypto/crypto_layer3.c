@@ -270,7 +270,6 @@ int crypto_layer3_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
     memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
     memcpy(out_buf + ETH_HEADER_SIZE, ip_hdr, (size_t)ip_hdr_len);
-    out_buf[IPV4_PROTO_OFF] = packet_crypto_get_fake_protocol();
 
     uint32_t counter = packet_crypto_next_counter();
     uint8_t nonce[16];
@@ -282,9 +281,10 @@ int crypto_layer3_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     if (!key)
         return -1;
 
+    memmove(out_buf + enc_off, enc_plain, enc_plain_len);
+    out_buf[IPV4_PROTO_OFF] = packet_crypto_get_fake_protocol();
     l3_write_tunnel_header_frag(out_buf + tunnel_off, nonce, nonce_size);
     l3_write_frag_tag(out_buf + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
-    memcpy(out_buf + enc_off, enc_plain, enc_plain_len);
 
     if (is_gcm) {
         uint8_t tag[AES128_GCM_TAG_SIZE];
@@ -382,7 +382,6 @@ int crypto_layer3_decrypt_fragment(struct packet_crypto_ctx *ctx,
         }
 
         memmove(packet + tunnel_off, packet + enc_off, enc_len);
-        l3_patch_ipv4(packet + ETH_HEADER_SIZE, ip_hdr_len, (uint16_t)(ip_hdr_len + enc_len));
         return (int)(tunnel_off + enc_len);
     }
     return -1;

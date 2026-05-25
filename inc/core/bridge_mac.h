@@ -6,7 +6,6 @@
 struct forwarder;
 struct app_config;
 
-/* True when profile WAN rows have no dst_ip (transparent inter-SEP links). */
 int config_wan_bridge_mode(const struct app_config *cfg);
 
 int bridge_mac_prepare(struct app_config *cfg);

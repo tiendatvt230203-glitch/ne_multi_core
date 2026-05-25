@@ -42,7 +42,7 @@ static void pin_cpu(unsigned int cpu)
 
 void forwarder_pin_cpu(void)
 {
-    pin_cpu(NE_PIPE_CPU_LOCAL);
+    pin_cpu(NE_CPU_LOC);
 }
 
 static int key_nonzero(const uint8_t *key, size_t len)
@@ -202,9 +202,9 @@ static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
     iface->queue_count = 1;
-    iface->ring_size = NE_PIPE_RING;
-    iface->batch_size = NE_PIPE_BATCH;
-    iface->frame_size = DEFAULT_FRAME_SIZE;
+    iface->ring_size = NE_RING;
+    iface->batch_size = NE_BATCH_SIZE;
+    iface->frame_size = NE_FRAME;
     memcpy(iface->src_mac, src_mac, MAC_LEN);
     memcpy(iface->dst_mac, dst_mac, MAC_LEN);
 }
@@ -242,16 +242,34 @@ static int emit_owned(struct forwarder *fwd, struct ne_ring *dst, struct ne_pack
     return 0;
 }
 
-static int emit_copy(struct forwarder *fwd, struct ne_ring *dst,
-                     const uint8_t *data, uint32_t len, uint8_t dir)
+static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
+                                  uint32_t frag0_len,
+                                  const uint8_t *frag1, uint32_t frag1_len)
 {
-    if (len > fwd->pair.frame_size)
+    uint32_t used = ne_ring_count(&fwd->mid_to_wan);
+    if (used + 2 > fwd->mid_to_wan.cap)
         return -1;
-    struct ne_packet out = { .len = len, .dir = dir };
-    if (ne_frame_alloc(&fwd->pair, &out.addr) != 0)
+    if (frag0_len > fwd->pair.frame_size || frag1_len > fwd->pair.frame_size)
         return -1;
-    memcpy(ne_packet_data(&fwd->pair, out.addr), data, len);
-    return emit_owned(fwd, dst, &out);
+
+    struct ne_packet tail = { .len = frag1_len, .dir = NE_DIR_WAN };
+    if (ne_frame_alloc(&fwd->pair, &tail.addr) != 0)
+        return -1;
+
+    memcpy(ne_packet_data(&fwd->pair, tail.addr), frag1, frag1_len);
+    job->len = frag0_len;
+    job->dir = NE_DIR_WAN;
+
+    if (ne_ring_try_push(&fwd->mid_to_wan, job) != 0) {
+        ne_frame_free(&fwd->pair, tail.addr);
+        return -1;
+    }
+    if (ne_ring_try_push(&fwd->mid_to_wan, &tail) != 0) {
+        ne_frame_free(&fwd->pair, tail.addr);
+        __sync_fetch_and_add(&fwd->total_dropped, 1);
+        __sync_fetch_and_add(&fwd->dropped_ring_full, 1);
+    }
+    return 0;
 }
 
 static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
@@ -262,43 +280,40 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
     int sent_split = 0;
 
     if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(pkt_len)) {
-        uint8_t f1[4096], f2[4096];
+        uint8_t f2[4096];
         uint32_t l1 = 0, l2 = 0;
         if (frag_split_and_encrypt_l2(&policy_crypto_ctx[cp - fwd->cfg->policies],
-                                      pkt, pkt_len, f1, &l1, f2, &l2) != 0)
+                                      pkt, pkt_len, fwd->pair.frame_size, &l1,
+                                      f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, f1) != 0 || set_wan_l2(fwd, f2) != 0)
+        if (set_wan_l2(fwd, pkt) != 0 || set_wan_l2(fwd, f2) != 0)
             return -1;
-        if (emit_copy(fwd, &fwd->mid_to_wan, f2, l2, NE_DIR_WAN) != 0)
+        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2) != 0)
             return -1;
-        memcpy(pkt, f1, l1);
-        job->len = l1;
         sent_split = 1;
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(pkt_len)) {
-        uint8_t f1[4096], f2[4096];
+        uint8_t f2[4096];
         uint32_t l1 = 0, l2 = 0;
         if (frag_split_and_encrypt(&policy_crypto_ctx[cp - fwd->cfg->policies],
-                                   pkt, pkt_len, f1, &l1, f2, &l2) != 0)
+                                   pkt, pkt_len, fwd->pair.frame_size, &l1,
+                                   f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, f1) != 0 || set_wan_l2(fwd, f2) != 0)
+        if (set_wan_l2(fwd, pkt) != 0 || set_wan_l2(fwd, f2) != 0)
             return -1;
-        if (emit_copy(fwd, &fwd->mid_to_wan, f2, l2, NE_DIR_WAN) != 0)
+        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2) != 0)
             return -1;
-        memcpy(pkt, f1, l1);
-        job->len = l1;
         sent_split = 1;
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L4 && frag_need_split_l4(pkt_len)) {
-        uint8_t f1[4096], f2[4096];
+        uint8_t f2[4096];
         uint32_t l1 = 0, l2 = 0;
         if (frag_split_and_encrypt_l4(&policy_crypto_ctx[cp - fwd->cfg->policies],
-                                      pkt, pkt_len, f1, &l1, f2, &l2) != 0)
+                                      pkt, pkt_len, fwd->pair.frame_size, &l1,
+                                      f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, f1) != 0 || set_wan_l2(fwd, f2) != 0)
+        if (set_wan_l2(fwd, pkt) != 0 || set_wan_l2(fwd, f2) != 0)
             return -1;
-        if (emit_copy(fwd, &fwd->mid_to_wan, f2, l2, NE_DIR_WAN) != 0)
+        if (emit_split_pair_to_wan(fwd, job, l1, f2, l2) != 0)
             return -1;
-        memcpy(pkt, f1, l1);
-        job->len = l1;
         sent_split = 1;
     }
 
@@ -314,7 +329,7 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
             return -1;
         job->len = (uint32_t)new_len;
     }
-    return 0;
+    return sent_split ? 1 : 0;
 }
 
 static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
@@ -345,8 +360,13 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
             if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi])
                 goto drop;
             crypto_apply_from_policy(cp);
-            if (encrypt_split_or_single(fwd, &job, cp) != 0)
+            int enc_rc = encrypt_split_or_single(fwd, &job, cp);
+            if (enc_rc < 0)
                 goto drop;
+            if (enc_rc > 0) {
+                __sync_fetch_and_add(&fwd->local_to_wan, 1);
+                return;
+            }
         }
     }
 
@@ -525,15 +545,15 @@ drop:
 static void *local_core_thread(void *arg)
 {
     struct forwarder *fwd = arg;
-    struct ne_packet batch[NE_PIPE_BATCH];
-    pin_cpu(NE_PIPE_CPU_LOCAL);
+    struct ne_packet batch[NE_BATCH_SIZE];
+    pin_cpu(NE_CPU_LOC);
 
     while (running) {
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
         (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local);
 
-        int rcvd = ne_recv_local(&fwd->pair, batch, NE_PIPE_BATCH);
+        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             sched_yield();
             continue;
@@ -554,15 +574,15 @@ static void *local_core_thread(void *arg)
 static void *wan_core_thread(void *arg)
 {
     struct forwarder *fwd = arg;
-    struct ne_packet batch[NE_PIPE_BATCH];
-    pin_cpu(NE_PIPE_CPU_WAN);
+    struct ne_packet batch[NE_BATCH_SIZE];
+    pin_cpu(NE_CPU_WAN);
 
     while (running) {
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
         (void)ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan);
 
-        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_PIPE_BATCH);
+        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             sched_yield();
             continue;
@@ -585,7 +605,7 @@ static void *middle_core_thread(void *arg)
     struct forwarder *fwd = arg;
     struct ne_packet job;
     uint32_t gc_tick = 0;
-    pin_cpu(NE_PIPE_CPU_MID);
+    pin_cpu(NE_CPU_MID);
 
     while (running) {
         int did_work = 0;
@@ -649,10 +669,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (ne_pair_open(&fwd->pair, cfg) != 0)
         return -1;
 
-    if (ne_ring_init(&fwd->local_to_mid, NE_PIPE_RING) != 0 ||
-        ne_ring_init(&fwd->wan_to_mid, NE_PIPE_RING) != 0 ||
-        ne_ring_init(&fwd->mid_to_wan, NE_PIPE_RING) != 0 ||
-        ne_ring_init(&fwd->mid_to_local, NE_PIPE_RING) != 0) {
+    if (ne_ring_init(&fwd->local_to_mid, NE_RING) != 0 ||
+        ne_ring_init(&fwd->wan_to_mid, NE_RING) != 0 ||
+        ne_ring_init(&fwd->mid_to_wan, NE_RING) != 0 ||
+        ne_ring_init(&fwd->mid_to_local, NE_RING) != 0) {
         forwarder_cleanup(fwd);
         return -1;
     }

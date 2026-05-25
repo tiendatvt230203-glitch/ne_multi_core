@@ -222,8 +222,8 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
 static int open_port(struct ne_pair *p, struct ne_port *port, const char *ifname)
 {
     struct xsk_socket_config cfg = {
-        .rx_size = NE_PIPE_RING,
-        .tx_size = NE_PIPE_RING,
+        .rx_size = 4096,
+        .tx_size = 4096,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = p->xdp_flags,
         .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
@@ -249,10 +249,10 @@ static int open_port(struct ne_pair *p, struct ne_port *port, const char *ifname
 
 static void prefill_port(struct ne_pair *p, struct ne_port *port, uint32_t want)
 {
-    uint64_t addrs[NE_PIPE_BATCH];
+    uint64_t addrs[NE_BATCH_SIZE];
 
     while (want > 0) {
-        uint32_t n = want > NE_PIPE_BATCH ? NE_PIPE_BATCH : want;
+        uint32_t n = want > NE_BATCH_SIZE ? NE_BATCH_SIZE : want;
         uint32_t got = pool_pop(&p->pool, addrs, n);
         if (got == 0)
             return;
@@ -291,12 +291,10 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
-    p->frame_size = cfg->global_frame_size ? cfg->global_frame_size : DEFAULT_FRAME_SIZE;
-    if (p->frame_size < 2048)
-        p->frame_size = 2048;
-    p->n_frames = NE_PIPE_FRAMES;
+    p->frame_size = NE_FRAME;
+    p->n_frames = NE_N_FRAMES;
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
-    p->xdp_flags = XDP_FLAGS_SKB_MODE;
+    p->xdp_flags = XDP_FLAGS_DRV_MODE;
 
     p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -310,8 +308,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     }
 
     struct xsk_umem_config ucfg = {
-        .fill_size = NE_PIPE_RING,
-        .comp_size = NE_PIPE_RING,
+        .fill_size = NE_RING,
+        .comp_size = NE_RING,
         .frame_size = p->frame_size,
         .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
         .flags = 0,
@@ -344,8 +342,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     NE_TRY(update_xsk_map(p->local.xsk, bpf_map__fd(local_map)));
     NE_TRY(update_xsk_map(p->wan.xsk, bpf_map__fd(wan_map)));
 
-    prefill_port(p, &p->local, NE_PIPE_RING);
-    prefill_port(p, &p->wan, NE_PIPE_RING);
+    prefill_port(p, &p->local, NE_RING / 2);
+    prefill_port(p, &p->wan, NE_RING / 2);
     return 0;
 
 fail:
@@ -416,9 +414,9 @@ void ne_recv_release_wan(struct ne_pair *p, uint32_t n)
 
 static void drain_cq(struct ne_port *port, struct ne_pool *pool)
 {
-    uint64_t addrs[NE_PIPE_BATCH];
+    uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
-    uint32_t n = xsk_ring_cons__peek(&port->cq, NE_PIPE_BATCH, &idx);
+    uint32_t n = xsk_ring_cons__peek(&port->cq, NE_BATCH_SIZE, &idx);
     if (!n)
         return;
     for (uint32_t i = 0; i < n; i++)
@@ -439,13 +437,13 @@ void ne_drain_cq_wan(struct ne_pair *p)
 
 static void refill_fq(struct ne_port *port, struct ne_pool *pool)
 {
-    uint64_t addrs[NE_PIPE_BATCH];
+    uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
-    uint32_t free_slots = xsk_prod_nb_free(&port->fq, NE_PIPE_BATCH);
-    if (free_slots < NE_PIPE_BATCH)
+    uint32_t free_slots = xsk_prod_nb_free(&port->fq, NE_BATCH_SIZE);
+    if (free_slots < NE_BATCH_SIZE)
         return;
 
-    uint32_t got = pool_pop(pool, addrs, NE_PIPE_BATCH);
+    uint32_t got = pool_pop(pool, addrs, NE_BATCH_SIZE);
     if (!got)
         return;
     if (xsk_ring_prod__reserve(&port->fq, got, &idx) != got) {
@@ -469,13 +467,13 @@ void ne_refill_fq_wan(struct ne_pair *p)
 
 static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max_frame)
 {
-    struct ne_packet jobs[NE_PIPE_BATCH];
-    uint32_t free_slots = xsk_prod_nb_free(&port->tx, NE_PIPE_BATCH);
+    struct ne_packet jobs[NE_BATCH_SIZE];
+    uint32_t free_slots = xsk_prod_nb_free(&port->tx, NE_BATCH_SIZE);
     if (!free_slots)
         return 0;
 
     uint32_t popped = 0;
-    uint32_t want = free_slots > NE_PIPE_BATCH ? NE_PIPE_BATCH : free_slots;
+    uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
     while (popped < want && ne_ring_try_pop(src, &jobs[popped]) == 0)
         popped++;
     if (!popped)

@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <net/if.h>
 
-/* Bridge deployment: WAN has no dst_ip; MAC learn + transparent WAN L2. */
 #ifndef NE_BRIDGE_MODE
 #define NE_BRIDGE_MODE 1
 #endif

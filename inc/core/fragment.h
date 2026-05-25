@@ -14,8 +14,6 @@
 #define FRAG_L4_HDR_SIZE    4
 #define FRAG_MTU            1500
 
-
-/* High-rate UDP split traffic needs wider table to avoid pkt_id hash overwrite before frag#2 arrives. */
 #define FRAG_TABLE_SIZE     4096
 #define FRAG_TIMEOUT_NS     (200ULL * 1000000ULL)
 
@@ -24,9 +22,6 @@ struct frag_entry {
     uint8_t  data[1600];
     uint32_t data_len;
     uint8_t  eth_hdr[14];
-    uint8_t  ip_hdr[60];
-    int      ip_hdr_len;
-    uint8_t  orig_proto;
     uint64_t timestamp_ns;
     int      valid;
 };
@@ -62,9 +57,10 @@ static inline int frag_need_split_l2(uint32_t pkt_len) {
 }
 
 int frag_split_and_encrypt(struct packet_crypto_ctx *ctx,
-                           const uint8_t *pkt_data, uint32_t pkt_len,
-                           uint8_t *frag1, uint32_t *frag1_len,
-                           uint8_t *frag2, uint32_t *frag2_len);
+                           uint8_t *pkt_data, uint32_t pkt_len,
+                           size_t frag0_max, uint32_t *frag0_len,
+                           uint8_t *frag1, size_t frag1_max,
+                           uint32_t *frag1_len);
 
 int frag_is_fragment(const struct app_config *cfg,
                      const uint8_t *pkt_data, uint32_t pkt_len,
@@ -76,9 +72,10 @@ int frag_try_reassemble(struct frag_table *ft,
                         uint8_t *out_buf, uint32_t *out_len);
 
 int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
-                              const uint8_t *pkt_data, uint32_t pkt_len,
-                              uint8_t *frag1, uint32_t *frag1_len,
-                              uint8_t *frag2, uint32_t *frag2_len);
+                              uint8_t *pkt_data, uint32_t pkt_len,
+                              size_t frag0_max, uint32_t *frag0_len,
+                              uint8_t *frag1, size_t frag1_max,
+                              uint32_t *frag1_len);
 
 int frag_is_fragment_l4(const struct app_config *cfg,
                         const uint8_t *pkt_data, uint32_t pkt_len,
@@ -90,9 +87,10 @@ int frag_try_reassemble_l4(struct frag_table *ft,
                            uint8_t *out_buf, uint32_t *out_len);
 
 int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
-                              const uint8_t *pkt_data, uint32_t pkt_len,
-                              uint8_t *frag1, uint32_t *frag1_len,
-                              uint8_t *frag2, uint32_t *frag2_len);
+                              uint8_t *pkt_data, uint32_t pkt_len,
+                              size_t frag0_max, uint32_t *frag0_len,
+                              uint8_t *frag1, size_t frag1_max,
+                              uint32_t *frag1_len);
 
 int frag_is_fragment_l2(const struct app_config *cfg,
                         const uint8_t *pkt_data, uint32_t pkt_len,

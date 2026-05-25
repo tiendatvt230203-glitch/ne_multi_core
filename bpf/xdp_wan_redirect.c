@@ -37,8 +37,6 @@ struct {
 #define STAT_NE_L2      6
 #define IPPROTO_ICMP_VAL 1
 
-#define NE_L2_MARKER_BYTE  0x88u
-
 static __always_inline void inc_stat(int idx)
 {
     __u64 *val = bpf_map_lookup_elem(&wan_stats_map, &idx);
@@ -82,9 +80,12 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 
     int key0 = 0;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
-    if (fake4 && *fake4 != 0) {
-        __u8 *raw = (void *)eth;
-        if ((void *)(raw + 14) <= data_end && raw[12] == NE_L2_MARKER_BYTE) {
+    __u8 *raw = (void *)eth;
+    if ((void *)(raw + 14) <= data_end) {
+        __u8 marker = 0x88u;
+        if (fake4 && *fake4 != 0)
+            marker = (__u8)(*fake4 >> 8);
+        if (raw[12] == marker || raw[12] == 0x88u) {
             inc_stat(STAT_NE_L2);
             goto redirect;
         }

@@ -298,7 +298,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
     int tunnel_off = offset;
     int enc_off = tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE;
-    memcpy(out_buf + enc_off, enc_plain, enc_plain_len);
+    memmove(out_buf + enc_off, enc_plain, enc_plain_len);
 
     l4_write_tunnel_header_frag(out_buf + tunnel_off, nonce, nonce_size);
     l4_write_frag_tag(out_buf + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
@@ -402,7 +402,6 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
         }
 
         memmove(packet + transport_off + L4_WIRE_PORT_LEN, packet + enc_off, enc_len);
-        l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len, L4_WIRE_PORT_LEN + enc_len);
         return (int)(transport_off + L4_WIRE_PORT_LEN + enc_len);
     }
     return -1;

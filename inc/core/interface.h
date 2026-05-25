@@ -6,16 +6,16 @@
 #include <pthread.h>
 #include <signal.h>
 
-#define NE_PIPE_RING        8192u
-#define NE_PIPE_FRAMES      32768u
-#define NE_PIPE_BATCH       64u
-#define NE_PIPE_CPU_LOCAL   0u
-#define NE_PIPE_CPU_MID     3u
-#define NE_PIPE_CPU_WAN     11u
+#define NE_RING        8192u
+#define NE_FRAME       2048u
+#define NE_N_FRAMES    8192u
+#define NE_BATCH_SIZE  64u
+#define NE_CPU_LOC     0u
+#define NE_CPU_MID     3u
+#define NE_CPU_WAN     11u
 
 struct bpf_object;
 
-/* Lightweight interface metadata for bridge MAC helpers. */
 struct xsk_queue {
     struct xsk_socket *xsk;
     struct xsk_umem *umem;

@@ -52,7 +52,6 @@ int flow_table_get_wan_profile(struct flow_table *ft,
                                 const int *allowed_wans, int allowed_count,
                                 const int *allowed_weights);
 
-/* Weighted round-robin: one pick per packet (no flow stickiness). */
 int flow_table_pick_wan_per_packet(const int *allowed_wans,
                                    const int *allowed_weights,
                                    int allowed_count);
