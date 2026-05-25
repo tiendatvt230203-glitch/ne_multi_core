@@ -1,0 +1,619 @@
+#define _POSIX_C_SOURCE 199309L
+#include "../../inc/core/fragment.h"
+#include "../../inc/crypto/packet_crypto.h"
+#include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/crypto/crypto_layer3.h"
+#include "../../inc/crypto/crypto_layer4.h"
+#include "../../inc/core/config.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+
+static atomic_uint_fast32_t g_pkt_id_counter = 0;
+
+uint16_t frag_next_pkt_id(void) {
+    return (uint16_t)(atomic_fetch_add(&g_pkt_id_counter, 1) & 0xFFFF);
+}
+
+void frag_table_init(struct frag_table *ft) {
+    memset(ft, 0, sizeof(*ft));
+}
+
+static uint64_t get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+void frag_table_gc(struct frag_table *ft) {
+    uint64_t now = get_time_ns();
+    for (int i = 0; i < FRAG_TABLE_SIZE; i++) {
+        if (ft->entries[i].valid &&
+            (now - ft->entries[i].timestamp_ns) > FRAG_TIMEOUT_NS) {
+            ft->entries[i].valid = 0;
+        }
+    }
+}
+
+static void frag_read_hdr(const uint8_t *buf, uint16_t *pkt_id, uint8_t *frag_index) {
+    *pkt_id = ((uint16_t)buf[0] << 8) | buf[1];
+    *frag_index = buf[2];
+}
+
+static void frag_patch_ipv4(uint8_t *ip, int ip_hdr_len, uint16_t ip_total) {
+    ip[2] = (uint8_t)(ip_total >> 8);
+    ip[3] = (uint8_t)(ip_total & 0xFF);
+    ip[10] = 0;
+    ip[11] = 0;
+    uint16_t cksum = crypto_calc_ip_checksum(ip, ip_hdr_len);
+    ip[10] = (uint8_t)(cksum >> 8);
+    ip[11] = (uint8_t)(cksum & 0xFF);
+}
+
+static int frag_require_ipv4(const uint8_t *pkt, uint32_t pkt_len, int *ip_hdr_len_out) {
+    if (pkt_len < 14 + 20)
+        return -1;
+    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != 0x0800)
+        return -1;
+    int ihl = (pkt[14] & 0x0F) * 4;
+    if (ihl < 20 || pkt_len < (uint32_t)(14 + ihl))
+        return -1;
+    *ip_hdr_len_out = ihl;
+    return 0;
+}
+
+static int frag_store_pending(struct frag_entry *entry, uint16_t pkt_id,
+                              const uint8_t *eth, const uint8_t *ip, int ip_hdr_len,
+                              uint8_t orig_proto, const uint8_t *data, uint32_t data_len,
+                              uint64_t now) {
+    if (data_len > sizeof(entry->data))
+        return -1;
+    entry->pkt_id = pkt_id;
+    entry->data_len = data_len;
+    memcpy(entry->data, data, data_len);
+    memcpy(entry->eth_hdr, eth, 14);
+    memcpy(entry->ip_hdr, ip, (size_t)ip_hdr_len);
+    entry->ip_hdr_len = ip_hdr_len;
+    entry->orig_proto = orig_proto;
+    entry->timestamp_ns = now;
+    entry->valid = 1;
+    return 0;
+}
+
+int frag_is_fragment(const struct app_config *cfg,
+                     const uint8_t *pkt_data, uint32_t pkt_len,
+                     uint16_t *pkt_id, uint8_t *frag_index) {
+    if (!cfg)
+        return 0;
+    int ip_hdr_len;
+    int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
+
+    if (frag_require_ipv4(pkt_data, pkt_len, &ip_hdr_len) != 0)
+        return 0;
+    if (pkt_data[14 + 9] != packet_crypto_get_fake_protocol())
+        return 0;
+
+    int tunnel_off = 14 + ip_hdr_len;
+    if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + CRYPTO_L3_FRAG_TAG_SIZE))
+        return 0;
+
+    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
+        const struct crypto_policy *cp = &cfg->policies[pi];
+        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3 || cp->nonce_size <= 0)
+            continue;
+        int ns = cp->nonce_size;
+        if (tunnel_off + ns + 1 >= (int)pkt_len)
+            continue;
+        if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L3_FRAG_MAGIC)
+            continue;
+        if (pkt_data[tunnel_off + ns] != (uint8_t)cp->id)
+            continue;
+        frag_read_hdr(pkt_data + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
+        if (*frag_index > 1)
+            return 0;
+        return 1;
+    }
+    return 0;
+}
+
+int frag_split_and_encrypt(struct packet_crypto_ctx *ctx,
+                           const uint8_t *pkt_data, uint32_t pkt_len,
+                           uint8_t *frag1, uint32_t *frag1_len,
+                           uint8_t *frag2, uint32_t *frag2_len) {
+    if (pkt_len < 14 + 20 + 8)
+        return -1;
+
+    int ip_hdr_len;
+    if (frag_require_ipv4(pkt_data, pkt_len, &ip_hdr_len) != 0)
+        return -1;
+
+    uint8_t ip_proto = pkt_data[14 + 9];
+    if (ip_proto != 6 && ip_proto != 17)
+        return -1;
+
+    const uint8_t *eth_hdr = pkt_data;
+    const uint8_t *ip_hdr = pkt_data + 14;
+    const uint8_t *ip_payload = pkt_data + 14 + ip_hdr_len;
+    uint32_t ip_payload_len = pkt_len - 14 - (uint32_t)ip_hdr_len;
+
+    int transport_hdr_len = crypto_layer4_get_transport_hdr_size(
+        ip_payload, ip_proto, ip_payload_len);
+    if (transport_hdr_len < 0)
+        return -1;
+
+    uint32_t app_off = (uint32_t)transport_hdr_len;
+    uint32_t app_len = ip_payload_len - app_off;
+    if (app_len == 0)
+        return -1;
+
+    uint32_t half1 = app_len / 2;
+    uint32_t half2 = app_len - half1;
+    uint16_t pkt_id = frag_next_pkt_id();
+
+    uint8_t frag0_plain[2048];
+    uint32_t frag0_len = (uint32_t)transport_hdr_len + half1;
+    if (frag0_len > sizeof(frag0_plain))
+        return -1;
+    memcpy(frag0_plain, ip_payload, (size_t)transport_hdr_len);
+    memcpy(frag0_plain + transport_hdr_len, ip_payload + app_off, half1);
+
+    if (crypto_layer3_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, ip_hdr_len,
+                                              frag0_plain, frag0_len, pkt_id, 0,
+                                              frag1, 2048, frag1_len) != 0)
+        return -1;
+    if (crypto_layer3_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, ip_hdr_len,
+                                              ip_payload + app_off + half1, half2,
+                                              pkt_id, 1, frag2, 2048, frag2_len) != 0)
+        return -1;
+    return 0;
+}
+
+int frag_try_reassemble(struct frag_table *ft,
+                        const uint8_t *pkt_data, uint32_t pkt_len,
+                        uint16_t pkt_id, uint8_t frag_index,
+                        uint8_t *out_buf, uint32_t *out_len) {
+    int ip_hdr_len;
+    if (frag_require_ipv4(pkt_data, pkt_len, &ip_hdr_len) != 0)
+        return -1;
+
+    const uint8_t *payload = pkt_data + 14 + ip_hdr_len;
+    uint32_t payload_len = pkt_len - 14 - (uint32_t)ip_hdr_len;
+
+    int idx = pkt_id % FRAG_TABLE_SIZE;
+    struct frag_entry *entry = &ft->entries[idx];
+    uint64_t now = get_time_ns();
+
+    if (frag_index == 0) {
+        uint8_t orig_proto = 0;
+        if (crypto_layer4_get_transport_hdr_size(payload, 6, payload_len) >= 0)
+            orig_proto = 6;
+        else if (crypto_layer4_get_transport_hdr_size(payload, 17, payload_len) >= 0)
+            orig_proto = 17;
+        else
+            return -1;
+
+        if (frag_store_pending(entry, pkt_id, pkt_data, pkt_data + 14, ip_hdr_len,
+                               orig_proto, payload, payload_len, now) != 0)
+            return -1;
+        return 0;
+    }
+
+    if (frag_index == 1) {
+        if (!entry->valid || entry->pkt_id != pkt_id)
+            return -1;
+        if ((now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
+            entry->valid = 0;
+            return -1;
+        }
+
+        uint32_t second_len = payload_len;
+        uint32_t first_len = entry->data_len;
+        if (first_len + second_len > 4096) {
+            entry->valid = 0;
+            return -1;
+        }
+
+        int off = 0;
+        memcpy(out_buf, entry->eth_hdr, 14);
+        off += 14;
+        memcpy(out_buf + off, entry->ip_hdr, entry->ip_hdr_len);
+        off += entry->ip_hdr_len;
+        out_buf[14 + 9] = entry->orig_proto;
+
+        int restored_th = crypto_layer4_get_transport_hdr_size(
+            entry->data, entry->orig_proto, first_len);
+        if (restored_th < 0)
+            restored_th = (entry->orig_proto == 6) ? 20 : 8;
+
+        memcpy(out_buf + off, entry->data, (size_t)restored_th);
+        off += restored_th;
+
+        uint32_t first_app = first_len > (uint32_t)restored_th
+                                 ? first_len - (uint32_t)restored_th
+                                 : 0;
+        if (first_app > 0)
+            memcpy(out_buf + off, entry->data + restored_th, first_app);
+        off += (int)first_app;
+
+        if (second_len > 0) {
+            memcpy(out_buf + off, payload, second_len);
+            off += (int)second_len;
+        }
+
+        frag_patch_ipv4(out_buf + 14, entry->ip_hdr_len, (uint16_t)(off - 14));
+
+        *out_len = (uint32_t)off;
+        entry->valid = 0;
+        return 1;
+    }
+
+    return -1;
+}
+
+int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
+                              const uint8_t *pkt_data, uint32_t pkt_len,
+                              uint8_t *frag1, uint32_t *frag1_len,
+                              uint8_t *frag2, uint32_t *frag2_len) {
+    if (pkt_len < 14 + 20)
+        return -1;
+
+    const uint8_t *eth_hdr = pkt_data;
+    const uint8_t *ip_hdr = pkt_data + 14;
+
+    int ip_hdr_len;
+    if (frag_require_ipv4(pkt_data, pkt_len, &ip_hdr_len) != 0)
+        return -1;
+
+    uint8_t ip_proto = ip_hdr[9];
+
+    const uint8_t *ip_payload = pkt_data + 14 + ip_hdr_len;
+    uint32_t ip_payload_len = pkt_len - 14 - ip_hdr_len;
+
+    int transport_hdr_len = -1;
+    uint32_t app_off = 0;
+    uint32_t app_len = ip_payload_len;
+
+    if (ip_proto == 6 || ip_proto == 17) {
+        transport_hdr_len = crypto_layer4_get_transport_hdr_size(
+            ip_payload, ip_proto, ip_payload_len);
+        if (transport_hdr_len < 0)
+            return -1;
+        app_off = (uint32_t)transport_hdr_len;
+        app_len = ip_payload_len - app_off;
+    }
+
+    if (app_len == 0)
+        return -1;
+
+    uint32_t half1 = app_len / 2;
+    uint32_t half2 = app_len - half1;
+
+    uint16_t pkt_id = frag_next_pkt_id();
+
+    uint8_t frag0_plain[2048];
+    uint32_t frag0_len;
+    if (transport_hdr_len >= 0) {
+        frag0_len = (uint32_t)ip_hdr_len + (uint32_t)transport_hdr_len + half1;
+        if (frag0_len > sizeof(frag0_plain))
+            return -1;
+        memcpy(frag0_plain, ip_hdr, (size_t)ip_hdr_len);
+        memcpy(frag0_plain + ip_hdr_len, ip_payload, (size_t)transport_hdr_len);
+        memcpy(frag0_plain + ip_hdr_len + transport_hdr_len, ip_payload + app_off, half1);
+    } else {
+        frag0_len = (uint32_t)ip_hdr_len + half1;
+        if (frag0_len > sizeof(frag0_plain))
+            return -1;
+        memcpy(frag0_plain, ip_hdr, (size_t)ip_hdr_len);
+        memcpy(frag0_plain + ip_hdr_len, ip_payload, half1);
+    }
+
+    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag0_plain, frag0_len,
+                                              pkt_id, 0, frag1, 2048, frag1_len) != 0)
+        return -1;
+
+    const uint8_t *frag1_plain = (transport_hdr_len >= 0)
+                                   ? ip_payload + app_off + half1
+                                   : ip_payload + half1;
+    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag1_plain, half2,
+                                              pkt_id, 1, frag2, 2048, frag2_len) != 0)
+        return -1;
+
+    return 0;
+}
+
+int frag_is_fragment_l2(const struct app_config *cfg,
+                        const uint8_t *pkt_data, uint32_t pkt_len,
+                        uint16_t *pkt_id, uint8_t *frag_index) {
+    if (!cfg)
+        return 0;
+    if (pkt_len < (uint32_t)(14 + 4 + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
+        return 0;
+
+    uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
+    if (!fake_ipv4 || pkt_data[12] != (uint8_t)(fake_ipv4 >> 8))
+        return 0;
+
+    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
+        const struct crypto_policy *cp = &cfg->policies[pi];
+        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->nonce_size <= 0)
+            continue;
+        int ns = cp->nonce_size;
+        int tag_off = 14 + ns;
+        if (tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE > (int)pkt_len)
+            continue;
+        if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
+            continue;
+        frag_read_hdr(pkt_data + tag_off + 1, pkt_id, frag_index);
+        if (*frag_index > 1)
+            return 0;
+        return 1;
+    }
+    return 0;
+}
+
+int frag_try_reassemble_l2(struct frag_table *ft,
+                           const uint8_t *pkt_data, uint32_t pkt_len,
+                           uint16_t pkt_id, uint8_t frag_index,
+                           uint8_t *out_buf, uint32_t *out_len) {
+    int wire_eth = crypto_layer2_wire_eth_len();
+    if (pkt_len < (uint32_t)(wire_eth + 20))
+        return -1;
+
+    const uint8_t *inner = pkt_data + wire_eth;
+    uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
+
+    int idx = pkt_id % FRAG_TABLE_SIZE;
+    struct frag_entry *entry = &ft->entries[idx];
+    uint64_t now = get_time_ns();
+
+    if (frag_index == 0) {
+        if (inner_len < 20 || (inner[0] >> 4) != 4)
+            return -1;
+        int ip_hdr_len = (inner[0] & 0x0F) * 4;
+        if (ip_hdr_len < 20 || inner_len < (uint32_t)ip_hdr_len)
+            return -1;
+        if (frag_store_pending(entry, pkt_id, pkt_data, inner, ip_hdr_len, inner[9],
+                               inner, inner_len, now) != 0)
+            return -1;
+        return 0;
+    }
+
+    if (frag_index == 1) {
+        if (!entry->valid || entry->pkt_id != pkt_id)
+            return -1;
+        if ((now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
+            entry->valid = 0;
+            return -1;
+        }
+
+        uint32_t second_len = inner_len;
+        uint32_t first_len = entry->data_len;
+        uint32_t total_inner = first_len + second_len;
+        if (total_inner > 4096) {
+            entry->valid = 0;
+            return -1;
+        }
+
+        int off = 0;
+        memcpy(out_buf, entry->eth_hdr, (size_t)wire_eth);
+        off += wire_eth;
+
+        int restored_th = crypto_layer4_get_transport_hdr_size(
+            entry->data + entry->ip_hdr_len, entry->orig_proto,
+            first_len > (uint32_t)entry->ip_hdr_len
+                ? first_len - (uint32_t)entry->ip_hdr_len
+                : 0);
+        if (restored_th < 0)
+            restored_th = (entry->orig_proto == 6) ? 20 : 8;
+
+        memcpy(out_buf + off, entry->data, (size_t)entry->ip_hdr_len);
+        off += entry->ip_hdr_len;
+
+        if (first_len > (uint32_t)entry->ip_hdr_len) {
+            const uint8_t *first_tail = entry->data + entry->ip_hdr_len;
+            uint32_t first_tail_len = first_len - (uint32_t)entry->ip_hdr_len;
+            uint32_t first_app = first_tail_len > (uint32_t)restored_th
+                                     ? first_tail_len - (uint32_t)restored_th
+                                     : 0;
+
+            memcpy(out_buf + off, first_tail, (size_t)restored_th);
+            off += restored_th;
+            if (first_app > 0)
+                memcpy(out_buf + off, first_tail + restored_th, first_app);
+            off += (int)first_app;
+        }
+
+        if (second_len > 0) {
+            memcpy(out_buf + off, inner, second_len);
+            off += (int)second_len;
+        }
+
+        frag_patch_ipv4(out_buf + wire_eth, entry->ip_hdr_len, (uint16_t)(off - wire_eth));
+
+        /* Per-frag decrypt leaves fake L2 ethertype in eth_hdr; forwarder needs IPv4. */
+        out_buf[12] = 0x08;
+        out_buf[13] = 0x00;
+
+        *out_len = (uint32_t)off;
+        entry->valid = 0;
+        return 1;
+    }
+
+    return -1;
+}
+
+int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
+                              const uint8_t *pkt_data, uint32_t pkt_len,
+                              uint8_t *frag1, uint32_t *frag1_len,
+                              uint8_t *frag2, uint32_t *frag2_len) {
+    if (pkt_len < 14 + 20 + 8) return -1;
+
+    uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
+    if (ether_type != 0x0800) return -1;
+
+    uint8_t ip_proto = pkt_data[14 + 9];
+    if (ip_proto != 6 && ip_proto != 17) return -1;
+
+    int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
+    if (ip_hdr_len < 20) return -1;
+
+    int transport_off = 14 + ip_hdr_len;
+    size_t remaining = pkt_len - transport_off;
+    int transport_hdr_len = crypto_layer4_get_transport_hdr_size(
+        pkt_data + transport_off, ip_proto, remaining);
+    if (transport_hdr_len < 0) return -1;
+
+    int app_off = transport_off + transport_hdr_len;
+    uint32_t app_len = pkt_len - app_off;
+    if (app_len == 0) return -1;
+
+    uint32_t half1 = app_len / 2;
+    uint32_t half2 = app_len - half1;
+
+    uint16_t pkt_id = frag_next_pkt_id();
+
+    const uint8_t *eth_hdr = pkt_data;
+    const uint8_t *ip_hdr = pkt_data + 14;
+    const uint8_t *wire_ports = pkt_data + transport_off;
+
+    uint8_t frag0_plain[2048];
+    uint32_t frag0_len = (uint32_t)transport_hdr_len + half1;
+    if (frag0_len > sizeof(frag0_plain))
+        return -1;
+    memcpy(frag0_plain, pkt_data + transport_off, (size_t)transport_hdr_len);
+    memcpy(frag0_plain + transport_hdr_len, pkt_data + app_off, half1);
+
+    if (crypto_layer4_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, ip_hdr_len, wire_ports,
+                                              frag0_plain, frag0_len, pkt_id, 0, frag1, 2048,
+                                              frag1_len) != 0)
+        return -1;
+    if (crypto_layer4_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, ip_hdr_len, wire_ports,
+                                              pkt_data + app_off + half1, half2, pkt_id, 1,
+                                              frag2, 2048, frag2_len) != 0)
+        return -1;
+    return 0;
+}
+
+int frag_is_fragment_l4(const struct app_config *cfg,
+                        const uint8_t *pkt_data, uint32_t pkt_len,
+                        uint16_t *pkt_id, uint8_t *frag_index) {
+    if (!cfg)
+        return 0;
+    if (pkt_len < 14 + 20 + 8) return 0;
+
+    uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
+    if (ether_type != 0x0800) return 0;
+
+    uint8_t ip_proto = pkt_data[14 + 9];
+    if (ip_proto != 6 && ip_proto != 17) return 0;
+
+    int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
+    if (ip_hdr_len < 20) return 0;
+
+    int transport_off = 14 + ip_hdr_len;
+    int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
+    int tunnel_off = transport_off + crypto_layer4_wire_port_len();
+
+    if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE))
+        return 0;
+
+    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
+        const struct crypto_policy *cp = &cfg->policies[pi];
+        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4 || cp->nonce_size <= 0)
+            continue;
+        int ns = cp->nonce_size;
+        if (tunnel_off + ns + 1 >= (int)pkt_len)
+            continue;
+        if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L4_FRAG_MAGIC)
+            continue;
+        if (pkt_data[tunnel_off + ns] != (uint8_t)cp->id)
+            continue;
+        frag_read_hdr(pkt_data + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
+        return (*frag_index <= 1) ? 1 : 0;
+    }
+    return 0;
+}
+
+int frag_try_reassemble_l4(struct frag_table *ft,
+                           const uint8_t *pkt_data, uint32_t pkt_len,
+                           uint16_t pkt_id, uint8_t frag_index,
+                           uint8_t *out_buf, uint32_t *out_len) {
+    if (pkt_len < 14 + 20) return -1;
+
+    uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
+    if (ether_type != 0x0800) return -1;
+
+    int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
+    const uint8_t *payload = pkt_data + 14 + ip_hdr_len;
+    uint32_t payload_len = pkt_len - 14 - ip_hdr_len;
+
+    int idx = pkt_id % FRAG_TABLE_SIZE;
+    struct frag_entry *entry = &ft->entries[idx];
+    uint64_t now = get_time_ns();
+
+    if (frag_index == 0) {
+        int wire_ports = crypto_layer4_wire_port_len();
+        uint32_t plain_len = payload_len > (uint32_t)wire_ports
+                                 ? payload_len - (uint32_t)wire_ports
+                                 : 0;
+
+        if (frag_store_pending(entry, pkt_id, pkt_data, pkt_data + 14, ip_hdr_len,
+                               pkt_data[14 + 9], payload + wire_ports, plain_len, now) != 0)
+            return -1;
+        return 0;
+    }
+
+    if (frag_index == 1) {
+        if (!entry->valid || entry->pkt_id != pkt_id)
+            return -1;
+        if ((now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
+            entry->valid = 0;
+            return -1;
+        }
+
+        int wire_ports = crypto_layer4_wire_port_len();
+        uint32_t second_half_len = payload_len > (uint32_t)wire_ports
+                                       ? payload_len - (uint32_t)wire_ports
+                                       : 0;
+        uint32_t first_plain_len = entry->data_len;
+        uint32_t total_plain = first_plain_len + second_half_len;
+
+        if (total_plain < 8 || total_plain > 4096) {
+            entry->valid = 0;
+            return -1;
+        }
+
+        int off = 0;
+        memcpy(out_buf, entry->eth_hdr, 14);
+        off += 14;
+        memcpy(out_buf + off, entry->ip_hdr, entry->ip_hdr_len);
+        off += entry->ip_hdr_len;
+
+        int restored_th = crypto_layer4_get_transport_hdr_size(
+            entry->data, entry->orig_proto, first_plain_len);
+        if (restored_th < 0)
+            restored_th = (entry->orig_proto == 6) ? 20 : 8;
+
+        memcpy(out_buf + off, entry->data, (size_t)restored_th);
+        off += restored_th;
+
+        uint32_t first_app = first_plain_len > (uint32_t)restored_th
+                                 ? first_plain_len - (uint32_t)restored_th
+                                 : 0;
+        if (first_app > 0 && (uint32_t)restored_th < first_plain_len)
+            memcpy(out_buf + off, entry->data + restored_th, first_app);
+        off += (int)first_app;
+
+        if (second_half_len > 0)
+            memcpy(out_buf + off, payload + wire_ports, second_half_len);
+        off += (int)second_half_len;
+
+        frag_patch_ipv4(out_buf + 14, entry->ip_hdr_len, (uint16_t)(off - 14));
+
+        *out_len = (uint32_t)off;
+        entry->valid = 0;
+        return 1;
+    }
+
+    return -1;
+}
