@@ -1,6 +1,5 @@
 #include "../../inc/core/bridge_mac.h"
 #include "../../inc/core/forwarder.h"
-#include "../../inc/crypto/packet_crypto.h"
 #include "../../inc/core/config.h"
 #include <net/ethernet.h>
 #include <net/if.h>
@@ -12,10 +11,6 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#ifndef NE_DEFAULT_FAKE_ETHERTYPE_IPV4
-#define NE_DEFAULT_FAKE_ETHERTYPE_IPV4 0x88B5u
-#endif
 
 static inline int mac_is_zero(const uint8_t mac[MAC_LEN]) {
     for (int i = 0; i < MAC_LEN; i++) {
@@ -108,43 +103,12 @@ static int ifname_is_safe(const char *ifname) {
     return 1;
 }
 
-static int read_bridge_master(const char *ifname, char *out, size_t out_sz) {
-    if (!ifname || !out || out_sz == 0)
-        return -1;
-
-    char path[256];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/master", ifname);
-
-    char link_buf[256];
-    ssize_t n = readlink(path, link_buf, sizeof(link_buf) - 1);
-    if (n <= 0)
-        return -1;
-    link_buf[n] = '\0';
-
-    char *name = strrchr(link_buf, '/');
-    name = name ? name + 1 : link_buf;
-    if (!name[0])
-        return -1;
-
-    size_t len = strlen(name);
-    if (len >= out_sz)
-        len = out_sz - 1;
-    memcpy(out, name, len);
-    out[len] = '\0';
-    return 0;
-}
-
-static int fdb_line_matches_master(const char *line, const char *bridge_name) {
+static int fdb_line_matches_local_dst(const char *line) {
     if (!line || !strstr(line, " master "))
         return 0;
     if (strstr(line, " self") || strstr(line, " permanent") || strstr(line, " vlan "))
         return 0;
-    if (!bridge_name || !bridge_name[0])
-        return 1;
-
-    char needle[96];
-    snprintf(needle, sizeof(needle), " master %s", bridge_name);
-    return strstr(line, needle) != NULL;
+    return 1;
 }
 
 static int mac_load_from_bridge_fdb(struct app_config *cfg) {
@@ -157,9 +121,6 @@ static int mac_load_from_bridge_fdb(struct app_config *cfg) {
         if (!ifname_is_safe(loc->ifname))
             continue;
 
-        char bridge_name[IF_NAMESIZE] = {0};
-        (void)read_bridge_master(loc->ifname, bridge_name, sizeof(bridge_name));
-
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "bridge fdb show dev %s", loc->ifname);
         FILE *fp = popen(cmd, "r");
@@ -170,7 +131,7 @@ static int mac_load_from_bridge_fdb(struct app_config *cfg) {
 
         char line[512];
         while (fgets(line, sizeof(line), fp)) {
-            if (!fdb_line_matches_master(line, bridge_name))
+            if (!fdb_line_matches_local_dst(line))
                 continue;
 
             char mac_tok[48];
@@ -185,11 +146,9 @@ static int mac_load_from_bridge_fdb(struct app_config *cfg) {
 
             if (mac_set_fdb_dst(cfg, li, mac) == 0) {
                 fprintf(stderr,
-                        "[LOCAL-MAC] %s dst %02x:%02x:%02x:%02x:%02x:%02x loaded from bridge fdb%s%s\n",
+                        "[LOCAL-MAC] %s dst %02x:%02x:%02x:%02x:%02x:%02x loaded from bridge fdb\n",
                         loc->ifname,
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                        bridge_name[0] ? " master " : "",
-                        bridge_name[0] ? bridge_name : "");
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
                 loaded++;
                 break;
             }
@@ -198,10 +157,8 @@ static int mac_load_from_bridge_fdb(struct app_config *cfg) {
 
         if (mac_is_zero(loc->dst_mac)) {
             fprintf(stderr,
-                    "[LOCAL-MAC] %s no dst MAC found in bridge fdb%s%s\n",
-                    loc->ifname,
-                    bridge_name[0] ? " master " : "",
-                    bridge_name[0] ? bridge_name : "");
+                    "[LOCAL-MAC] %s no dst MAC found in bridge fdb\n",
+                    loc->ifname);
         }
     }
 
@@ -216,58 +173,6 @@ static int bridge_mac_prepare_impl(struct app_config *cfg) {
         (void)read_local_iface_hwaddr(cfg->locals[i].ifname, cfg->locals[i].src_mac);
 
     (void)mac_load_from_bridge_fdb(cfg);
-    return 0;
-}
-
-static int ne_rx_ipv4_header_csum_ok(const uint8_t *ip, int ihl) {
-    uint32_t sum = 0;
-    for (int i = 0; i < ihl; i += 2) {
-        uint16_t w = ((uint16_t)ip[i] << 8);
-        if (i + 1 < ihl)
-            w |= ip[i + 1];
-        sum += w;
-    }
-    while (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return ((uint16_t)sum) == 0xffff;
-}
-
-void bridge_wan_rx_normalize_eth_ipv4(uint8_t *pkt, uint32_t pkt_len) {
-    if (!pkt || pkt_len < 14 + 20)
-        return;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == 0x0800 || et == 0x8100)
-        return;
-
-    const uint8_t *iph = pkt + 14;
-    if ((iph[0] >> 4) != 4)
-        return;
-    int ihl = (iph[0] & 0x0F) * 4;
-    if (ihl < 20 || ihl > 60 || pkt_len < 14 + (uint32_t)ihl)
-        return;
-    uint16_t tot = ((uint16_t)iph[2] << 8) | iph[3];
-    if (tot < (uint16_t)ihl || pkt_len < 14 + (uint32_t)tot)
-        return;
-    if (!ne_rx_ipv4_header_csum_ok(iph, ihl))
-        return;
-
-    uint16_t fake4 = packet_crypto_get_fake_ethertype_ipv4();
-    if (fake4 == 0)
-        fake4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
-    if (pkt[12] != (uint8_t)(fake4 >> 8))
-        return;
-
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
-}
-
-int config_wan_bridge_mode(const struct app_config *cfg) {
-    if (!cfg || cfg->wan_count <= 0)
-        return 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (cfg->wans[i].dst_ip == 0)
-            return 1;
-    }
     return 0;
 }
 

@@ -283,22 +283,22 @@ int flow_table_get_wan_profile(struct flow_table *ft,
             }
 
             entry->last_seen = now;
+            int wan_idx = entry->current_wan;
             entry->byte_count += pkt_len;
 
-            uint32_t cur_limit = profile_wan_limit(ft, entry->current_wan,
+            uint32_t cur_limit = profile_wan_limit(ft, wan_idx,
                                                    allowed_wans, allowed_weights,
                                                    allowed_count);
 
             if (cur_limit > 0 && entry->byte_count >= cur_limit) {
                 entry->byte_count = 0;
-                pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+                pos = wan_allowed_pos(wan_idx, allowed_wans, allowed_count);
                 if (pos < 0)
                     pos = 0;
                 entry->wrr_slot = (pos + 1) % allowed_count;
                 entry->current_wan = allowed_wans[entry->wrr_slot];
             }
 
-            int wan_idx = entry->current_wan;
             pthread_mutex_unlock(&ft->locks[idx]);
             return wan_idx;
         }
@@ -326,9 +326,20 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     uint32_t h = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
     entry->wrr_slot = (int)(h % (uint32_t)allowed_count);
     entry->current_wan = allowed_wans[entry->wrr_slot];
+    int wan_idx = entry->current_wan;
+    uint32_t cur_limit = profile_wan_limit(ft, wan_idx,
+                                           allowed_wans, allowed_weights,
+                                           allowed_count);
+    if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+        int pos = wan_allowed_pos(wan_idx, allowed_wans, allowed_count);
+        if (pos < 0)
+            pos = 0;
+        entry->byte_count = 0;
+        entry->wrr_slot = (pos + 1) % allowed_count;
+        entry->current_wan = allowed_wans[entry->wrr_slot];
+    }
 
     ft->buckets[idx] = entry;
-    int wan_idx = entry->current_wan;
 
     pthread_mutex_unlock(&ft->locks[idx]);
     return wan_idx;

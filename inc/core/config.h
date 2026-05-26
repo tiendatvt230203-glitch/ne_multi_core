@@ -4,10 +4,6 @@
 #include <stdint.h>
 #include <net/if.h>
 
-#ifndef NE_BRIDGE_MODE
-#define NE_BRIDGE_MODE 1
-#endif
-
 #define MAX_INTERFACES 16
 #define MAC_LEN 6
 #define AES_KEY_LEN 32

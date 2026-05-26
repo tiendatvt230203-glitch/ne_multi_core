@@ -6,14 +6,10 @@
 struct forwarder;
 struct app_config;
 
-int config_wan_bridge_mode(const struct app_config *cfg);
-
 int bridge_mac_prepare(struct app_config *cfg);
 int bridge_mac_install(struct forwarder *fwd);
 
 int bridge_mac_local_for_dmac(struct forwarder *fwd,
                               const uint8_t *pkt, uint32_t pkt_len);
-
-void bridge_wan_rx_normalize_eth_ipv4(uint8_t *pkt, uint32_t pkt_len);
 
 #endif

@@ -106,6 +106,22 @@ int interface_set_queue_count(const char *ifname, int desired_count)
     return -1;
 }
 
+static int interface_set_promisc(const char *ifname)
+{
+    if (!ifname_is_safe(ifname))
+        return -1;
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ip link set dev %s promisc on >/dev/null 2>&1", ifname);
+    if (system(cmd) == 0) {
+        fprintf(stderr, "[PROMISC] %s on\n", ifname);
+        return 0;
+    }
+
+    fprintf(stderr, "[PROMISC] %s unable to enable promisc\n", ifname);
+    return -1;
+}
+
 int interface_get_queue_count(const char *ifname)
 {
     (void)ifname;
@@ -369,6 +385,10 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(interface_set_queue_count(cfg->locals[i].ifname, DEFAULT_QUEUE_COUNT));
     for (int i = 0; i < p->wan_count; i++)
         NE_TRY(interface_set_queue_count(cfg->wans[i].ifname, DEFAULT_QUEUE_COUNT));
+    for (int i = 0; i < p->local_count; i++)
+        NE_TRY(interface_set_promisc(cfg->locals[i].ifname));
+    for (int i = 0; i < p->wan_count; i++)
+        NE_TRY(interface_set_promisc(cfg->wans[i].ifname));
 
     struct xsk_umem_config ucfg = {
         .fill_size = NE_RING,
@@ -729,7 +749,7 @@ void interface_print_xdp_stats(struct ne_pair *p)
             bpf_object__find_map_by_name(p->bpf_wans[i], "wan_stats_map") : NULL;
         if (wan_stats) {
             fprintf(stderr,
-                    "[XDP-STATS wan[%d] %s] total=%llu non_ip=%llu redirect=%llu no_sock=%llu arp_pass=%llu icmp_pass=%llu ne_l2=%llu\n",
+                    "[XDP-STATS wan[%d] %s] total=%llu non_ip=%llu redirect=%llu no_sock=%llu arp_pass=%llu icmp_pass=%llu ne_l2=%llu tcp_redirect=%llu udp_redirect=%llu\n",
                     i, p->wans[i].ifname,
                     (unsigned long long)map_u64_value(wan_stats, 0),
                     (unsigned long long)map_u64_value(wan_stats, 1),
@@ -737,7 +757,9 @@ void interface_print_xdp_stats(struct ne_pair *p)
                     (unsigned long long)map_u64_value(wan_stats, 3),
                     (unsigned long long)map_u64_value(wan_stats, 4),
                     (unsigned long long)map_u64_value(wan_stats, 5),
-                    (unsigned long long)map_u64_value(wan_stats, 6));
+                    (unsigned long long)map_u64_value(wan_stats, 6),
+                    (unsigned long long)map_u64_value(wan_stats, 7),
+                    (unsigned long long)map_u64_value(wan_stats, 8));
         } else {
             fprintf(stderr, "[XDP-STATS wan[%d] %s] wan_stats_map missing\n",
                     i, p->wans[i].ifname);

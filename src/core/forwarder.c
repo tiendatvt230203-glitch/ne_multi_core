@@ -255,36 +255,24 @@ static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
 
 static int set_wan_l2(struct forwarder *fwd, int wan_idx, uint8_t *pkt)
 {
-    if (config_wan_bridge_mode(fwd->cfg))
-        return 0;
-    if (wan_idx < 0 || wan_idx >= fwd->wan_count)
-        return -1;
-    const struct wan_config *wan = &fwd->cfg->wans[wan_idx];
-    if (memcmp(wan->dst_mac, "\0\0\0\0\0\0", MAC_LEN) == 0 ||
-        memcmp(wan->src_mac, "\0\0\0\0\0\0", MAC_LEN) == 0)
-        return -1;
-    memcpy(pkt, wan->dst_mac, MAC_LEN);
-    memcpy(pkt + MAC_LEN, wan->src_mac, MAC_LEN);
+    (void)fwd;
+    (void)wan_idx;
+    (void)pkt;
     return 0;
 }
 
 static int set_local_l2(struct forwarder *fwd, int local_idx, uint8_t *pkt)
 {
-    if (config_wan_bridge_mode(fwd->cfg))
-        return 0;
-    const struct xsk_interface *local = &fwd->locals[local_idx];
-    if (memcmp(local->dst_mac, "\0\0\0\0\0\0", MAC_LEN) == 0 ||
-        memcmp(local->src_mac, "\0\0\0\0\0\0", MAC_LEN) == 0)
-        return -1;
-    memcpy(pkt, local->dst_mac, MAC_LEN);
-    memcpy(pkt + MAC_LEN, local->src_mac, MAC_LEN);
+    (void)fwd;
+    (void)local_idx;
+    (void)pkt;
     return 0;
 }
 
 static int local_rx_is_reflected_client_frame(struct forwarder *fwd, int local_idx,
                                               const uint8_t *pkt, uint32_t pkt_len)
 {
-    if (!fwd || !config_wan_bridge_mode(fwd->cfg) ||
+    if (!fwd || !fwd->cfg ||
         local_idx < 0 || local_idx >= fwd->local_count || !pkt || pkt_len < 14)
         return 0;
     const uint8_t *dst = fwd->locals[local_idx].dst_mac;
@@ -854,10 +842,9 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
 
 static int pick_local_for_packet(struct forwarder *fwd, uint8_t *pkt, uint32_t pkt_len)
 {
-    if (config_wan_bridge_mode(fwd->cfg)) {
-        bridge_wan_rx_normalize_eth_ipv4(pkt, pkt_len);
-        return bridge_mac_local_for_dmac(fwd, pkt, pkt_len);
-    }
+    int local_idx = bridge_mac_local_for_dmac(fwd, pkt, pkt_len);
+    if (local_idx >= 0)
+        return local_idx;
 
     uint32_t dst_ip = get_dest_ip(pkt, pkt_len);
     if (!dst_ip)
@@ -896,6 +883,20 @@ static void process_wan_packet(struct forwarder *fwd, struct ne_packet job)
     }
 
     int local_idx = pick_local_for_packet(fwd, pkt, job.len);
+    if (do_trace) {
+        uint32_t src_ip = 0, dst_ip = 0;
+        uint16_t src_port = 0, dst_port = 0;
+        uint8_t proto = 0;
+        if (parse_flow(pkt, job.len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0) {
+            char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+            ip_to_str(src_ip, src, sizeof(src));
+            ip_to_str(dst_ip, dst, sizeof(dst));
+            fprintf(stderr,
+                    "[TRACE WAN-FLOW] wan=%u local=%d %s:%u -> %s:%u proto=%u len=%u dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                    job.wan_idx, local_idx, src, src_port, dst, dst_port, proto, job.len,
+                    pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5]);
+        }
+    }
     if (local_idx < 0 || local_idx >= fwd->local_count) {
         if (do_trace)
             fprintf(stderr,
@@ -1114,7 +1115,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     interface_xdp_detach_all_from_config(cfg);
     interface_reset_redirect_maps();
 
-    if (config_wan_bridge_mode(cfg) && bridge_mac_prepare(cfg) != 0)
+    if (bridge_mac_prepare(cfg) != 0)
         return -1;
 
     if (rebuild_crypto_runtime(cfg) != 0)
@@ -1146,8 +1147,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     init_wan_flow_table(fwd);
 
-    if (config_wan_bridge_mode(cfg))
-        (void)bridge_mac_install(fwd);
+    (void)bridge_mac_install(fwd);
 
     running = 1;
     return 0;
@@ -1163,8 +1163,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     }
 
     pthread_mutex_lock(&runtime_lock);
-    if (config_wan_bridge_mode(cfg))
-        (void)bridge_mac_prepare(cfg);
+    (void)bridge_mac_prepare(cfg);
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
     fwd->wan_count = cfg->wan_count;
@@ -1172,8 +1171,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
         fwd->local_count = MAX_INTERFACES;
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
-    if (config_wan_bridge_mode(cfg))
-        (void)bridge_mac_install(fwd);
+    (void)bridge_mac_install(fwd);
     if (fwd->wan_flow_table_ready)
         flow_table_cleanup(&fwd->wan_flow_table);
     init_wan_flow_table(fwd);

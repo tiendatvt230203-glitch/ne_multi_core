@@ -16,7 +16,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 8);
+    __uint(max_entries, 10);
     __type(key, int);
     __type(value, __u64);
 } wan_stats_map SEC(".maps");
@@ -35,7 +35,11 @@ struct {
 #define STAT_ARP_PASS   4
 #define STAT_ICMP_PASS  5
 #define STAT_NE_L2      6
+#define STAT_TCP_REDIRECT 7
+#define STAT_UDP_REDIRECT 8
 #define IPPROTO_ICMP_VAL 1
+#define IPPROTO_TCP_VAL 6
+#define IPPROTO_UDP_VAL 17
 #define ETH_P_LLDP_VAL 0x88cc
 #define ETH_P_8021AD_VAL 0x88a8
 #define ETH_P_EAPOL_VAL 0x888e
@@ -77,6 +81,10 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
             inc_stat(STAT_ICMP_PASS);
             return XDP_PASS;
         }
+        if (ip->protocol == IPPROTO_TCP_VAL)
+            inc_stat(STAT_TCP_REDIRECT);
+        else if (ip->protocol == IPPROTO_UDP_VAL)
+            inc_stat(STAT_UDP_REDIRECT);
         goto redirect;
     }
 
