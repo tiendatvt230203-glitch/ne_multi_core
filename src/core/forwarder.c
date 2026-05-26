@@ -554,7 +554,7 @@ static int fallback_wan_if_congested(struct forwarder *fwd, int profile_idx, int
 static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
                                 uint32_t src_ip, uint32_t dst_ip,
                                 uint16_t src_port, uint16_t dst_port,
-                                uint8_t proto, uint32_t pkt_len)
+                                uint8_t proto, uint32_t pkt_len, int pin_tcp)
 {
     static uint64_t trace_counter;
     if (!fwd || fwd->wan_count <= 0)
@@ -563,7 +563,7 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
         struct profile_config *p = &fwd->cfg->profiles[profile_idx];
         if (p->wan_count > 0) {
             int wan_idx;
-            if (proto == IPPROTO_TCP) {
+            if (pin_tcp && proto == IPPROTO_TCP) {
                 wan_idx = fallback_wan_if_congested(fwd, profile_idx, p->wan_indices[0]);
                 if (trace_hit(&trace_counter)) {
                     char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
@@ -646,9 +646,14 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
         return;
     }
     int profile_idx = config_select_profile_for_local(fwd->cfg, local_idx);
+    const struct crypto_policy *cp = NULL;
+    if (fwd->cfg->crypto_enabled && flow_ok)
+        cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
+                                         src_port, dst_port, proto);
+    int pin_tcp = (!fwd->cfg->crypto_enabled || !cp || cp->action == POLICY_ACTION_BYPASS);
     int wan_idx = select_wan_for_local(fwd, profile_idx, flow_ok,
                                        src_ip, dst_ip, src_port, dst_port,
-                                       proto, job.len);
+                                       proto, job.len, pin_tcp);
     if (do_trace) {
         char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
         ip_to_str(src_ip, src, sizeof(src));
@@ -681,10 +686,6 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     }
 
-    const struct crypto_policy *cp = NULL;
-    if (fwd->cfg->crypto_enabled && flow_ok)
-        cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
-                                         src_port, dst_port, proto);
     if (fwd->cfg->crypto_enabled && do_trace) {
         if (cp) {
             fprintf(stderr,
