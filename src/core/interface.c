@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <ctype.h>
 
 static int trace_hit(uint64_t *counter)
 {
@@ -23,6 +24,17 @@ static uint32_t next_pow2_u32(uint32_t v)
     v |= v >> 8;
     v |= v >> 16;
     return v + 1;
+}
+
+static int ifname_is_safe(const char *ifname)
+{
+    if (!ifname || !ifname[0])
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)ifname; *p; p++) {
+        if (!(isalnum(*p) || *p == '_' || *p == '-' || *p == '.'))
+            return 0;
+    }
+    return 1;
 }
 
 static void xdp_try_detach(int ifindex, const char *ifname)
@@ -70,9 +82,28 @@ int interface_push_encrypt_filters(const struct app_config *cfg)
 
 int interface_set_queue_count(const char *ifname, int desired_count)
 {
-    (void)ifname;
-    (void)desired_count;
-    return 0;
+    if (!ifname_is_safe(ifname) || desired_count <= 0)
+        return -1;
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ethtool -L %s combined %d >/dev/null 2>&1",
+             ifname, desired_count);
+    if (system(cmd) == 0) {
+        fprintf(stderr, "[QUEUE] %s combined=%d\n", ifname, desired_count);
+        return 0;
+    }
+
+    snprintf(cmd, sizeof(cmd), "ethtool -L %s rx %d tx %d >/dev/null 2>&1",
+             ifname, desired_count, desired_count);
+    if (system(cmd) == 0) {
+        fprintf(stderr, "[QUEUE] %s rx=%d tx=%d\n",
+                ifname, desired_count, desired_count);
+        return 0;
+    }
+
+    fprintf(stderr, "[QUEUE] %s unable to force queue_count=%d\n",
+            ifname, desired_count);
+    return -1;
 }
 
 int interface_get_queue_count(const char *ifname)
@@ -333,6 +364,11 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         uint64_t addr = (uint64_t)i * p->frame_size;
         (void)pool_push(&p->pool, &addr, 1);
     }
+
+    for (int i = 0; i < p->local_count; i++)
+        (void)interface_set_queue_count(cfg->locals[i].ifname, DEFAULT_QUEUE_COUNT);
+    for (int i = 0; i < p->wan_count; i++)
+        (void)interface_set_queue_count(cfg->wans[i].ifname, DEFAULT_QUEUE_COUNT);
 
     struct xsk_umem_config ucfg = {
         .fill_size = NE_RING,
