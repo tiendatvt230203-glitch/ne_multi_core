@@ -231,7 +231,8 @@ static int set_wan_l2(struct forwarder *fwd, int wan_idx, uint8_t *pkt)
     if (wan_idx < 0 || wan_idx >= fwd->wan_count)
         return -1;
     const struct wan_config *wan = &fwd->cfg->wans[wan_idx];
-    if (memcmp(wan->dst_mac, "\0\0\0\0\0\0", MAC_LEN) == 0)
+    if (memcmp(wan->dst_mac, "\0\0\0\0\0\0", MAC_LEN) == 0 ||
+        memcmp(wan->src_mac, "\0\0\0\0\0\0", MAC_LEN) == 0)
         return -1;
     memcpy(pkt, wan->dst_mac, MAC_LEN);
     memcpy(pkt + MAC_LEN, wan->src_mac, MAC_LEN);
@@ -240,8 +241,11 @@ static int set_wan_l2(struct forwarder *fwd, int wan_idx, uint8_t *pkt)
 
 static int set_local_l2(struct forwarder *fwd, int local_idx, uint8_t *pkt)
 {
+    if (config_wan_bridge_mode(fwd->cfg))
+        return 0;
     const struct xsk_interface *local = &fwd->locals[local_idx];
-    if (memcmp(local->dst_mac, "\0\0\0\0\0\0", MAC_LEN) == 0)
+    if (memcmp(local->dst_mac, "\0\0\0\0\0\0", MAC_LEN) == 0 ||
+        memcmp(local->src_mac, "\0\0\0\0\0\0", MAC_LEN) == 0)
         return -1;
     memcpy(pkt, local->dst_mac, MAC_LEN);
     memcpy(pkt + MAC_LEN, local->src_mac, MAC_LEN);
@@ -408,10 +412,7 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
         if (flow_ok)
             cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
                                              src_port, dst_port, proto);
-        if (!cp) {
-            if (fwd->cfg->policy_count > 0)
-                goto drop;
-        } else if (cp->action != POLICY_ACTION_BYPASS) {
+        if (cp && cp->action != POLICY_ACTION_BYPASS) {
             int pi = (int)(cp - fwd->cfg->policies);
             if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi])
                 goto drop;
@@ -844,4 +845,12 @@ void forwarder_print_stats(struct forwarder *fwd)
             (unsigned long long)fwd->dropped_ring_full,
             (unsigned long long)fwd->dropped_no_local_match,
             (unsigned long long)fwd->dropped_local_tx_fail);
+    for (int i = 0; i < fwd->wan_count; i++) {
+        fprintf(stderr,
+                "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu\n",
+                i, fwd->pair.wans[i].ifname,
+                ne_ring_count(&fwd->mid_to_wan[i]),
+                (unsigned long long)fwd->pair.wans[i].tx_packets,
+                (unsigned long long)fwd->pair.wans[i].rx_packets);
+    }
 }
