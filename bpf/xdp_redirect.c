@@ -125,9 +125,8 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         inc_stat(10);
         return XDP_PASS;
     }
-    if (l4_proto == IPPROTO_UDP_VAL &&
-        (sport == DNS_PORT_VAL || dport == DNS_PORT_VAL ||
-         sport == NTP_PORT_VAL || dport == NTP_PORT_VAL)) {
+    if (sport == DNS_PORT_VAL || dport == DNS_PORT_VAL ||
+        sport == NTP_PORT_VAL || dport == NTP_PORT_VAL) {
         inc_stat(11);
         return XDP_PASS;
     }
