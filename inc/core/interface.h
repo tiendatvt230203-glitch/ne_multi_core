@@ -150,6 +150,7 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx);
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
+void interface_print_xdp_stats(struct ne_pair *p);
 
 void interface_reset_redirect_maps(void);
 int interface_push_encrypt_filters(const struct app_config *cfg);

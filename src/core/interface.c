@@ -499,12 +499,6 @@ static void refill_fq(struct ne_port *port, struct ne_pool *pool)
     uint32_t free_slots = xsk_prod_nb_free(&port->fq, NE_BATCH_SIZE);
     if (free_slots < NE_BATCH_SIZE) {
         port->fq_no_slots++;
-        if (trace_hit(&trace_counter)) {
-            fprintf(stderr,
-                    "[TRACE FQ] if=%s no_slots free=%u need=%u count=%llu\n",
-                    port->ifname, free_slots, NE_BATCH_SIZE,
-                    (unsigned long long)port->fq_no_slots);
-        }
         return;
     }
 
@@ -620,4 +614,56 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
     if (!p || wan_idx < 0 || wan_idx >= p->wan_count)
         return 0;
     return tx_drain_port(&p->wans[wan_idx], src, p->frame_size);
+}
+
+static uint64_t map_u64_value(struct bpf_map *map, int key)
+{
+    uint64_t val = 0;
+    if (map)
+        (void)bpf_map_lookup_elem(bpf_map__fd(map), &key, &val);
+    return val;
+}
+
+void interface_print_xdp_stats(struct ne_pair *p)
+{
+    if (!p)
+        return;
+
+    struct bpf_map *local_stats = p->bpf_local ?
+        bpf_object__find_map_by_name(p->bpf_local, "stats_map") : NULL;
+    if (local_stats) {
+        fprintf(stderr,
+                "[XDP-STATS local %s] total=%llu non_ip_or_short=%llu icmp_pass=%llu no_sock=%llu redirect=%llu arp_pass=%llu other_l4_pass=%llu port_fail=%llu\n",
+                p->local.ifname,
+                (unsigned long long)map_u64_value(local_stats, 0),
+                (unsigned long long)map_u64_value(local_stats, 1),
+                (unsigned long long)map_u64_value(local_stats, 4),
+                (unsigned long long)map_u64_value(local_stats, 5),
+                (unsigned long long)map_u64_value(local_stats, 6),
+                (unsigned long long)map_u64_value(local_stats, 7),
+                (unsigned long long)map_u64_value(local_stats, 8),
+                (unsigned long long)map_u64_value(local_stats, 10));
+    } else {
+        fprintf(stderr, "[XDP-STATS local %s] stats_map missing\n", p->local.ifname);
+    }
+
+    for (int i = 0; i < p->wan_count; i++) {
+        struct bpf_map *wan_stats = p->bpf_wans[i] ?
+            bpf_object__find_map_by_name(p->bpf_wans[i], "wan_stats_map") : NULL;
+        if (wan_stats) {
+            fprintf(stderr,
+                    "[XDP-STATS wan[%d] %s] total=%llu non_ip=%llu redirect=%llu no_sock=%llu arp_pass=%llu icmp_pass=%llu ne_l2=%llu\n",
+                    i, p->wans[i].ifname,
+                    (unsigned long long)map_u64_value(wan_stats, 0),
+                    (unsigned long long)map_u64_value(wan_stats, 1),
+                    (unsigned long long)map_u64_value(wan_stats, 2),
+                    (unsigned long long)map_u64_value(wan_stats, 3),
+                    (unsigned long long)map_u64_value(wan_stats, 4),
+                    (unsigned long long)map_u64_value(wan_stats, 5),
+                    (unsigned long long)map_u64_value(wan_stats, 6));
+        } else {
+            fprintf(stderr, "[XDP-STATS wan[%d] %s] wan_stats_map missing\n",
+                    i, p->wans[i].ifname);
+        }
+    }
 }

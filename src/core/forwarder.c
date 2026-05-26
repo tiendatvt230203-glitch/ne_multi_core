@@ -1053,6 +1053,7 @@ void forwarder_print_stats(struct forwarder *fwd)
             (unsigned long long)fwd->dropped_wan_l2,
             (unsigned long long)fwd->dropped_policy_not_ready,
             (unsigned long long)fwd->dropped_encrypt_fail);
+    interface_print_xdp_stats(&fwd->pair);
     for (int i = 0; i < fwd->wan_count; i++) {
         fprintf(stderr,
                 "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu\n",
