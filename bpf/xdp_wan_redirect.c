@@ -36,6 +36,11 @@ struct {
 #define STAT_ICMP_PASS  5
 #define STAT_NE_L2      6
 #define IPPROTO_ICMP_VAL 1
+#define ETH_P_LLDP_VAL 0x88cc
+#define ETH_P_8021AD_VAL 0x88a8
+#define ETH_P_EAPOL_VAL 0x888e
+#define ETH_P_MACSEC_VAL 0x88e5
+#define ETH_P_PTP_VAL 0x88f7
 
 static __always_inline void inc_stat(int idx)
 {
@@ -76,6 +81,12 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     }
 
     if (proto == __constant_htons(ETH_P_IPV6))
+        return XDP_PASS;
+    if (proto == __constant_htons(ETH_P_LLDP_VAL) ||
+        proto == __constant_htons(ETH_P_8021AD_VAL) ||
+        proto == __constant_htons(ETH_P_EAPOL_VAL) ||
+        proto == __constant_htons(ETH_P_MACSEC_VAL) ||
+        proto == __constant_htons(ETH_P_PTP_VAL))
         return XDP_PASS;
 
     int key0 = 0;
