@@ -215,17 +215,18 @@ static int split_cidr_list(const char *input, char out[][MAX_CIDR_ITEM_LEN], int
     return (count > 0) ? count : -1;
 }
 
-static int ne_fill_str_list(const char *joined, int pq_null, char out[][MAX_CIDR_ITEM_LEN], int max_out) {
+static int ne_fill_nullable_list(const char *joined, int pq_null,
+                                 char out[][MAX_CIDR_ITEM_LEN], int max_out) {
+    if (!out || max_out <= 0)
+        return -1;
     if (pq_null || !joined || !joined[0]) {
-        strncpy(out[0], "ANY", MAX_CIDR_ITEM_LEN - 1);
-        out[0][MAX_CIDR_ITEM_LEN - 1] = '\0';
+        out[0][0] = '\0';
         return 1;
     }
     int n = split_cidr_list(joined, out, max_out);
     if (n < 0) {
-        strncpy(out[0], "ANY", MAX_CIDR_ITEM_LEN - 1);
-        out[0][MAX_CIDR_ITEM_LEN - 1] = '\0';
-        return 1;
+        out[0][0] = '\0';
+        return -1;
     }
     return n;
 }
@@ -378,10 +379,10 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
     res = PQexecParams(conn,
         "SELECT id, priority, action::text, proto::text, "
-        "COALESCE(array_to_string(src_ip, ','), ''), invert_src_ip, "
-        "COALESCE(array_to_string(dst_ip, ','), ''), invert_dst_ip, "
-        "COALESCE(array_to_string(src_port, ','), ''), "
-        "COALESCE(array_to_string(dst_port, ','), ''), "
+        "array_to_string(src_ip, ','), invert_src_ip, "
+        "array_to_string(dst_ip, ','), invert_dst_ip, "
+        "array_to_string(src_port, ','), "
+        "array_to_string(dst_port, ','), "
         "method::text, encryption_key, nonce "
         "FROM ne_policies WHERE profile_id = $1 ORDER BY priority ASC, id ASC",
         1, NULL, params, NULL, NULL, 0);
@@ -457,10 +458,15 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         char sp_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
         char dp_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
 
-        int src_n = ne_fill_str_list(src_joined, PQgetisnull(res, r, 4), src_items, MAX_CIDR_LIST_ITEMS);
-        int dst_n = ne_fill_str_list(dst_joined, PQgetisnull(res, r, 6), dst_items, MAX_CIDR_LIST_ITEMS);
-        int sp_n = ne_fill_str_list(sport_joined, PQgetisnull(res, r, 8), sp_items, MAX_CIDR_LIST_ITEMS);
-        int dp_n = ne_fill_str_list(dport_joined, PQgetisnull(res, r, 9), dp_items, MAX_CIDR_LIST_ITEMS);
+        int src_n = ne_fill_nullable_list(src_joined, PQgetisnull(res, r, 4), src_items, MAX_CIDR_LIST_ITEMS);
+        int dst_n = ne_fill_nullable_list(dst_joined, PQgetisnull(res, r, 6), dst_items, MAX_CIDR_LIST_ITEMS);
+        int sp_n = ne_fill_nullable_list(sport_joined, PQgetisnull(res, r, 8), sp_items, MAX_CIDR_LIST_ITEMS);
+        int dp_n = ne_fill_nullable_list(dport_joined, PQgetisnull(res, r, 9), dp_items, MAX_CIDR_LIST_ITEMS);
+        if (src_n <= 0 || dst_n <= 0 || sp_n <= 0 || dp_n <= 0) {
+            fprintf(stderr, "[DB CRYPTO] policy id=%d has invalid match list\n", db_policy_id);
+            PQclear(res);
+            return -1;
+        }
 
         for (int si = 0; si < src_n; si++) {
             for (int di = 0; di < dst_n; di++) {

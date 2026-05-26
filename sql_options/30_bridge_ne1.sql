@@ -41,10 +41,10 @@ INSERT INTO ne_policies (
     'aes-gcm-128', 12, 'aac816a88e013feb4925f9f2af602b3f', 'seed'
 ),
 (
-    40, 30, 4, 'bypass', 'any',
-    ARRAY['ANY']::text[], FALSE,
-    ARRAY['ANY']::text[], FALSE,
-    ARRAY['ANY']::text[], ARRAY['ANY']::text[],
+    40, 30, 4, 'bypass', NULL,
+    NULL, FALSE,
+    NULL, FALSE,
+    NULL, NULL,
     NULL, NULL, NULL, 'seed'
 );
 

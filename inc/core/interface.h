@@ -96,18 +96,7 @@ struct ne_port {
     struct xsk_ring_cons cq;
     int ifindex;
     char ifname[IF_NAMESIZE];
-    uint64_t rx_packets;
-    uint64_t tx_packets;
-    uint64_t dropped_tx_full;
     uint64_t tx_no_free;
-    uint64_t tx_reserve_fail;
-    uint64_t tx_submit_calls;
-    uint64_t tx_popped;
-    uint64_t cq_packets;
-    uint64_t fq_no_slots;
-    uint64_t fq_pool_empty;
-    uint64_t fq_reserve_fail;
-    uint64_t fq_refill_packets;
 };
 
 struct ne_pair {
@@ -154,7 +143,6 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx);
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
-void interface_print_xdp_stats(struct ne_pair *p);
 
 void interface_reset_redirect_maps(void);
 int interface_push_encrypt_filters(const struct app_config *cfg);

@@ -16,41 +16,47 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 10);
-    __type(key, int);
-    __type(value, __u64);
-} wan_stats_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 2);
     __type(key, int);
     __type(value, __u16);
 } wan_config_map SEC(".maps");
 
-#define STAT_TOTAL      0
-#define STAT_NON_IP     1
-#define STAT_REDIRECT   2
-#define STAT_NO_SOCK    3
-#define STAT_ARP_PASS   4
-#define STAT_ICMP_PASS  5
-#define STAT_NE_L2      6
-#define STAT_TCP_REDIRECT 7
-#define STAT_UDP_REDIRECT 8
 #define IPPROTO_ICMP_VAL 1
 #define IPPROTO_TCP_VAL 6
 #define IPPROTO_UDP_VAL 17
+#define DNS_PORT_VAL 53
+#define NTP_PORT_VAL 123
 #define ETH_P_LLDP_VAL 0x88cc
 #define ETH_P_8021AD_VAL 0x88a8
 #define ETH_P_EAPOL_VAL 0x888e
 #define ETH_P_MACSEC_VAL 0x88e5
 #define ETH_P_PTP_VAL 0x88f7
 
-static __always_inline void inc_stat(int idx)
+static __always_inline int read_tcp_udp_ports(void *data, void *data_end, __u8 ip_proto,
+                                              __u16 *sport_out, __u16 *dport_out)
 {
-    __u64 *val = bpf_map_lookup_elem(&wan_stats_map, &idx);
-    if (val)
-        __sync_fetch_and_add(val, 1);
+    *sport_out = 0;
+    *dport_out = 0;
+    if (ip_proto != IPPROTO_TCP_VAL && ip_proto != IPPROTO_UDP_VAL)
+        return 0;
+
+    struct ethhdr *eth = data;
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return -1;
+
+    __u32 ihl = (__u32)ip->ihl * 4U;
+    if (ihl < 20)
+        return -1;
+
+    __u8 *l4 = (__u8 *)ip + ihl;
+    if ((void *)(l4 + 4) > data_end)
+        return -1;
+
+    __be16 *ports = (__be16 *)l4;
+    *sport_out = bpf_ntohs(ports[0]);
+    *dport_out = bpf_ntohs(ports[1]);
+    return 0;
 }
 
 SEC("xdp")
@@ -59,8 +65,6 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    inc_stat(STAT_TOTAL);
-
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
@@ -68,7 +72,6 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     __u16 proto = eth->h_proto;
 
     if (proto == __constant_htons(ETH_P_ARP)) {
-        inc_stat(STAT_ARP_PASS);
         return XDP_PASS;
     }
 
@@ -78,13 +81,18 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
             return XDP_PASS;
 
         if (ip->protocol == IPPROTO_ICMP_VAL) {
-            inc_stat(STAT_ICMP_PASS);
             return XDP_PASS;
         }
-        if (ip->protocol == IPPROTO_TCP_VAL)
-            inc_stat(STAT_TCP_REDIRECT);
-        else if (ip->protocol == IPPROTO_UDP_VAL)
-            inc_stat(STAT_UDP_REDIRECT);
+        if (ip->protocol == IPPROTO_TCP_VAL || ip->protocol == IPPROTO_UDP_VAL) {
+            __u16 sport = 0;
+            __u16 dport = 0;
+            if (read_tcp_udp_ports(data, data_end, ip->protocol, &sport, &dport) < 0)
+                return XDP_PASS;
+            if (sport == DNS_PORT_VAL || dport == DNS_PORT_VAL ||
+                sport == NTP_PORT_VAL || dport == NTP_PORT_VAL) {
+                return XDP_PASS;
+            }
+        }
         goto redirect;
     }
 
@@ -105,27 +113,17 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         if (fake4 && *fake4 != 0)
             marker = (__u8)(*fake4 >> 8);
         if (raw[12] == marker || raw[12] == 0x88u) {
-            inc_stat(STAT_NE_L2);
             goto redirect;
         }
     }
 
-    inc_stat(STAT_NON_IP);
     return XDP_PASS;
 
 redirect:
     ;
 
     int queue_id = NE_XSK_QUEUE_ID;
-    int ret = bpf_redirect_map(&wan_xsks_map, queue_id, XDP_DROP);
-
-    if (ret == XDP_REDIRECT) {
-        inc_stat(STAT_REDIRECT);
-    } else {
-        inc_stat(STAT_NO_SOCK);
-    }
-
-    return ret;
+    return bpf_redirect_map(&wan_xsks_map, queue_id, XDP_DROP);
 }
 
 char _license[] SEC("license") = "GPL";

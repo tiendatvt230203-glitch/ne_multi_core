@@ -196,6 +196,30 @@ static int weights_sum_positive(const int *allowed_weights, int allowed_count) {
     return s;
 }
 
+static int first_positive_pos(const int *allowed_weights, int allowed_count) {
+    if (!allowed_weights || allowed_count <= 0)
+        return 0;
+    for (int i = 0; i < allowed_count; i++) {
+        if (allowed_weights[i] > 0)
+            return i;
+    }
+    return 0;
+}
+
+static int next_enabled_pos(int pos, const int *allowed_weights, int allowed_count) {
+    if (allowed_count <= 0)
+        return 0;
+    int sumw = weights_sum_positive(allowed_weights, allowed_count);
+    if (sumw <= 0 || !allowed_weights)
+        return (pos + 1) % allowed_count;
+    for (int step = 1; step <= allowed_count; step++) {
+        int next = (pos + step) % allowed_count;
+        if (allowed_weights[next] > 0)
+            return next;
+    }
+    return first_positive_pos(allowed_weights, allowed_count);
+}
+
 static int wrr_slot_to_wan(int slot, const int *allowed_wans, const int *allowed_weights,
                            int allowed_count, int sumw) {
     if (!allowed_wans || !allowed_weights || allowed_count <= 0 || sumw <= 0)
@@ -226,7 +250,7 @@ static uint32_t profile_wan_limit(const struct flow_table *ft, int wan_idx,
         return base / (uint32_t)(allowed_count > 0 ? allowed_count : 1);
     int pos = wan_allowed_pos(wan_idx, allowed_wans, allowed_count);
     if (pos < 0 || allowed_weights[pos] <= 0)
-        return base / (uint32_t)sumw;
+        return 0;
     uint64_t limit = ((uint64_t)base * (uint64_t)allowed_weights[pos]) / (uint64_t)sumw;
     return limit > 0 ? (uint32_t)limit : 1;
 }
@@ -261,6 +285,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     normalize_flow_5tuple(&src_ip, &dst_ip, &src_port, &dst_port);
     uint32_t idx = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
     uint64_t now = get_time_sec();
+    int sumw = weights_sum_positive(allowed_weights, allowed_count);
 
     pthread_mutex_lock(&ft->locks[idx]);
 
@@ -275,11 +300,11 @@ int flow_table_get_wan_profile(struct flow_table *ft,
             entry->key.protocol == protocol) {
 
             int pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
-            if (pos < 0) {
-                entry->current_wan = allowed_wans[0];
+            if (pos < 0 || (sumw > 0 && allowed_weights && allowed_weights[pos] <= 0)) {
+                pos = (sumw > 0) ? first_positive_pos(allowed_weights, allowed_count) : 0;
+                entry->current_wan = allowed_wans[pos];
                 entry->byte_count = 0;
-                entry->wrr_slot = 0;
-                pos = 0;
+                entry->wrr_slot = pos;
             }
 
             entry->last_seen = now;
@@ -295,7 +320,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
                 pos = wan_allowed_pos(wan_idx, allowed_wans, allowed_count);
                 if (pos < 0)
                     pos = 0;
-                entry->wrr_slot = (pos + 1) % allowed_count;
+                entry->wrr_slot = next_enabled_pos(pos, allowed_weights, allowed_count);
                 entry->current_wan = allowed_wans[entry->wrr_slot];
             }
 
@@ -324,8 +349,17 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     entry->next = ft->buckets[idx];
 
     uint32_t h = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
-    entry->wrr_slot = (int)(h % (uint32_t)allowed_count);
-    entry->current_wan = allowed_wans[entry->wrr_slot];
+    if (sumw > 0 && allowed_weights) {
+        entry->current_wan = wrr_slot_to_wan((int)(h % (uint32_t)sumw),
+                                             allowed_wans, allowed_weights,
+                                             allowed_count, sumw);
+        entry->wrr_slot = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+        if (entry->wrr_slot < 0)
+            entry->wrr_slot = first_positive_pos(allowed_weights, allowed_count);
+    } else {
+        entry->wrr_slot = (int)(h % (uint32_t)allowed_count);
+        entry->current_wan = allowed_wans[entry->wrr_slot];
+    }
     int wan_idx = entry->current_wan;
     uint32_t cur_limit = profile_wan_limit(ft, wan_idx,
                                            allowed_wans, allowed_weights,
@@ -335,7 +369,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
         if (pos < 0)
             pos = 0;
         entry->byte_count = 0;
-        entry->wrr_slot = (pos + 1) % allowed_count;
+        entry->wrr_slot = next_enabled_pos(pos, allowed_weights, allowed_count);
         entry->current_wan = allowed_wans[entry->wrr_slot];
     }
 

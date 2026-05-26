@@ -7,12 +7,6 @@
 #include <sys/socket.h>
 #include <ctype.h>
 
-static int trace_hit(uint64_t *counter)
-{
-    uint64_t n = __sync_add_and_fetch(counter, 1);
-    return n <= 256 || (n % 1024) == 0;
-}
-
 static uint32_t next_pow2_u32(uint32_t v)
 {
     if (v <= 1)
@@ -499,7 +493,6 @@ static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max,
         out[i].wan_idx = wan_idx;
         out[i].local_idx = local_idx;
     }
-    port->rx_packets += n;
     return (int)n;
 }
 
@@ -564,7 +557,6 @@ static void drain_cq(struct ne_port *port, struct ne_pool *pool)
             addrs[i] = *xsk_ring_cons__comp_addr(&port->cq, idx + i);
         xsk_ring_cons__release(&port->cq, n);
         (void)pool_push(pool, addrs, n);
-        port->cq_packets += n;
     }
 }
 
@@ -582,47 +574,22 @@ void ne_drain_cq_wan(struct ne_pair *p)
 
 static void refill_fq(struct ne_port *port, struct ne_pool *pool)
 {
-    static uint64_t trace_counter;
     uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
     uint32_t free_slots = xsk_prod_nb_free(&port->fq, NE_BATCH_SIZE);
-    if (free_slots < NE_BATCH_SIZE) {
-        port->fq_no_slots++;
+    if (free_slots < NE_BATCH_SIZE)
         return;
-    }
 
     uint32_t got = pool_pop(pool, addrs, NE_BATCH_SIZE);
-    if (!got) {
-        port->fq_pool_empty++;
-        if (trace_hit(&trace_counter)) {
-            fprintf(stderr,
-                    "[TRACE FQ] if=%s pool_empty count=%llu\n",
-                    port->ifname,
-                    (unsigned long long)port->fq_pool_empty);
-        }
+    if (!got)
         return;
-    }
     if (xsk_ring_prod__reserve(&port->fq, got, &idx) != got) {
         (void)pool_push(pool, addrs, got);
-        port->fq_reserve_fail++;
-        if (trace_hit(&trace_counter)) {
-            fprintf(stderr,
-                    "[TRACE FQ] if=%s reserve_fail got=%u count=%llu\n",
-                    port->ifname, got,
-                    (unsigned long long)port->fq_reserve_fail);
-        }
         return;
     }
     for (uint32_t i = 0; i < got; i++)
         *xsk_ring_prod__fill_addr(&port->fq, idx + i) = addrs[i];
     xsk_ring_prod__submit(&port->fq, got);
-    port->fq_refill_packets += got;
-    if (trace_hit(&trace_counter)) {
-        fprintf(stderr,
-                "[TRACE FQ] if=%s refill=%u total=%llu\n",
-                port->ifname, got,
-                (unsigned long long)port->fq_refill_packets);
-    }
 }
 
 void ne_refill_fq_local(struct ne_pair *p)
@@ -639,18 +606,11 @@ void ne_refill_fq_wan(struct ne_pair *p)
 
 static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max_frame)
 {
-    static uint64_t trace_counter;
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&port->tx, NE_BATCH_SIZE);
     if (!free_slots) {
         port->tx_no_free++;
         (void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-        if (ne_ring_count(src) > 0 && trace_hit(&trace_counter)) {
-            fprintf(stderr,
-                    "[TRACE TX] if=%s no_free kick src_ring=%u count=%llu\n",
-                    port->ifname, ne_ring_count(src),
-                    (unsigned long long)port->tx_no_free);
-        }
         return 0;
     }
 
@@ -665,13 +625,6 @@ static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max
     if (xsk_ring_prod__reserve(&port->tx, popped, &idx) != popped) {
         for (uint32_t i = 0; i < popped; i++)
             (void)ne_ring_try_push(src, &jobs[i]);
-        port->tx_reserve_fail++;
-        if (trace_hit(&trace_counter)) {
-            fprintf(stderr,
-                    "[TRACE TX] if=%s reserve_fail popped=%u free=%u count=%llu\n",
-                    port->ifname, popped, free_slots,
-                    (unsigned long long)port->tx_reserve_fail);
-        }
         return 0;
     }
 
@@ -682,16 +635,6 @@ static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max
     }
     xsk_ring_prod__submit(&port->tx, popped);
     (void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-    port->tx_packets += popped;
-    port->tx_popped += popped;
-    port->tx_submit_calls++;
-    if (trace_hit(&trace_counter)) {
-        fprintf(stderr,
-                "[TRACE TX] if=%s submit=%u free_before=%u tx_packets=%llu src_ring_after=%u\n",
-                port->ifname, popped, free_slots,
-                (unsigned long long)port->tx_packets,
-                ne_ring_count(src));
-    }
     return (int)popped;
 }
 
@@ -709,60 +652,3 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
     return tx_drain_port(&p->wans[wan_idx], src, p->frame_size);
 }
 
-static uint64_t map_u64_value(struct bpf_map *map, int key)
-{
-    uint64_t val = 0;
-    if (map)
-        (void)bpf_map_lookup_elem(bpf_map__fd(map), &key, &val);
-    return val;
-}
-
-void interface_print_xdp_stats(struct ne_pair *p)
-{
-    if (!p)
-        return;
-
-    for (int i = 0; i < p->local_count; i++) {
-        struct bpf_map *local_stats = p->bpf_locals[i] ?
-            bpf_object__find_map_by_name(p->bpf_locals[i], "stats_map") : NULL;
-        if (local_stats) {
-            fprintf(stderr,
-                    "[XDP-STATS local[%d] %s] total=%llu non_ip_or_short=%llu icmp_pass=%llu no_sock=%llu redirect=%llu arp_pass=%llu other_l4_pass=%llu port_fail=%llu dns_ntp_pass=%llu\n",
-                    i, p->locals[i].ifname,
-                    (unsigned long long)map_u64_value(local_stats, 0),
-                    (unsigned long long)map_u64_value(local_stats, 1),
-                    (unsigned long long)map_u64_value(local_stats, 4),
-                    (unsigned long long)map_u64_value(local_stats, 5),
-                    (unsigned long long)map_u64_value(local_stats, 6),
-                    (unsigned long long)map_u64_value(local_stats, 7),
-                    (unsigned long long)map_u64_value(local_stats, 8),
-                    (unsigned long long)map_u64_value(local_stats, 10),
-                    (unsigned long long)map_u64_value(local_stats, 11));
-        } else {
-            fprintf(stderr, "[XDP-STATS local[%d] %s] stats_map missing\n",
-                    i, p->locals[i].ifname);
-        }
-    }
-
-    for (int i = 0; i < p->wan_count; i++) {
-        struct bpf_map *wan_stats = p->bpf_wans[i] ?
-            bpf_object__find_map_by_name(p->bpf_wans[i], "wan_stats_map") : NULL;
-        if (wan_stats) {
-            fprintf(stderr,
-                    "[XDP-STATS wan[%d] %s] total=%llu non_ip=%llu redirect=%llu no_sock=%llu arp_pass=%llu icmp_pass=%llu ne_l2=%llu tcp_redirect=%llu udp_redirect=%llu\n",
-                    i, p->wans[i].ifname,
-                    (unsigned long long)map_u64_value(wan_stats, 0),
-                    (unsigned long long)map_u64_value(wan_stats, 1),
-                    (unsigned long long)map_u64_value(wan_stats, 2),
-                    (unsigned long long)map_u64_value(wan_stats, 3),
-                    (unsigned long long)map_u64_value(wan_stats, 4),
-                    (unsigned long long)map_u64_value(wan_stats, 5),
-                    (unsigned long long)map_u64_value(wan_stats, 6),
-                    (unsigned long long)map_u64_value(wan_stats, 7),
-                    (unsigned long long)map_u64_value(wan_stats, 8));
-        } else {
-            fprintf(stderr, "[XDP-STATS wan[%d] %s] wan_stats_map missing\n",
-                    i, p->wans[i].ifname);
-        }
-    }
-}
