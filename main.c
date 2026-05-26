@@ -202,6 +202,7 @@ static void *forwarder_thread_main(void *arg) {
     }
     rt->running = 1;
     forwarder_run(&rt->fwd);
+    forwarder_print_stats(&rt->fwd);
     forwarder_cleanup(&rt->fwd);
     rt->running = 0;
     return NULL;

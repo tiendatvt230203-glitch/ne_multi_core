@@ -32,6 +32,15 @@ struct forwarder {
     uint64_t dropped_no_local_match;
     uint64_t dropped_local_tx_fail;
     uint64_t dropped_ring_full;
+    uint64_t local_rx_to_mid;
+    uint64_t wan_rx_to_mid;
+    uint64_t dropped_no_wan;
+    uint64_t dropped_wan_l2;
+    uint64_t dropped_policy_not_ready;
+    uint64_t dropped_encrypt_fail;
+    uint64_t local_bypass_to_wan;
+    uint64_t local_encrypted_to_wan;
+    uint64_t local_split_to_wan;
 };
 
 void forwarder_pin_cpu(void);

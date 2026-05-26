@@ -32,6 +32,35 @@ static struct frag_table wan_frag_l2;
 static struct frag_table wan_frag_l3;
 static struct frag_table wan_frag_l4;
 
+static int trace_hit(uint64_t *counter)
+{
+    uint64_t n = __sync_add_and_fetch(counter, 1);
+    return n <= 256 || (n % 1024) == 0;
+}
+
+static const char *action_name(int action)
+{
+    switch (action) {
+    case POLICY_ACTION_BYPASS:
+        return "bypass";
+    case POLICY_ACTION_ENCRYPT_L2:
+        return "L2";
+    case POLICY_ACTION_ENCRYPT_L3:
+        return "L3";
+    case POLICY_ACTION_ENCRYPT_L4:
+        return "L4";
+    default:
+        return "none";
+    }
+}
+
+static void ip_to_str(uint32_t ip, char *buf, size_t len)
+{
+    struct in_addr a = { .s_addr = ip };
+    if (!inet_ntop(AF_INET, &a, buf, len))
+        snprintf(buf, len, "0.0.0.0");
+}
+
 static void pin_cpu(unsigned int cpu)
 {
     cpu_set_t cpuset;
@@ -268,6 +297,7 @@ static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
                                   const uint8_t *frag1, uint32_t frag1_len,
                                   int wan_idx)
 {
+    static uint64_t trace_counter;
     if (wan_idx < 0 || wan_idx >= fwd->wan_count)
         return -1;
     struct ne_ring *tx = &fwd->mid_to_wan[wan_idx];
@@ -285,6 +315,12 @@ static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
     job->len = frag0_len;
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_idx;
+
+    if (trace_hit(&trace_counter)) {
+        fprintf(stderr,
+                "[TRACE SPLIT-EMIT] wan=%d if=%s frag0=%u frag1=%u ring_before=%u\n",
+                wan_idx, fwd->pair.wans[wan_idx].ifname, frag0_len, frag1_len, used);
+    }
 
     if (ne_ring_try_push(tx, job) != 0) {
         ne_frame_free(&fwd->pair, tail.addr);
@@ -363,6 +399,7 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
                                 uint16_t src_port, uint16_t dst_port,
                                 uint8_t proto, uint32_t pkt_len)
 {
+    static uint64_t trace_counter;
     if (!fwd || fwd->wan_count <= 0)
         return -1;
     if (profile_idx >= 0 && profile_idx < fwd->cfg->profile_count) {
@@ -380,57 +417,141 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
                                                          p->wan_bandwidth_weight,
                                                          p->wan_count);
             }
-            if (wan_idx >= 0 && wan_idx < fwd->wan_count)
+            if (wan_idx >= 0 && wan_idx < fwd->wan_count) {
+                if (trace_hit(&trace_counter)) {
+                    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+                    int selected_weight = 0;
+                    for (int wi = 0; wi < p->wan_count; wi++) {
+                        if (p->wan_indices[wi] == wan_idx) {
+                            selected_weight = p->wan_bandwidth_weight[wi];
+                            break;
+                        }
+                    }
+                    ip_to_str(src_ip, src, sizeof(src));
+                    ip_to_str(dst_ip, dst, sizeof(dst));
+                    fprintf(stderr,
+                            "[TRACE LB] profile=%d flow_ok=%d %s:%u -> %s:%u proto=%u len=%u allowed=%d selected_wan=%d if=%s weight=%d ring=%u\n",
+                            profile_idx, flow_ok, src, src_port, dst, dst_port, proto, pkt_len,
+                            p->wan_count, wan_idx, fwd->pair.wans[wan_idx].ifname,
+                            selected_weight,
+                            ne_ring_count(&fwd->mid_to_wan[wan_idx]));
+                }
                 return wan_idx;
+            }
         }
+    }
+    if (trace_hit(&trace_counter)) {
+        fprintf(stderr,
+                "[TRACE LB] profile=%d flow_ok=%d fallback_wan=0 if=%s len=%u\n",
+                profile_idx, flow_ok, fwd->pair.wans[0].ifname, pkt_len);
     }
     return 0;
 }
 
 static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
 {
+    static uint64_t trace_counter;
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     uint32_t src_ip = 0, dst_ip = 0;
     uint16_t src_port = 0, dst_port = 0;
     uint8_t proto = 0;
+    int encrypted = 0;
     int flow_ok = (parse_flow(pkt, job.len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0);
     int profile_idx = config_select_profile_for_local(fwd->cfg, 0);
     int wan_idx = select_wan_for_local(fwd, profile_idx, flow_ok,
                                        src_ip, dst_ip, src_port, dst_port,
                                        proto, job.len);
-    if (wan_idx < 0)
+    int do_trace = trace_hit(&trace_counter);
+    if (do_trace) {
+        char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+        ip_to_str(src_ip, src, sizeof(src));
+        ip_to_str(dst_ip, dst, sizeof(dst));
+        fprintf(stderr,
+                "[TRACE LOCAL-IN] len=%u flow_ok=%d profile=%d wan=%d %s:%u -> %s:%u proto=%u eth=%02x%02x\n",
+                job.len, flow_ok, profile_idx, wan_idx, src, src_port, dst, dst_port, proto,
+                pkt[12], pkt[13]);
+    }
+    if (wan_idx < 0) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE LOCAL-DROP] reason=no_wan len=%u profile=%d\n", job.len, profile_idx);
+        __sync_fetch_and_add(&fwd->dropped_no_wan, 1);
         goto drop;
+    }
 
     if (config_wan_bridge_mode(fwd->cfg))
         bridge_mac_learn_rx(fwd, 0, pkt, job.len);
 
-    if (set_wan_l2(fwd, wan_idx, pkt) != 0)
+    if (set_wan_l2(fwd, wan_idx, pkt) != 0) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE LOCAL-DROP] reason=wan_l2 wan=%d len=%u\n", wan_idx, job.len);
+        __sync_fetch_and_add(&fwd->dropped_wan_l2, 1);
         goto drop;
+    }
 
     if (fwd->cfg->crypto_enabled) {
         const struct crypto_policy *cp = NULL;
         if (flow_ok)
             cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
                                              src_port, dst_port, proto);
+        if (do_trace) {
+            if (cp) {
+                fprintf(stderr,
+                        "[TRACE POLICY] db_id=%d wire_id=%d action=%s ready=%d\n",
+                        cp->db_id, cp->id, action_name(cp->action),
+                        (cp->action >= 0 && cp->action <= POLICY_ACTION_ENCRYPT_L4) ?
+                            policy_crypto_ready[cp - fwd->cfg->policies] : 0);
+            } else {
+                fprintf(stderr, "[TRACE POLICY] no_match -> bypass_forward\n");
+            }
+        }
         if (cp && cp->action != POLICY_ACTION_BYPASS) {
             int pi = (int)(cp - fwd->cfg->policies);
-            if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi])
+            if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi]) {
+                if (do_trace)
+                    fprintf(stderr, "[TRACE LOCAL-DROP] reason=policy_not_ready pi=%d\n", pi);
+                __sync_fetch_and_add(&fwd->dropped_policy_not_ready, 1);
                 goto drop;
+            }
             crypto_apply_from_policy(cp);
             int enc_rc = encrypt_split_or_single(fwd, &job, cp, wan_idx);
-            if (enc_rc < 0)
+            if (enc_rc < 0) {
+                if (do_trace)
+                    fprintf(stderr, "[TRACE LOCAL-DROP] reason=encrypt_fail action=%s len=%u\n",
+                            action_name(cp->action), job.len);
+                __sync_fetch_and_add(&fwd->dropped_encrypt_fail, 1);
                 goto drop;
+            }
             if (enc_rc > 0) {
+                if (do_trace)
+                    fprintf(stderr, "[TRACE LOCAL-OUT] split action=%s wan=%d ring_now=%u\n",
+                            action_name(cp->action), wan_idx, ne_ring_count(&fwd->mid_to_wan[wan_idx]));
                 __sync_fetch_and_add(&fwd->local_to_wan, 1);
+                __sync_fetch_and_add(&fwd->local_split_to_wan, 1);
                 return;
             }
+            encrypted = 1;
         }
     }
 
     job.dir = NE_DIR_WAN;
     job.wan_idx = (uint8_t)wan_idx;
-    if (emit_owned(fwd, &fwd->mid_to_wan[wan_idx], &job) == 0)
+    if (emit_owned(fwd, &fwd->mid_to_wan[wan_idx], &job) == 0) {
+        if (do_trace)
+            fprintf(stderr,
+                    "[TRACE LOCAL-OUT] mode=%s wan=%d if=%s len=%u ring_now=%u\n",
+                    encrypted ? "encrypted" : "bypass", wan_idx,
+                    fwd->pair.wans[wan_idx].ifname, job.len,
+                    ne_ring_count(&fwd->mid_to_wan[wan_idx]));
         __sync_fetch_and_add(&fwd->local_to_wan, 1);
+        if (encrypted)
+            __sync_fetch_and_add(&fwd->local_encrypted_to_wan, 1);
+        else
+            __sync_fetch_and_add(&fwd->local_bypass_to_wan, 1);
+    } else if (do_trace) {
+        fprintf(stderr,
+                "[TRACE LOCAL-DROP] reason=emit_mid_to_wan_failed wan=%d len=%u ring=%u\n",
+                wan_idx, job.len, ne_ring_count(&fwd->mid_to_wan[wan_idx]));
+    }
     return;
 
 drop:
@@ -571,28 +692,57 @@ static int pick_local_for_packet(struct forwarder *fwd, uint8_t *pkt, uint32_t p
 
 static void process_wan_packet(struct forwarder *fwd, struct ne_packet job)
 {
+    static uint64_t trace_counter;
+    int do_trace = trace_hit(&trace_counter);
+    if (do_trace) {
+        uint8_t *raw = ne_packet_data(&fwd->pair, job.addr);
+        fprintf(stderr,
+                "[TRACE WAN-IN] wan=%u len=%u eth=%02x%02x\n",
+                job.wan_idx, job.len, raw[12], raw[13]);
+    }
     int dec = decrypt_wan_packet(fwd, &job);
     if (dec == 1) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE WAN-WAIT] fragment buffered wan=%u\n", job.wan_idx);
         ne_frame_free(&fwd->pair, job.addr);
         return;
     }
-    if (dec != 0)
+    if (dec != 0) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE WAN-DROP] reason=decrypt_fail wan=%u len=%u\n", job.wan_idx, job.len);
         goto drop;
+    }
 
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     int local_idx = pick_local_for_packet(fwd, pkt, job.len);
     if (local_idx < 0 || local_idx >= fwd->local_count) {
+        if (do_trace)
+            fprintf(stderr,
+                    "[TRACE WAN-DROP] reason=no_local_match wan=%u len=%u dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                    job.wan_idx, job.len, pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5]);
         __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
         goto drop;
     }
     if (set_local_l2(fwd, local_idx, pkt) != 0) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE WAN-DROP] reason=local_l2_fail local=%d len=%u\n",
+                    local_idx, job.len);
         __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
         goto drop;
     }
 
     job.dir = NE_DIR_LOCAL;
-    if (emit_owned(fwd, &fwd->mid_to_local, &job) == 0)
+    if (emit_owned(fwd, &fwd->mid_to_local, &job) == 0) {
+        if (do_trace)
+            fprintf(stderr,
+                    "[TRACE WAN-OUT] local=%d if=%s len=%u mid_to_local=%u\n",
+                    local_idx, fwd->pair.local.ifname, job.len,
+                    ne_ring_count(&fwd->mid_to_local));
         __sync_fetch_and_add(&fwd->wan_to_local, 1);
+    } else if (do_trace) {
+        fprintf(stderr, "[TRACE WAN-DROP] reason=emit_mid_to_local_failed len=%u ring=%u\n",
+                job.len, ne_ring_count(&fwd->mid_to_local));
+    }
     return;
 
 drop:
@@ -604,6 +754,7 @@ static void *local_core_thread(void *arg)
 {
     struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
+    uint64_t trace_counter = 0;
     pin_cpu(NE_CPU_LOC);
 
     while (running) {
@@ -617,11 +768,21 @@ static void *local_core_thread(void *arg)
             continue;
         }
 
+        if (trace_hit(&trace_counter)) {
+            fprintf(stderr,
+                    "[TRACE LOCAL-RX] batch=%d local_to_mid_before=%u mid_to_local=%u\n",
+                    rcvd, ne_ring_count(&fwd->local_to_mid), ne_ring_count(&fwd->mid_to_local));
+        }
         for (int i = 0; i < rcvd; i++) {
             if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0) {
+                fprintf(stderr,
+                        "[TRACE LOCAL-RX-DROP] reason=local_to_mid_full len=%u ring=%u\n",
+                        batch[i].len, ne_ring_count(&fwd->local_to_mid));
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_ring_full, 1);
+            } else {
+                __sync_fetch_and_add(&fwd->local_rx_to_mid, 1);
             }
         }
         ne_recv_release_local(&fwd->pair, (uint32_t)rcvd);
@@ -633,13 +794,26 @@ static void *wan_core_thread(void *arg)
 {
     struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
+    uint64_t tx_trace_counter = 0;
+    uint64_t rx_trace_counter = 0;
     pin_cpu(NE_CPU_WAN);
 
     while (running) {
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
-        for (int wi = 0; wi < fwd->wan_count; wi++)
-            (void)ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
+        for (int wi = 0; wi < fwd->wan_count; wi++) {
+            uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
+            int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
+            if ((sent > 0 || before > 0) && trace_hit(&tx_trace_counter)) {
+                fprintf(stderr,
+                        "[TRACE WAN-TX-DRAIN] wan=%d if=%s ring_before=%u sent=%d ring_after=%u tx_packets=%llu no_free=%llu reserve_fail=%llu\n",
+                        wi, fwd->pair.wans[wi].ifname, before, sent,
+                        ne_ring_count(&fwd->mid_to_wan[wi]),
+                        (unsigned long long)fwd->pair.wans[wi].tx_packets,
+                        (unsigned long long)fwd->pair.wans[wi].tx_no_free,
+                        (unsigned long long)fwd->pair.wans[wi].tx_reserve_fail);
+            }
+        }
 
         int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
@@ -647,11 +821,21 @@ static void *wan_core_thread(void *arg)
             continue;
         }
 
+        if (trace_hit(&rx_trace_counter)) {
+            fprintf(stderr,
+                    "[TRACE WAN-RX] batch=%d wan_to_mid_before=%u\n",
+                    rcvd, ne_ring_count(&fwd->wan_to_mid));
+        }
         for (int i = 0; i < rcvd; i++) {
             if (ne_ring_try_push(&fwd->wan_to_mid, &batch[i]) != 0) {
+                fprintf(stderr,
+                        "[TRACE WAN-RX-DROP] reason=wan_to_mid_full wan=%u len=%u ring=%u\n",
+                        batch[i].wan_idx, batch[i].len, ne_ring_count(&fwd->wan_to_mid));
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_ring_full, 1);
+            } else {
+                __sync_fetch_and_add(&fwd->wan_rx_to_mid, 1);
             }
         }
         ne_recv_release_wan(&fwd->pair, (uint32_t)rcvd);
@@ -664,6 +848,7 @@ static void *middle_core_thread(void *arg)
     struct forwarder *fwd = arg;
     struct ne_packet job;
     uint32_t gc_tick = 0;
+    uint64_t trace_counter = 0;
     pin_cpu(NE_CPU_MID);
 
     while (running) {
@@ -671,10 +856,20 @@ static void *middle_core_thread(void *arg)
 
         pthread_mutex_lock(&runtime_lock);
         if (ne_ring_try_pop(&fwd->wan_to_mid, &job) == 0) {
+            if (trace_hit(&trace_counter)) {
+                fprintf(stderr,
+                        "[TRACE MID] pop wan_to_mid len=%u wan=%u remaining=%u\n",
+                        job.len, job.wan_idx, ne_ring_count(&fwd->wan_to_mid));
+            }
             process_wan_packet(fwd, job);
             did_work = 1;
         }
         if (ne_ring_try_pop(&fwd->local_to_mid, &job) == 0) {
+            if (trace_hit(&trace_counter)) {
+                fprintf(stderr,
+                        "[TRACE MID] pop local_to_mid len=%u remaining=%u\n",
+                        job.len, ne_ring_count(&fwd->local_to_mid));
+            }
             process_local_packet(fwd, job);
             did_work = 1;
         }
@@ -837,20 +1032,41 @@ void forwarder_print_stats(struct forwarder *fwd)
     if (!fwd)
         return;
     fprintf(stderr,
-            "[STATS] local_to_wan=%llu wan_to_local=%llu dropped=%llu ring_full=%llu "
-            "no_local=%llu local_tx_fail=%llu\n",
+            "[STATS] local_rx=%llu local_tx=%llu local_to_wan=%llu wan_to_local=%llu dropped=%llu ring_full=%llu "
+            "no_local=%llu local_tx_fail=%llu local_rx_to_mid=%llu wan_rx_to_mid=%llu\n",
+            (unsigned long long)fwd->pair.local.rx_packets,
+            (unsigned long long)fwd->pair.local.tx_packets,
             (unsigned long long)fwd->local_to_wan,
             (unsigned long long)fwd->wan_to_local,
             (unsigned long long)fwd->total_dropped,
             (unsigned long long)fwd->dropped_ring_full,
             (unsigned long long)fwd->dropped_no_local_match,
-            (unsigned long long)fwd->dropped_local_tx_fail);
+            (unsigned long long)fwd->dropped_local_tx_fail,
+            (unsigned long long)fwd->local_rx_to_mid,
+            (unsigned long long)fwd->wan_rx_to_mid);
+    fprintf(stderr,
+            "[STATS] local_path bypass=%llu encrypted=%llu split=%llu no_wan=%llu wan_l2=%llu policy_not_ready=%llu encrypt_fail=%llu\n",
+            (unsigned long long)fwd->local_bypass_to_wan,
+            (unsigned long long)fwd->local_encrypted_to_wan,
+            (unsigned long long)fwd->local_split_to_wan,
+            (unsigned long long)fwd->dropped_no_wan,
+            (unsigned long long)fwd->dropped_wan_l2,
+            (unsigned long long)fwd->dropped_policy_not_ready,
+            (unsigned long long)fwd->dropped_encrypt_fail);
     for (int i = 0; i < fwd->wan_count; i++) {
         fprintf(stderr,
-                "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu\n",
+                "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu\n",
                 i, fwd->pair.wans[i].ifname,
                 ne_ring_count(&fwd->mid_to_wan[i]),
                 (unsigned long long)fwd->pair.wans[i].tx_packets,
-                (unsigned long long)fwd->pair.wans[i].rx_packets);
+                (unsigned long long)fwd->pair.wans[i].rx_packets,
+                (unsigned long long)fwd->pair.wans[i].tx_no_free,
+                (unsigned long long)fwd->pair.wans[i].tx_reserve_fail,
+                (unsigned long long)fwd->pair.wans[i].tx_submit_calls,
+                (unsigned long long)fwd->pair.wans[i].tx_popped,
+                (unsigned long long)fwd->pair.wans[i].fq_no_slots,
+                (unsigned long long)fwd->pair.wans[i].fq_pool_empty,
+                (unsigned long long)fwd->pair.wans[i].fq_reserve_fail,
+                (unsigned long long)fwd->pair.wans[i].fq_refill_packets);
     }
 }

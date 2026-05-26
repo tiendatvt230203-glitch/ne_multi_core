@@ -98,6 +98,14 @@ struct ne_port {
     uint64_t rx_packets;
     uint64_t tx_packets;
     uint64_t dropped_tx_full;
+    uint64_t tx_no_free;
+    uint64_t tx_reserve_fail;
+    uint64_t tx_submit_calls;
+    uint64_t tx_popped;
+    uint64_t fq_no_slots;
+    uint64_t fq_pool_empty;
+    uint64_t fq_reserve_fail;
+    uint64_t fq_refill_packets;
 };
 
 struct ne_pair {

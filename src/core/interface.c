@@ -6,6 +6,12 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 
+static int trace_hit(uint64_t *counter)
+{
+    uint64_t n = __sync_add_and_fetch(counter, 1);
+    return n <= 256 || (n % 1024) == 0;
+}
+
 static void xdp_try_detach(int ifindex, const char *ifname)
 {
     static const int modes[] = {
@@ -244,6 +250,8 @@ static int open_port(struct ne_pair *p, struct ne_port *port, const char *ifname
         fprintf(stderr, "[XSK] create %s failed: %d\n", ifname, ret);
         return -1;
     }
+    fprintf(stderr, "[TRACE XSK] opened if=%s ifindex=%d rx=4096 tx=4096 mode=copy\n",
+            port->ifname, port->ifindex);
     return 0;
 }
 
@@ -334,6 +342,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->xdp_local_on = 1;
 
     NE_TRY(update_xsk_map(p->local.xsk, bpf_map__fd(local_map)));
+    fprintf(stderr, "[TRACE XDP] local if=%s attached xskmap queue=0\n", p->local.ifname);
 
     for (int i = 0; i < p->wan_count; i++) {
         struct bpf_program *wan_prog = NULL;
@@ -344,6 +353,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(bpf_xdp_attach(p->wans[i].ifindex, bpf_program__fd(wan_prog), p->xdp_flags, NULL));
         p->xdp_wan_on[i] = 1;
         NE_TRY(update_xsk_map(p->wans[i].xsk, bpf_map__fd(wan_map)));
+        fprintf(stderr, "[TRACE XDP] wan[%d] if=%s attached xskmap queue=0\n",
+                i, p->wans[i].ifname);
     }
 
     uint32_t prefill = NE_N_FRAMES / (uint32_t)(p->wan_count + 2);
@@ -352,6 +363,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     prefill_port(p, &p->local, prefill);
     for (int i = 0; i < p->wan_count; i++)
         prefill_port(p, &p->wans[i], prefill);
+    fprintf(stderr, "[TRACE UMEM] frames=%u frame_size=%u prefill_per_port=%u wan_count=%d\n",
+            p->n_frames, p->frame_size, prefill, p->wan_count);
     return 0;
 
 fail:
@@ -466,22 +479,53 @@ void ne_drain_cq_wan(struct ne_pair *p)
 
 static void refill_fq(struct ne_port *port, struct ne_pool *pool)
 {
+    static uint64_t trace_counter;
     uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
     uint32_t free_slots = xsk_prod_nb_free(&port->fq, NE_BATCH_SIZE);
-    if (free_slots < NE_BATCH_SIZE)
+    if (free_slots < NE_BATCH_SIZE) {
+        port->fq_no_slots++;
+        if (trace_hit(&trace_counter)) {
+            fprintf(stderr,
+                    "[TRACE FQ] if=%s no_slots free=%u need=%u count=%llu\n",
+                    port->ifname, free_slots, NE_BATCH_SIZE,
+                    (unsigned long long)port->fq_no_slots);
+        }
         return;
+    }
 
     uint32_t got = pool_pop(pool, addrs, NE_BATCH_SIZE);
-    if (!got)
+    if (!got) {
+        port->fq_pool_empty++;
+        if (trace_hit(&trace_counter)) {
+            fprintf(stderr,
+                    "[TRACE FQ] if=%s pool_empty count=%llu\n",
+                    port->ifname,
+                    (unsigned long long)port->fq_pool_empty);
+        }
         return;
+    }
     if (xsk_ring_prod__reserve(&port->fq, got, &idx) != got) {
         (void)pool_push(pool, addrs, got);
+        port->fq_reserve_fail++;
+        if (trace_hit(&trace_counter)) {
+            fprintf(stderr,
+                    "[TRACE FQ] if=%s reserve_fail got=%u count=%llu\n",
+                    port->ifname, got,
+                    (unsigned long long)port->fq_reserve_fail);
+        }
         return;
     }
     for (uint32_t i = 0; i < got; i++)
         *xsk_ring_prod__fill_addr(&port->fq, idx + i) = addrs[i];
     xsk_ring_prod__submit(&port->fq, got);
+    port->fq_refill_packets += got;
+    if (trace_hit(&trace_counter)) {
+        fprintf(stderr,
+                "[TRACE FQ] if=%s refill=%u total=%llu\n",
+                port->ifname, got,
+                (unsigned long long)port->fq_refill_packets);
+    }
 }
 
 void ne_refill_fq_local(struct ne_pair *p)
@@ -497,10 +541,19 @@ void ne_refill_fq_wan(struct ne_pair *p)
 
 static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max_frame)
 {
+    static uint64_t trace_counter;
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&port->tx, NE_BATCH_SIZE);
-    if (!free_slots)
+    if (!free_slots) {
+        port->tx_no_free++;
+        if (ne_ring_count(src) > 0 && trace_hit(&trace_counter)) {
+            fprintf(stderr,
+                    "[TRACE TX] if=%s no_free src_ring=%u count=%llu\n",
+                    port->ifname, ne_ring_count(src),
+                    (unsigned long long)port->tx_no_free);
+        }
         return 0;
+    }
 
     uint32_t popped = 0;
     uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
@@ -513,6 +566,13 @@ static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max
     if (xsk_ring_prod__reserve(&port->tx, popped, &idx) != popped) {
         for (uint32_t i = 0; i < popped; i++)
             (void)ne_ring_try_push(src, &jobs[i]);
+        port->tx_reserve_fail++;
+        if (trace_hit(&trace_counter)) {
+            fprintf(stderr,
+                    "[TRACE TX] if=%s reserve_fail popped=%u free=%u count=%llu\n",
+                    port->ifname, popped, free_slots,
+                    (unsigned long long)port->tx_reserve_fail);
+        }
         return 0;
     }
 
@@ -524,6 +584,15 @@ static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max
     xsk_ring_prod__submit(&port->tx, popped);
     (void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
     port->tx_packets += popped;
+    port->tx_popped += popped;
+    port->tx_submit_calls++;
+    if (trace_hit(&trace_counter)) {
+        fprintf(stderr,
+                "[TRACE TX] if=%s submit=%u free_before=%u tx_packets=%llu src_ring_after=%u\n",
+                port->ifname, popped, free_slots,
+                (unsigned long long)port->tx_packets,
+                ne_ring_count(src));
+    }
     return (int)popped;
 }
 
