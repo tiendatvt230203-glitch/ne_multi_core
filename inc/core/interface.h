@@ -8,7 +8,7 @@
 
 #define NE_RING        8192u
 #define NE_FRAME       2048u
-#define NE_N_FRAMES    8192u
+#define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
 #define NE_CPU_LOC     0u
 #define NE_CPU_MID     3u

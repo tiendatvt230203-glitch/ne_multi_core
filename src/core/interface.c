@@ -12,6 +12,19 @@ static int trace_hit(uint64_t *counter)
     return n <= 256 || (n % 1024) == 0;
 }
 
+static uint32_t next_pow2_u32(uint32_t v)
+{
+    if (v <= 1)
+        return 1;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
 static void xdp_try_detach(int ifindex, const char *ifname)
 {
     static const int modes[] = {
@@ -228,8 +241,8 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
 static int open_port(struct ne_pair *p, struct ne_port *port, const char *ifname)
 {
     struct xsk_socket_config cfg = {
-        .rx_size = 4096,
-        .tx_size = 4096,
+        .rx_size = NE_RING,
+        .tx_size = NE_RING,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = p->xdp_flags,
         .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
@@ -250,8 +263,8 @@ static int open_port(struct ne_pair *p, struct ne_port *port, const char *ifname
         fprintf(stderr, "[XSK] create %s failed: %d\n", ifname, ret);
         return -1;
     }
-    fprintf(stderr, "[TRACE XSK] opened if=%s ifindex=%d rx=4096 tx=4096 mode=copy\n",
-            port->ifname, port->ifindex);
+    fprintf(stderr, "[TRACE XSK] opened if=%s ifindex=%d rx=%u tx=%u mode=copy\n",
+            port->ifname, port->ifindex, NE_RING, NE_RING);
     return 0;
 }
 
@@ -303,7 +316,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
     p->frame_size = NE_FRAME;
-    p->n_frames = NE_N_FRAMES;
+    p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->wan_count + 2));
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
     p->xdp_flags = XDP_FLAGS_DRV_MODE;
 
@@ -357,14 +370,15 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
                 i, p->wans[i].ifname);
     }
 
-    uint32_t prefill = NE_N_FRAMES / (uint32_t)(p->wan_count + 2);
+    uint32_t prefill = NE_RING - 1;
     if (prefill == 0)
         prefill = 1;
     prefill_port(p, &p->local, prefill);
     for (int i = 0; i < p->wan_count; i++)
         prefill_port(p, &p->wans[i], prefill);
-    fprintf(stderr, "[TRACE UMEM] frames=%u frame_size=%u prefill_per_port=%u wan_count=%d\n",
-            p->n_frames, p->frame_size, prefill, p->wan_count);
+    fprintf(stderr, "[TRACE UMEM] frames=%u frame_size=%u mb=%zu prefill_per_port=%u reserve_frames=%u wan_count=%d\n",
+            p->n_frames, p->frame_size, p->bufsize / (1024 * 1024), prefill,
+            p->n_frames - (prefill * (uint32_t)(p->wan_count + 1)), p->wan_count);
     return 0;
 
 fail:
