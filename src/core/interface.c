@@ -309,6 +309,9 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         return -1;
 
     memset(p, 0, sizeof(*p));
+    p->local_count = cfg->local_count;
+    if (p->local_count > MAX_INTERFACES)
+        p->local_count = MAX_INTERFACES;
     p->wan_count = cfg->wan_count;
     if (p->wan_count > MAX_INTERFACES)
         p->wan_count = MAX_INTERFACES;
@@ -316,7 +319,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
     p->frame_size = NE_FRAME;
-    p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->wan_count + 2));
+    p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
     p->xdp_flags = XDP_FLAGS_DRV_MODE;
 
@@ -340,22 +343,24 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     };
 
     NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize,
-                            &p->local.fq, &p->local.cq, &ucfg));
+                            &p->locals[0].fq, &p->locals[0].cq, &ucfg));
 
-    NE_TRY(open_port(p, &p->local, cfg->locals[0].ifname));
+    for (int i = 0; i < p->local_count; i++)
+        NE_TRY(open_port(p, &p->locals[i], cfg->locals[i].ifname));
     for (int i = 0; i < p->wan_count; i++)
         NE_TRY(open_port(p, &p->wans[i], cfg->wans[i].ifname));
 
-    struct bpf_program *local_prog = NULL;
-    struct bpf_map *local_map = NULL;
-    NE_TRY(open_bpf_object(cfg->bpf_file, &p->bpf_local,
-                           "xdp_redirect_prog", &local_prog, "xsks_map", &local_map));
-
-    NE_TRY(bpf_xdp_attach(p->local.ifindex, bpf_program__fd(local_prog), p->xdp_flags, NULL));
-    p->xdp_local_on = 1;
-
-    NE_TRY(update_xsk_map(p->local.xsk, bpf_map__fd(local_map)));
-    fprintf(stderr, "[TRACE XDP] local if=%s attached xskmap queue=0\n", p->local.ifname);
+    for (int i = 0; i < p->local_count; i++) {
+        struct bpf_program *local_prog = NULL;
+        struct bpf_map *local_map = NULL;
+        NE_TRY(open_bpf_object(cfg->bpf_file, &p->bpf_locals[i],
+                               "xdp_redirect_prog", &local_prog, "xsks_map", &local_map));
+        NE_TRY(bpf_xdp_attach(p->locals[i].ifindex, bpf_program__fd(local_prog), p->xdp_flags, NULL));
+        p->xdp_local_on[i] = 1;
+        NE_TRY(update_xsk_map(p->locals[i].xsk, bpf_map__fd(local_map)));
+        fprintf(stderr, "[TRACE XDP] local[%d] if=%s attached xskmap queue=0\n",
+                i, p->locals[i].ifname);
+    }
 
     for (int i = 0; i < p->wan_count; i++) {
         struct bpf_program *wan_prog = NULL;
@@ -373,12 +378,14 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     uint32_t prefill = NE_RING - 1;
     if (prefill == 0)
         prefill = 1;
-    prefill_port(p, &p->local, prefill);
+    for (int i = 0; i < p->local_count; i++)
+        prefill_port(p, &p->locals[i], prefill);
     for (int i = 0; i < p->wan_count; i++)
         prefill_port(p, &p->wans[i], prefill);
-    fprintf(stderr, "[TRACE UMEM] frames=%u frame_size=%u mb=%zu prefill_per_port=%u reserve_frames=%u wan_count=%d\n",
+    fprintf(stderr, "[TRACE UMEM] frames=%u frame_size=%u mb=%zu prefill_per_port=%u reserve_frames=%u local_count=%d wan_count=%d\n",
             p->n_frames, p->frame_size, p->bufsize / (1024 * 1024), prefill,
-            p->n_frames - (prefill * (uint32_t)(p->wan_count + 1)), p->wan_count);
+            p->n_frames - (prefill * (uint32_t)(p->local_count + p->wan_count)),
+            p->local_count, p->wan_count);
     return 0;
 
 fail:
@@ -395,20 +402,26 @@ void ne_pair_close(struct ne_pair *p)
         if (p->xdp_wan_on[i])
             bpf_xdp_detach(p->wans[i].ifindex, p->xdp_flags, NULL);
     }
-    if (p->xdp_local_on)
-        bpf_xdp_detach(p->local.ifindex, p->xdp_flags, NULL);
+    for (int i = 0; i < p->local_count; i++) {
+        if (p->xdp_local_on[i])
+            bpf_xdp_detach(p->locals[i].ifindex, p->xdp_flags, NULL);
+    }
+    for (int i = 0; i < p->local_count; i++) {
+        if (p->bpf_locals[i])
+            bpf_object__close(p->bpf_locals[i]);
+    }
     for (int i = 0; i < p->wan_count; i++) {
         if (p->bpf_wans[i])
             bpf_object__close(p->bpf_wans[i]);
     }
-    if (p->bpf_local)
-        bpf_object__close(p->bpf_local);
     for (int i = 0; i < p->wan_count; i++) {
         if (p->wans[i].xsk)
             xsk_socket__delete(p->wans[i].xsk);
     }
-    if (p->local.xsk)
-        xsk_socket__delete(p->local.xsk);
+    for (int i = 0; i < p->local_count; i++) {
+        if (p->locals[i].xsk)
+            xsk_socket__delete(p->locals[i].xsk);
+    }
     if (p->umem)
         xsk_umem__delete(p->umem);
     pool_destroy(&p->pool);
@@ -417,7 +430,8 @@ void ne_pair_close(struct ne_pair *p)
     memset(p, 0, sizeof(*p));
 }
 
-static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max, uint8_t dir, uint8_t wan_idx)
+static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max,
+                     uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
     uint32_t idx = 0;
     uint32_t n = xsk_ring_cons__peek(&port->rx, max, &idx);
@@ -427,6 +441,7 @@ static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max, 
         out[i].len = d->len;
         out[i].dir = dir;
         out[i].wan_idx = wan_idx;
+        out[i].local_idx = local_idx;
     }
     port->rx_packets += n;
     return (int)n;
@@ -434,7 +449,17 @@ static int recv_port(struct ne_port *port, struct ne_packet *out, uint32_t max, 
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 {
-    return recv_port(&p->local, out, max, NE_DIR_LOCAL, 0);
+    uint32_t total = 0;
+    memset(p->local_rx_pending, 0, sizeof(p->local_rx_pending));
+    for (int i = 0; i < p->local_count && total < max; i++) {
+        int n = recv_port(&p->locals[i], out + total, max - total,
+                          NE_DIR_LOCAL, 0, (uint8_t)i);
+        if (n > 0) {
+            p->local_rx_pending[i] = (uint32_t)n;
+            total += (uint32_t)n;
+        }
+    }
+    return (int)total;
 }
 
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
@@ -442,7 +467,8 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
     uint32_t total = 0;
     memset(p->wan_rx_pending, 0, sizeof(p->wan_rx_pending));
     for (int i = 0; i < p->wan_count && total < max; i++) {
-        int n = recv_port(&p->wans[i], out + total, max - total, NE_DIR_WAN, (uint8_t)i);
+        int n = recv_port(&p->wans[i], out + total, max - total,
+                          NE_DIR_WAN, (uint8_t)i, 0);
         if (n > 0) {
             p->wan_rx_pending[i] = (uint32_t)n;
             total += (uint32_t)n;
@@ -453,8 +479,12 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 
 void ne_recv_release_local(struct ne_pair *p, uint32_t n)
 {
-    if (n)
-        xsk_ring_cons__release(&p->local.rx, n);
+    (void)n;
+    for (int i = 0; i < p->local_count; i++) {
+        if (p->local_rx_pending[i])
+            xsk_ring_cons__release(&p->locals[i].rx, p->local_rx_pending[i]);
+        p->local_rx_pending[i] = 0;
+    }
 }
 
 void ne_recv_release_wan(struct ne_pair *p, uint32_t n)
@@ -482,7 +512,8 @@ static void drain_cq(struct ne_port *port, struct ne_pool *pool)
 
 void ne_drain_cq_local(struct ne_pair *p)
 {
-    drain_cq(&p->local, &p->pool);
+    for (int i = 0; i < p->local_count; i++)
+        drain_cq(&p->locals[i], &p->pool);
 }
 
 void ne_drain_cq_wan(struct ne_pair *p)
@@ -538,7 +569,8 @@ static void refill_fq(struct ne_port *port, struct ne_pool *pool)
 
 void ne_refill_fq_local(struct ne_pair *p)
 {
-    refill_fq(&p->local, &p->pool);
+    for (int i = 0; i < p->local_count; i++)
+        refill_fq(&p->locals[i], &p->pool);
 }
 
 void ne_refill_fq_wan(struct ne_pair *p)
@@ -605,9 +637,11 @@ static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max
     return (int)popped;
 }
 
-int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src)
+int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx)
 {
-    return tx_drain_port(&p->local, src, p->frame_size);
+    if (!p || local_idx < 0 || local_idx >= p->local_count)
+        return 0;
+    return tx_drain_port(&p->locals[local_idx], src, p->frame_size);
 }
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
@@ -630,22 +664,26 @@ void interface_print_xdp_stats(struct ne_pair *p)
     if (!p)
         return;
 
-    struct bpf_map *local_stats = p->bpf_local ?
-        bpf_object__find_map_by_name(p->bpf_local, "stats_map") : NULL;
-    if (local_stats) {
-        fprintf(stderr,
-                "[XDP-STATS local %s] total=%llu non_ip_or_short=%llu icmp_pass=%llu no_sock=%llu redirect=%llu arp_pass=%llu other_l4_pass=%llu port_fail=%llu\n",
-                p->local.ifname,
-                (unsigned long long)map_u64_value(local_stats, 0),
-                (unsigned long long)map_u64_value(local_stats, 1),
-                (unsigned long long)map_u64_value(local_stats, 4),
-                (unsigned long long)map_u64_value(local_stats, 5),
-                (unsigned long long)map_u64_value(local_stats, 6),
-                (unsigned long long)map_u64_value(local_stats, 7),
-                (unsigned long long)map_u64_value(local_stats, 8),
-                (unsigned long long)map_u64_value(local_stats, 10));
-    } else {
-        fprintf(stderr, "[XDP-STATS local %s] stats_map missing\n", p->local.ifname);
+    for (int i = 0; i < p->local_count; i++) {
+        struct bpf_map *local_stats = p->bpf_locals[i] ?
+            bpf_object__find_map_by_name(p->bpf_locals[i], "stats_map") : NULL;
+        if (local_stats) {
+            fprintf(stderr,
+                    "[XDP-STATS local[%d] %s] total=%llu non_ip_or_short=%llu icmp_pass=%llu no_sock=%llu redirect=%llu arp_pass=%llu other_l4_pass=%llu port_fail=%llu dns_ntp_pass=%llu\n",
+                    i, p->locals[i].ifname,
+                    (unsigned long long)map_u64_value(local_stats, 0),
+                    (unsigned long long)map_u64_value(local_stats, 1),
+                    (unsigned long long)map_u64_value(local_stats, 4),
+                    (unsigned long long)map_u64_value(local_stats, 5),
+                    (unsigned long long)map_u64_value(local_stats, 6),
+                    (unsigned long long)map_u64_value(local_stats, 7),
+                    (unsigned long long)map_u64_value(local_stats, 8),
+                    (unsigned long long)map_u64_value(local_stats, 10),
+                    (unsigned long long)map_u64_value(local_stats, 11));
+        } else {
+            fprintf(stderr, "[XDP-STATS local[%d] %s] stats_map missing\n",
+                    i, p->locals[i].ifname);
+        }
     }
 
     for (int i = 0; i < p->wan_count; i++) {

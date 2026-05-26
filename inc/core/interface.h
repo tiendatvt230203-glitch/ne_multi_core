@@ -68,6 +68,7 @@ struct ne_packet {
     uint32_t len;
     uint8_t dir;
     uint8_t wan_idx;
+    uint8_t local_idx;
 };
 
 struct ne_ring {
@@ -114,14 +115,16 @@ struct ne_pair {
     uint32_t frame_size;
     uint32_t n_frames;
     struct xsk_umem *umem;
-    struct ne_port local;
+    struct ne_port locals[MAX_INTERFACES];
+    int local_count;
     struct ne_port wans[MAX_INTERFACES];
     int wan_count;
+    uint32_t local_rx_pending[MAX_INTERFACES];
     uint32_t wan_rx_pending[MAX_INTERFACES];
     struct ne_pool pool;
-    struct bpf_object *bpf_local;
+    struct bpf_object *bpf_locals[MAX_INTERFACES];
     struct bpf_object *bpf_wans[MAX_INTERFACES];
-    uint8_t xdp_local_on;
+    uint8_t xdp_local_on[MAX_INTERFACES];
     uint8_t xdp_wan_on[MAX_INTERFACES];
     uint32_t xdp_flags;
 };
@@ -144,7 +147,7 @@ void ne_drain_cq_local(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
-int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src);
+int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx);
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx);
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);

@@ -9,6 +9,8 @@
 #define IPPROTO_TCP_VAL 6
 #define IPPROTO_UDP_VAL 17
 #define ETH_P_ARP_VAL 0x0806
+#define DNS_PORT_VAL 53
+#define NTP_PORT_VAL 123
 
 #define NE_XSK_QUEUE_ID 0
 
@@ -121,6 +123,12 @@ int xdp_redirect_prog(struct xdp_md *ctx)
     __u16 dport = 0;
     if (read_tcp_udp_ports(data, data_end, l4_proto, &sport, &dport) < 0) {
         inc_stat(10);
+        return XDP_PASS;
+    }
+    if (l4_proto == IPPROTO_UDP_VAL &&
+        (sport == DNS_PORT_VAL || dport == DNS_PORT_VAL ||
+         sport == NTP_PORT_VAL || dport == NTP_PORT_VAL)) {
+        inc_stat(11);
         return XDP_PASS;
     }
     (void)src_ip;

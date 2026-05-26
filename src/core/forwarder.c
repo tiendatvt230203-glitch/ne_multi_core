@@ -532,7 +532,8 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
     uint8_t proto = 0;
     int encrypted = 0;
     int flow_ok = (parse_flow(pkt, job.len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0);
-    int profile_idx = config_select_profile_for_local(fwd->cfg, 0);
+    int local_idx = job.local_idx < fwd->local_count ? job.local_idx : 0;
+    int profile_idx = config_select_profile_for_local(fwd->cfg, local_idx);
     int wan_idx = select_wan_for_local(fwd, profile_idx, flow_ok,
                                        src_ip, dst_ip, src_port, dst_port,
                                        proto, job.len);
@@ -561,9 +562,6 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
         __sync_fetch_and_add(&fwd->dropped_wan_congested, 1);
         goto drop;
     }
-
-    if (config_wan_bridge_mode(fwd->cfg))
-        bridge_mac_learn_rx(fwd, 0, pkt, job.len);
 
     if (set_wan_l2(fwd, wan_idx, pkt) != 0) {
         if (do_trace)
@@ -763,8 +761,6 @@ static int pick_local_for_packet(struct forwarder *fwd, uint8_t *pkt, uint32_t p
 {
     if (config_wan_bridge_mode(fwd->cfg)) {
         bridge_wan_rx_normalize_eth_ipv4(pkt, pkt_len);
-        if (fwd->local_count == 1)
-            return 0;
         return bridge_mac_local_for_dmac(fwd, pkt, pkt_len);
     }
 
@@ -816,16 +812,17 @@ static void process_wan_packet(struct forwarder *fwd, struct ne_packet job)
     }
 
     job.dir = NE_DIR_LOCAL;
-    if (emit_owned(fwd, &fwd->mid_to_local, &job) == 0) {
+    job.local_idx = (uint8_t)local_idx;
+    if (emit_owned(fwd, &fwd->mid_to_local[local_idx], &job) == 0) {
         if (do_trace)
             fprintf(stderr,
                     "[TRACE WAN-OUT] local=%d if=%s len=%u mid_to_local=%u\n",
-                    local_idx, fwd->pair.local.ifname, job.len,
-                    ne_ring_count(&fwd->mid_to_local));
+                    local_idx, fwd->pair.locals[local_idx].ifname, job.len,
+                    ne_ring_count(&fwd->mid_to_local[local_idx]));
         __sync_fetch_and_add(&fwd->wan_to_local, 1);
     } else if (do_trace) {
-        fprintf(stderr, "[TRACE WAN-DROP] reason=emit_mid_to_local_failed len=%u ring=%u\n",
-                job.len, ne_ring_count(&fwd->mid_to_local));
+        fprintf(stderr, "[TRACE WAN-DROP] reason=emit_mid_to_local_failed local=%d len=%u ring=%u\n",
+                local_idx, job.len, ne_ring_count(&fwd->mid_to_local[local_idx]));
     }
     return;
 
@@ -844,7 +841,8 @@ static void *local_core_thread(void *arg)
     while (running) {
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
-        (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local);
+        for (int li = 0; li < fwd->local_count; li++)
+            (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
@@ -854,8 +852,9 @@ static void *local_core_thread(void *arg)
 
         if (trace_hit(&trace_counter)) {
             fprintf(stderr,
-                    "[TRACE LOCAL-RX] batch=%d local_to_mid_before=%u mid_to_local=%u\n",
-                    rcvd, ne_ring_count(&fwd->local_to_mid), ne_ring_count(&fwd->mid_to_local));
+                    "[TRACE LOCAL-RX] batch=%d local_to_mid_before=%u mid_to_local0=%u\n",
+                    rcvd, ne_ring_count(&fwd->local_to_mid),
+                    fwd->local_count > 0 ? ne_ring_count(&fwd->mid_to_local[0]) : 0);
         }
         for (int i = 0; i < rcvd; i++) {
             if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0) {
@@ -1027,10 +1026,15 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         return -1;
 
     if (ne_ring_init(&fwd->local_to_mid, NE_RING) != 0 ||
-        ne_ring_init(&fwd->wan_to_mid, NE_RING) != 0 ||
-        ne_ring_init(&fwd->mid_to_local, NE_RING) != 0) {
+        ne_ring_init(&fwd->wan_to_mid, NE_RING) != 0) {
         forwarder_cleanup(fwd);
         return -1;
+    }
+    for (int i = 0; i < fwd->local_count; i++) {
+        if (ne_ring_init(&fwd->mid_to_local[i], NE_RING) != 0) {
+            forwarder_cleanup(fwd);
+            return -1;
+        }
     }
     for (int i = 0; i < fwd->wan_count; i++) {
         if (ne_ring_init(&fwd->mid_to_wan[i], NE_RING) != 0) {
@@ -1085,13 +1089,13 @@ void forwarder_cleanup(struct forwarder *fwd)
     ne_ring_destroy(&fwd->wan_to_mid);
     for (int i = 0; i < MAX_INTERFACES; i++)
         ne_ring_destroy(&fwd->mid_to_wan[i]);
-    ne_ring_destroy(&fwd->mid_to_local);
+    for (int i = 0; i < MAX_INTERFACES; i++)
+        ne_ring_destroy(&fwd->mid_to_local[i]);
     if (fwd->wan_flow_table_ready) {
         flow_table_cleanup(&fwd->wan_flow_table);
         fwd->wan_flow_table_ready = 0;
     }
     ne_pair_close(&fwd->pair);
-    bridge_mac_shutdown();
 }
 
 void forwarder_run(struct forwarder *fwd)
@@ -1134,11 +1138,17 @@ void forwarder_print_stats(struct forwarder *fwd)
 {
     if (!fwd)
         return;
+    uint64_t local_rx = 0;
+    uint64_t local_tx = 0;
+    for (int i = 0; i < fwd->local_count; i++) {
+        local_rx += fwd->pair.locals[i].rx_packets;
+        local_tx += fwd->pair.locals[i].tx_packets;
+    }
     fprintf(stderr,
             "[STATS] local_rx=%llu local_tx=%llu local_to_wan=%llu wan_to_local=%llu dropped=%llu ring_full=%llu "
             "no_local=%llu local_tx_fail=%llu local_rx_to_mid=%llu wan_rx_to_mid=%llu\n",
-            (unsigned long long)fwd->pair.local.rx_packets,
-            (unsigned long long)fwd->pair.local.tx_packets,
+            (unsigned long long)local_rx,
+            (unsigned long long)local_tx,
             (unsigned long long)fwd->local_to_wan,
             (unsigned long long)fwd->wan_to_local,
             (unsigned long long)fwd->total_dropped,
@@ -1158,6 +1168,22 @@ void forwarder_print_stats(struct forwarder *fwd)
             (unsigned long long)fwd->dropped_encrypt_fail,
             (unsigned long long)fwd->dropped_wan_congested);
     interface_print_xdp_stats(&fwd->pair);
+    for (int i = 0; i < fwd->local_count; i++) {
+        fprintf(stderr,
+                "[STATS] local[%d]=%s mid_to_local=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu\n",
+                i, fwd->pair.locals[i].ifname,
+                ne_ring_count(&fwd->mid_to_local[i]),
+                (unsigned long long)fwd->pair.locals[i].tx_packets,
+                (unsigned long long)fwd->pair.locals[i].rx_packets,
+                (unsigned long long)fwd->pair.locals[i].tx_no_free,
+                (unsigned long long)fwd->pair.locals[i].tx_reserve_fail,
+                (unsigned long long)fwd->pair.locals[i].tx_submit_calls,
+                (unsigned long long)fwd->pair.locals[i].tx_popped,
+                (unsigned long long)fwd->pair.locals[i].fq_no_slots,
+                (unsigned long long)fwd->pair.locals[i].fq_pool_empty,
+                (unsigned long long)fwd->pair.locals[i].fq_reserve_fail,
+                (unsigned long long)fwd->pair.locals[i].fq_refill_packets);
+    }
     for (int i = 0; i < fwd->wan_count; i++) {
         fprintf(stderr,
                 "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu stuck=%llu cooldown=%u flushes=%llu queue_dropped=%llu\n",

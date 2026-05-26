@@ -17,8 +17,6 @@
 #define NE_DEFAULT_FAKE_ETHERTYPE_IPV4 0x88B5u
 #endif
 
-static int g_peer_macs_ready;
-
 static inline int mac_is_zero(const uint8_t mac[MAC_LEN]) {
     for (int i = 0; i < MAC_LEN; i++) {
         if (mac[i] != 0)
@@ -39,7 +37,7 @@ static inline int mac_is_multicast(const uint8_t mac[MAC_LEN]) {
     return (mac[0] & 0x01) != 0;
 }
 
-static int mac_is_valid_peer(const uint8_t mac[MAC_LEN]) {
+static int mac_is_valid_dst(const uint8_t mac[MAC_LEN]) {
     return !mac_is_zero(mac) && !mac_is_broadcast(mac) && !mac_is_multicast(mac);
 }
 
@@ -70,33 +68,33 @@ static int read_local_iface_hwaddr(const char *ifname, uint8_t mac[MAC_LEN]) {
     return 0;
 }
 
-static void log_local_peer_mac(const char *ifname, const uint8_t peer[MAC_LEN]) {
+static void log_local_dst_mac(const char *ifname, const uint8_t dst[MAC_LEN]) {
     uint8_t loc[MAC_LEN];
     if (read_local_iface_hwaddr(ifname, loc) == 0) {
         fprintf(stderr,
-                "[LOCAL-MAC] %s local %02x:%02x:%02x:%02x:%02x:%02x peer %02x:%02x:%02x:%02x:%02x:%02x\n",
+                "[LOCAL-MAC] %s local %02x:%02x:%02x:%02x:%02x:%02x dst %02x:%02x:%02x:%02x:%02x:%02x\n",
                 ifname,
                 loc[0], loc[1], loc[2], loc[3], loc[4], loc[5],
-                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+                dst[0], dst[1], dst[2], dst[3], dst[4], dst[5]);
     } else {
         fprintf(stderr,
-                "[LOCAL-MAC] %s peer %02x:%02x:%02x:%02x:%02x:%02x\n",
+                "[LOCAL-MAC] %s dst %02x:%02x:%02x:%02x:%02x:%02x\n",
                 ifname,
-                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+                dst[0], dst[1], dst[2], dst[3], dst[4], dst[5]);
     }
 }
 
-static int mac_set_peer(struct app_config *cfg, int li, const uint8_t mac[MAC_LEN]) {
-    if (!cfg || li < 0 || li >= cfg->local_count || !mac_is_valid_peer(mac))
+static int mac_set_fdb_dst(struct app_config *cfg, int li, const uint8_t mac[MAC_LEN]) {
+    if (!cfg || li < 0 || li >= cfg->local_count || !mac_is_valid_dst(mac))
         return -1;
     if (mac_is_own_local(cfg, li, mac)) {
         fprintf(stderr,
-                "[LOCAL-MAC] %s ignoring own interface MAC as peer\n",
+                "[LOCAL-MAC] %s ignoring own interface MAC from bridge fdb\n",
                 cfg->locals[li].ifname);
         return -1;
     }
     memcpy(cfg->locals[li].dst_mac, mac, MAC_LEN);
-    log_local_peer_mac(cfg->locals[li].ifname, mac);
+    log_local_dst_mac(cfg->locals[li].ifname, mac);
     return 0;
 }
 
@@ -180,14 +178,14 @@ static int mac_load_from_bridge_fdb(struct app_config *cfg) {
                 continue;
 
             uint8_t mac[MAC_LEN];
-            if (parse_mac(mac_tok, mac) != 0 || !mac_is_valid_peer(mac))
+            if (parse_mac(mac_tok, mac) != 0 || !mac_is_valid_dst(mac))
                 continue;
             if (mac_is_own_local(cfg, li, mac))
                 continue;
 
-            if (mac_set_peer(cfg, li, mac) == 0) {
+            if (mac_set_fdb_dst(cfg, li, mac) == 0) {
                 fprintf(stderr,
-                        "[LOCAL-MAC] %s remote-peer %02x:%02x:%02x:%02x:%02x:%02x loaded from bridge fdb%s%s\n",
+                        "[LOCAL-MAC] %s dst %02x:%02x:%02x:%02x:%02x:%02x loaded from bridge fdb%s%s\n",
                         loc->ifname,
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
                         bridge_name[0] ? " master " : "",
@@ -200,7 +198,7 @@ static int mac_load_from_bridge_fdb(struct app_config *cfg) {
 
         if (mac_is_zero(loc->dst_mac)) {
             fprintf(stderr,
-                    "[LOCAL-MAC] %s no peer MAC found in bridge fdb%s%s\n",
+                    "[LOCAL-MAC] %s no dst MAC found in bridge fdb%s%s\n",
                     loc->ifname,
                     bridge_name[0] ? " master " : "",
                     bridge_name[0] ? bridge_name : "");
@@ -213,23 +211,11 @@ static int mac_load_from_bridge_fdb(struct app_config *cfg) {
 static int bridge_mac_prepare_impl(struct app_config *cfg) {
     if (!cfg || cfg->local_count <= 0)
         return 0;
-    if (g_peer_macs_ready)
-        return 0;
 
     for (int i = 0; i < cfg->local_count; i++)
         (void)read_local_iface_hwaddr(cfg->locals[i].ifname, cfg->locals[i].src_mac);
 
     (void)mac_load_from_bridge_fdb(cfg);
-
-    for (int i = 0; i < cfg->local_count; i++) {
-        if (!mac_is_zero(cfg->locals[i].dst_mac))
-            continue;
-        fprintf(stderr,
-                "[LOCAL-MAC] %s peer unknown; will learn from first LAN packet\n",
-                cfg->locals[i].ifname);
-    }
-
-    g_peer_macs_ready = 1;
     return 0;
 }
 
@@ -305,36 +291,21 @@ int bridge_mac_install(struct forwarder *fwd) {
     return 0;
 }
 
-void bridge_mac_shutdown(void) {
-    g_peer_macs_ready = 0;
-}
-
-void bridge_mac_learn_rx(struct forwarder *fwd, int local_idx,
-                         const uint8_t *pkt, uint32_t pkt_len) {
-    if (!fwd || !fwd->cfg || local_idx < 0 ||
-        local_idx >= fwd->cfg->local_count ||
-        !pkt || pkt_len < sizeof(struct ether_header))
-        return;
-}
-
 int bridge_mac_local_for_dmac(struct forwarder *fwd,
                               const uint8_t *pkt, uint32_t pkt_len) {
     if (!fwd || !fwd->cfg || !pkt || pkt_len < sizeof(struct ether_header))
         return -1;
 
     const struct ether_header *eth = (const struct ether_header *)pkt;
-    if (!mac_is_valid_peer(eth->ether_dhost))
+    if (!mac_is_valid_dst(eth->ether_dhost))
         return -1;
 
-    for (int i = 0; i < fwd->cfg->local_count; i++) {
-        if (mac_is_zero(fwd->cfg->locals[i].dst_mac))
+    for (int i = 0; i < fwd->local_count; i++) {
+        if (mac_is_zero(fwd->locals[i].dst_mac))
             continue;
-        if (memcmp(eth->ether_dhost, fwd->cfg->locals[i].dst_mac, MAC_LEN) == 0)
+        if (memcmp(eth->ether_dhost, fwd->locals[i].dst_mac, MAC_LEN) == 0)
             return i;
     }
     return -1;
 }
 
-void bridge_mac_sync_cfg_to_iface(struct forwarder *fwd) {
-    bridge_mac_copy_local_macs(fwd);
-}
