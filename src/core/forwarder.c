@@ -387,6 +387,8 @@ static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
         return -1;
     if (frag0_len > fwd->pair.frame_size || frag1_len > fwd->pair.frame_size)
         return -1;
+    if (frag0_len == 0 || frag1_len == 0)
+        return -1;
 
     struct ne_packet tail = { .len = frag1_len, .dir = NE_DIR_WAN, .wan_idx = (uint8_t)wan_idx };
     if (ne_frame_alloc(&fwd->pair, &tail.addr) != 0)
@@ -399,7 +401,7 @@ static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
 
     if (trace_hit(&trace_counter)) {
         fprintf(stderr,
-                "[TRACE SPLIT-EMIT] wan=%d if=%s frag0=%u frag1=%u ring_before=%u\n",
+                "[TRACE SPLIT-EMIT] pair_same_wan=1 wan=%d if=%s frag0=%u frag1=%u ring_before=%u\n",
                 wan_idx, fwd->pair.wans[wan_idx].ifname, frag0_len, frag1_len, used);
     }
 
@@ -561,6 +563,20 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
         struct profile_config *p = &fwd->cfg->profiles[profile_idx];
         if (p->wan_count > 0) {
             int wan_idx;
+            if (proto == IPPROTO_TCP) {
+                wan_idx = fallback_wan_if_congested(fwd, profile_idx, p->wan_indices[0]);
+                if (trace_hit(&trace_counter)) {
+                    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+                    ip_to_str(src_ip, src, sizeof(src));
+                    ip_to_str(dst_ip, dst, sizeof(dst));
+                    fprintf(stderr,
+                            "[TRACE LB] profile=%d flow_ok=%d tcp_pinned %s:%u -> %s:%u len=%u selected_wan=%d if=%s ring=%u\n",
+                            profile_idx, flow_ok, src, src_port, dst, dst_port, pkt_len,
+                            wan_idx, fwd->pair.wans[wan_idx].ifname,
+                            ne_ring_count(&fwd->mid_to_wan[wan_idx]));
+                }
+                return wan_idx;
+            }
             if (flow_ok && fwd->wan_flow_table_ready) {
                 wan_idx = flow_table_get_wan_profile(&fwd->wan_flow_table,
                                                      src_ip, dst_ip, src_port, dst_port,
