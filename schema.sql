@@ -10,7 +10,7 @@ DROP TYPE IF EXISTS encryption_method_enum CASCADE;
 
 CREATE TYPE encryption_action_enum AS ENUM ('L2', 'L3', 'L4', 'bypass');
 
-CREATE TYPE encryption_protocol_enum AS ENUM ('tcp', 'udp', 'icmp', 'ospf', 'any');
+CREATE TYPE encryption_protocol_enum AS ENUM ('tcp', 'udp', 'icmp', 'ospf');
 
 CREATE TYPE encryption_method_enum AS ENUM (
     'aes-gcm-128',
