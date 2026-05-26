@@ -554,9 +554,10 @@ static int tx_drain_port(struct ne_port *port, struct ne_ring *src, uint32_t max
     uint32_t free_slots = xsk_prod_nb_free(&port->tx, NE_BATCH_SIZE);
     if (!free_slots) {
         port->tx_no_free++;
+        (void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
         if (ne_ring_count(src) > 0 && trace_hit(&trace_counter)) {
             fprintf(stderr,
-                    "[TRACE TX] if=%s no_free src_ring=%u count=%llu\n",
+                    "[TRACE TX] if=%s no_free kick src_ring=%u count=%llu\n",
                     port->ifname, ne_ring_count(src),
                     (unsigned long long)port->tx_no_free);
         }

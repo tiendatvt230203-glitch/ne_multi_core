@@ -38,9 +38,14 @@ struct forwarder {
     uint64_t dropped_wan_l2;
     uint64_t dropped_policy_not_ready;
     uint64_t dropped_encrypt_fail;
+    uint64_t dropped_wan_congested;
     uint64_t local_bypass_to_wan;
     uint64_t local_encrypted_to_wan;
     uint64_t local_split_to_wan;
+    uint64_t wan_tx_stuck[MAX_INTERFACES];
+    uint64_t wan_tx_flushes[MAX_INTERFACES];
+    uint64_t wan_tx_dropped[MAX_INTERFACES];
+    uint32_t wan_tx_cooldown[MAX_INTERFACES];
 };
 
 void forwarder_pin_cpu(void);

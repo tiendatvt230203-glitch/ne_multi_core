@@ -394,6 +394,80 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
     return sent_split ? 1 : 0;
 }
 
+static int wan_has_tx_room(struct forwarder *fwd, int wan_idx)
+{
+    if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
+        return 0;
+    if (fwd->wan_tx_cooldown[wan_idx] > 0)
+        return 0;
+    struct ne_ring *r = &fwd->mid_to_wan[wan_idx];
+    return ne_ring_count(r) + NE_BATCH_SIZE < r->cap;
+}
+
+static uint32_t flush_wan_queue(struct forwarder *fwd, int wan_idx)
+{
+    struct ne_packet pkt;
+    uint32_t dropped = 0;
+    if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
+        return 0;
+    while (ne_ring_try_pop(&fwd->mid_to_wan[wan_idx], &pkt) == 0) {
+        ne_frame_free(&fwd->pair, pkt.addr);
+        dropped++;
+    }
+    if (dropped) {
+        __sync_fetch_and_add(&fwd->total_dropped, dropped);
+        __sync_fetch_and_add(&fwd->wan_tx_dropped[wan_idx], dropped);
+        __sync_fetch_and_add(&fwd->wan_tx_flushes[wan_idx], 1);
+    }
+    return dropped;
+}
+
+static int fallback_wan_if_congested(struct forwarder *fwd, int profile_idx, int selected)
+{
+    if (wan_has_tx_room(fwd, selected))
+        return selected;
+
+    int best = -1;
+    uint32_t best_depth = UINT32_MAX;
+
+    if (profile_idx >= 0 && profile_idx < fwd->cfg->profile_count) {
+        struct profile_config *p = &fwd->cfg->profiles[profile_idx];
+        for (int i = 0; i < p->wan_count; i++) {
+            int wi = p->wan_indices[i];
+            if (!wan_has_tx_room(fwd, wi))
+                continue;
+            uint32_t depth = ne_ring_count(&fwd->mid_to_wan[wi]);
+            if (depth < best_depth) {
+                best_depth = depth;
+                best = wi;
+            }
+        }
+    }
+
+    if (best < 0) {
+        for (int wi = 0; wi < fwd->wan_count; wi++) {
+            if (!wan_has_tx_room(fwd, wi))
+                continue;
+            uint32_t depth = ne_ring_count(&fwd->mid_to_wan[wi]);
+            if (depth < best_depth) {
+                best_depth = depth;
+                best = wi;
+            }
+        }
+    }
+
+    if (best >= 0) {
+        fprintf(stderr,
+                "[TRACE LB-FAILOVER] selected_wan=%d ring=%u -> wan=%d ring=%u\n",
+                selected,
+                (selected >= 0 && selected < fwd->wan_count) ? ne_ring_count(&fwd->mid_to_wan[selected]) : 0,
+                best, ne_ring_count(&fwd->mid_to_wan[best]));
+        return best;
+    }
+
+    return selected;
+}
+
 static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
                                 uint32_t src_ip, uint32_t dst_ip,
                                 uint16_t src_port, uint16_t dst_port,
@@ -418,6 +492,7 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
                                                          p->wan_count);
             }
             if (wan_idx >= 0 && wan_idx < fwd->wan_count) {
+                wan_idx = fallback_wan_if_congested(fwd, profile_idx, wan_idx);
                 if (trace_hit(&trace_counter)) {
                     char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
                     int selected_weight = 0;
@@ -445,7 +520,7 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
                 "[TRACE LB] profile=%d flow_ok=%d fallback_wan=0 if=%s len=%u\n",
                 profile_idx, flow_ok, fwd->pair.wans[0].ifname, pkt_len);
     }
-    return 0;
+    return fallback_wan_if_congested(fwd, profile_idx, 0);
 }
 
 static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
@@ -475,6 +550,15 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
         if (do_trace)
             fprintf(stderr, "[TRACE LOCAL-DROP] reason=no_wan len=%u profile=%d\n", job.len, profile_idx);
         __sync_fetch_and_add(&fwd->dropped_no_wan, 1);
+        goto drop;
+    }
+    if (!wan_has_tx_room(fwd, wan_idx)) {
+        if (do_trace)
+            fprintf(stderr,
+                    "[TRACE LOCAL-DROP] reason=wan_congested wan=%d cooldown=%u ring=%u len=%u\n",
+                    wan_idx, fwd->wan_tx_cooldown[wan_idx],
+                    ne_ring_count(&fwd->mid_to_wan[wan_idx]), job.len);
+        __sync_fetch_and_add(&fwd->dropped_wan_congested, 1);
         goto drop;
     }
 
@@ -802,16 +886,35 @@ static void *wan_core_thread(void *arg)
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
+            if (fwd->wan_tx_cooldown[wi] > 0)
+                fwd->wan_tx_cooldown[wi]--;
             uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
+            uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
             int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
+            if (sent > 0) {
+                fwd->wan_tx_stuck[wi] = 0;
+            } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
+                uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
+                if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
+                    uint32_t dropped = flush_wan_queue(fwd, wi);
+                    fwd->wan_tx_cooldown[wi] = 65535;
+                    fwd->wan_tx_stuck[wi] = 0;
+                    fprintf(stderr,
+                            "[TRACE WAN-TX-FAULT] wan=%d if=%s tx_no_free_stuck dropped_queue=%u cooldown=%u tx_packets=%llu\n",
+                            wi, fwd->pair.wans[wi].ifname, dropped,
+                            fwd->wan_tx_cooldown[wi],
+                            (unsigned long long)fwd->pair.wans[wi].tx_packets);
+                }
+            }
             if ((sent > 0 || before > 0) && trace_hit(&tx_trace_counter)) {
                 fprintf(stderr,
-                        "[TRACE WAN-TX-DRAIN] wan=%d if=%s ring_before=%u sent=%d ring_after=%u tx_packets=%llu no_free=%llu reserve_fail=%llu\n",
+                        "[TRACE WAN-TX-DRAIN] wan=%d if=%s ring_before=%u sent=%d ring_after=%u tx_packets=%llu no_free=%llu reserve_fail=%llu cooldown=%u\n",
                         wi, fwd->pair.wans[wi].ifname, before, sent,
                         ne_ring_count(&fwd->mid_to_wan[wi]),
                         (unsigned long long)fwd->pair.wans[wi].tx_packets,
                         (unsigned long long)fwd->pair.wans[wi].tx_no_free,
-                        (unsigned long long)fwd->pair.wans[wi].tx_reserve_fail);
+                        (unsigned long long)fwd->pair.wans[wi].tx_reserve_fail,
+                        fwd->wan_tx_cooldown[wi]);
             }
         }
 
@@ -1045,18 +1148,19 @@ void forwarder_print_stats(struct forwarder *fwd)
             (unsigned long long)fwd->local_rx_to_mid,
             (unsigned long long)fwd->wan_rx_to_mid);
     fprintf(stderr,
-            "[STATS] local_path bypass=%llu encrypted=%llu split=%llu no_wan=%llu wan_l2=%llu policy_not_ready=%llu encrypt_fail=%llu\n",
+            "[STATS] local_path bypass=%llu encrypted=%llu split=%llu no_wan=%llu wan_l2=%llu policy_not_ready=%llu encrypt_fail=%llu wan_congested=%llu\n",
             (unsigned long long)fwd->local_bypass_to_wan,
             (unsigned long long)fwd->local_encrypted_to_wan,
             (unsigned long long)fwd->local_split_to_wan,
             (unsigned long long)fwd->dropped_no_wan,
             (unsigned long long)fwd->dropped_wan_l2,
             (unsigned long long)fwd->dropped_policy_not_ready,
-            (unsigned long long)fwd->dropped_encrypt_fail);
+            (unsigned long long)fwd->dropped_encrypt_fail,
+            (unsigned long long)fwd->dropped_wan_congested);
     interface_print_xdp_stats(&fwd->pair);
     for (int i = 0; i < fwd->wan_count; i++) {
         fprintf(stderr,
-                "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu\n",
+                "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu stuck=%llu cooldown=%u flushes=%llu queue_dropped=%llu\n",
                 i, fwd->pair.wans[i].ifname,
                 ne_ring_count(&fwd->mid_to_wan[i]),
                 (unsigned long long)fwd->pair.wans[i].tx_packets,
@@ -1068,6 +1172,10 @@ void forwarder_print_stats(struct forwarder *fwd)
                 (unsigned long long)fwd->pair.wans[i].fq_no_slots,
                 (unsigned long long)fwd->pair.wans[i].fq_pool_empty,
                 (unsigned long long)fwd->pair.wans[i].fq_reserve_fail,
-                (unsigned long long)fwd->pair.wans[i].fq_refill_packets);
+                (unsigned long long)fwd->pair.wans[i].fq_refill_packets,
+                (unsigned long long)fwd->wan_tx_stuck[i],
+                fwd->wan_tx_cooldown[i],
+                (unsigned long long)fwd->wan_tx_flushes[i],
+                (unsigned long long)fwd->wan_tx_dropped[i]);
     }
 }
