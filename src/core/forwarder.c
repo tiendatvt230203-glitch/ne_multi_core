@@ -294,6 +294,45 @@ static int local_rx_is_reflected_client_frame(struct forwarder *fwd, int local_i
     return memcmp(pkt, dst, MAC_LEN) == 0;
 }
 
+static int has_l2_crypto_marker(const uint8_t *pkt, uint32_t pkt_len)
+{
+    uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
+    if (!fake || !pkt || pkt_len < 14)
+        return 0;
+    if (pkt[12] != (uint8_t)(fake >> 8))
+        return 0;
+    return policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][pkt[13]] >= 0;
+}
+
+static int wan_packet_needs_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len)
+{
+    if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled || !pkt)
+        return 0;
+
+    uint16_t pid = 0;
+    uint8_t frag_idx = 0;
+    if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return 1;
+    if (frag_is_fragment(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return 1;
+    if (frag_is_fragment_l4(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return 1;
+
+    if (has_l2_crypto_marker(pkt, pkt_len))
+        return 1;
+
+    uint8_t policy_id = 0;
+    if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, pkt_len, &policy_id) == 0)
+        return 1;
+
+    int nonce_size = 0;
+    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, pkt_len,
+                                         &policy_id, &nonce_size) == 0)
+        return 1;
+
+    return 0;
+}
+
 static int emit_owned(struct forwarder *fwd, struct ne_ring *dst, struct ne_packet *pkt)
 {
     if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(dst, pkt) != 0) {
@@ -302,6 +341,35 @@ static int emit_owned(struct forwarder *fwd, struct ne_ring *dst, struct ne_pack
         __sync_fetch_and_add(&fwd->dropped_ring_full, 1);
         return -1;
     }
+    return 0;
+}
+
+static int emit_local_to_wan(struct forwarder *fwd, struct ne_packet *job,
+                             int wan_idx, int encrypted, int do_trace)
+{
+    job->dir = NE_DIR_WAN;
+    job->wan_idx = (uint8_t)wan_idx;
+    if (emit_owned(fwd, &fwd->mid_to_wan[wan_idx], job) != 0) {
+        if (do_trace) {
+            fprintf(stderr,
+                    "[TRACE LOCAL-DROP] reason=emit_mid_to_wan_failed wan=%d len=%u ring=%u\n",
+                    wan_idx, job->len, ne_ring_count(&fwd->mid_to_wan[wan_idx]));
+        }
+        return -1;
+    }
+
+    if (do_trace) {
+        fprintf(stderr,
+                "[TRACE LOCAL-OUT] mode=%s wan=%d if=%s len=%u ring_now=%u\n",
+                encrypted ? "encrypted" : "bypass", wan_idx,
+                fwd->pair.wans[wan_idx].ifname, job->len,
+                ne_ring_count(&fwd->mid_to_wan[wan_idx]));
+    }
+    __sync_fetch_and_add(&fwd->local_to_wan, 1);
+    if (encrypted)
+        __sync_fetch_and_add(&fwd->local_encrypted_to_wan, 1);
+    else
+        __sync_fetch_and_add(&fwd->local_bypass_to_wan, 1);
     return 0;
 }
 
@@ -597,70 +665,53 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     }
 
-    if (fwd->cfg->crypto_enabled) {
-        const struct crypto_policy *cp = NULL;
-        if (flow_ok)
-            cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
-                                             src_port, dst_port, proto);
-        if (do_trace) {
-            if (cp) {
-                fprintf(stderr,
-                        "[TRACE POLICY] db_id=%d wire_id=%d action=%s ready=%d\n",
-                        cp->db_id, cp->id, action_name(cp->action),
-                        (cp->action >= 0 && cp->action <= POLICY_ACTION_ENCRYPT_L4) ?
-                            policy_crypto_ready[cp - fwd->cfg->policies] : 0);
-            } else {
-                fprintf(stderr, "[TRACE POLICY] no_match -> bypass_forward\n");
-            }
-        }
-        if (cp && cp->action != POLICY_ACTION_BYPASS) {
-            int pi = (int)(cp - fwd->cfg->policies);
-            if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi]) {
-                if (do_trace)
-                    fprintf(stderr, "[TRACE LOCAL-DROP] reason=policy_not_ready pi=%d\n", pi);
-                __sync_fetch_and_add(&fwd->dropped_policy_not_ready, 1);
-                goto drop;
-            }
-            crypto_apply_from_policy(cp);
-            int enc_rc = encrypt_split_or_single(fwd, &job, cp, wan_idx);
-            if (enc_rc < 0) {
-                if (do_trace)
-                    fprintf(stderr, "[TRACE LOCAL-DROP] reason=encrypt_fail action=%s len=%u\n",
-                            action_name(cp->action), job.len);
-                __sync_fetch_and_add(&fwd->dropped_encrypt_fail, 1);
-                goto drop;
-            }
-            if (enc_rc > 0) {
-                if (do_trace)
-                    fprintf(stderr, "[TRACE LOCAL-OUT] split action=%s wan=%d ring_now=%u\n",
-                            action_name(cp->action), wan_idx, ne_ring_count(&fwd->mid_to_wan[wan_idx]));
-                __sync_fetch_and_add(&fwd->local_to_wan, 1);
-                __sync_fetch_and_add(&fwd->local_split_to_wan, 1);
-                return;
-            }
-            encrypted = 1;
+    const struct crypto_policy *cp = NULL;
+    if (fwd->cfg->crypto_enabled && flow_ok)
+        cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
+                                         src_port, dst_port, proto);
+    if (fwd->cfg->crypto_enabled && do_trace) {
+        if (cp) {
+            fprintf(stderr,
+                    "[TRACE POLICY] db_id=%d wire_id=%d action=%s ready=%d\n",
+                    cp->db_id, cp->id, action_name(cp->action),
+                    (cp->action >= 0 && cp->action <= POLICY_ACTION_ENCRYPT_L4) ?
+                        policy_crypto_ready[cp - fwd->cfg->policies] : 0);
+        } else {
+            fprintf(stderr, "[TRACE POLICY] no_match -> bypass_fast\n");
         }
     }
 
-    job.dir = NE_DIR_WAN;
-    job.wan_idx = (uint8_t)wan_idx;
-    if (emit_owned(fwd, &fwd->mid_to_wan[wan_idx], &job) == 0) {
-        if (do_trace)
-            fprintf(stderr,
-                    "[TRACE LOCAL-OUT] mode=%s wan=%d if=%s len=%u ring_now=%u\n",
-                    encrypted ? "encrypted" : "bypass", wan_idx,
-                    fwd->pair.wans[wan_idx].ifname, job.len,
-                    ne_ring_count(&fwd->mid_to_wan[wan_idx]));
-        __sync_fetch_and_add(&fwd->local_to_wan, 1);
-        if (encrypted)
-            __sync_fetch_and_add(&fwd->local_encrypted_to_wan, 1);
-        else
-            __sync_fetch_and_add(&fwd->local_bypass_to_wan, 1);
-    } else if (do_trace) {
-        fprintf(stderr,
-                "[TRACE LOCAL-DROP] reason=emit_mid_to_wan_failed wan=%d len=%u ring=%u\n",
-                wan_idx, job.len, ne_ring_count(&fwd->mid_to_wan[wan_idx]));
+    if (!fwd->cfg->crypto_enabled || !cp || cp->action == POLICY_ACTION_BYPASS) {
+        (void)emit_local_to_wan(fwd, &job, wan_idx, 0, do_trace);
+        return;
     }
+
+    int pi = (int)(cp - fwd->cfg->policies);
+    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi]) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE LOCAL-DROP] reason=policy_not_ready pi=%d\n", pi);
+        __sync_fetch_and_add(&fwd->dropped_policy_not_ready, 1);
+        goto drop;
+    }
+    crypto_apply_from_policy(cp);
+    int enc_rc = encrypt_split_or_single(fwd, &job, cp, wan_idx);
+    if (enc_rc < 0) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE LOCAL-DROP] reason=encrypt_fail action=%s len=%u\n",
+                    action_name(cp->action), job.len);
+        __sync_fetch_and_add(&fwd->dropped_encrypt_fail, 1);
+        goto drop;
+    }
+    if (enc_rc > 0) {
+        if (do_trace)
+            fprintf(stderr, "[TRACE LOCAL-OUT] split action=%s wan=%d ring_now=%u\n",
+                    action_name(cp->action), wan_idx, ne_ring_count(&fwd->mid_to_wan[wan_idx]));
+        __sync_fetch_and_add(&fwd->local_to_wan, 1);
+        __sync_fetch_and_add(&fwd->local_split_to_wan, 1);
+        return;
+    }
+    encrypted = 1;
+    (void)emit_local_to_wan(fwd, &job, wan_idx, encrypted, do_trace);
     return;
 
 drop:
@@ -807,20 +858,26 @@ static void process_wan_packet(struct forwarder *fwd, struct ne_packet job)
                 "[TRACE WAN-IN] wan=%u len=%u eth=%02x%02x\n",
                 job.wan_idx, job.len, raw[12], raw[13]);
     }
-    int dec = decrypt_wan_packet(fwd, &job);
-    if (dec == 1) {
-        if (do_trace)
-            fprintf(stderr, "[TRACE WAN-WAIT] fragment buffered wan=%u\n", job.wan_idx);
-        ne_frame_free(&fwd->pair, job.addr);
-        return;
-    }
-    if (dec != 0) {
-        if (do_trace)
-            fprintf(stderr, "[TRACE WAN-DROP] reason=decrypt_fail wan=%u len=%u\n", job.wan_idx, job.len);
-        goto drop;
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
+    if (wan_packet_needs_crypto(fwd, pkt, job.len)) {
+        int dec = decrypt_wan_packet(fwd, &job);
+        if (dec == 1) {
+            if (do_trace)
+                fprintf(stderr, "[TRACE WAN-WAIT] fragment buffered wan=%u\n", job.wan_idx);
+            ne_frame_free(&fwd->pair, job.addr);
+            return;
+        }
+        if (dec != 0) {
+            if (do_trace)
+                fprintf(stderr, "[TRACE WAN-DROP] reason=decrypt_fail wan=%u len=%u\n", job.wan_idx, job.len);
+            goto drop;
+        }
+        pkt = ne_packet_data(&fwd->pair, job.addr);
+    } else if (do_trace) {
+        fprintf(stderr, "[TRACE WAN-FAST] mode=bypass wan=%u len=%u\n",
+                job.wan_idx, job.len);
     }
 
-    uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     int local_idx = pick_local_for_packet(fwd, pkt, job.len);
     if (local_idx < 0 || local_idx >= fwd->local_count) {
         if (do_trace)
@@ -1198,7 +1255,7 @@ void forwarder_print_stats(struct forwarder *fwd)
     interface_print_xdp_stats(&fwd->pair);
     for (int i = 0; i < fwd->local_count; i++) {
         fprintf(stderr,
-                "[STATS] local[%d]=%s mid_to_local=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu\n",
+                "[STATS] local[%d]=%s mid_to_local=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu cq=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu\n",
                 i, fwd->pair.locals[i].ifname,
                 ne_ring_count(&fwd->mid_to_local[i]),
                 (unsigned long long)fwd->pair.locals[i].tx_packets,
@@ -1207,6 +1264,7 @@ void forwarder_print_stats(struct forwarder *fwd)
                 (unsigned long long)fwd->pair.locals[i].tx_reserve_fail,
                 (unsigned long long)fwd->pair.locals[i].tx_submit_calls,
                 (unsigned long long)fwd->pair.locals[i].tx_popped,
+                (unsigned long long)fwd->pair.locals[i].cq_packets,
                 (unsigned long long)fwd->pair.locals[i].fq_no_slots,
                 (unsigned long long)fwd->pair.locals[i].fq_pool_empty,
                 (unsigned long long)fwd->pair.locals[i].fq_reserve_fail,
@@ -1214,7 +1272,7 @@ void forwarder_print_stats(struct forwarder *fwd)
     }
     for (int i = 0; i < fwd->wan_count; i++) {
         fprintf(stderr,
-                "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu stuck=%llu cooldown=%u flushes=%llu queue_dropped=%llu\n",
+                "[STATS] wan[%d]=%s mid_to_wan=%u tx_packets=%llu rx_packets=%llu tx_no_free=%llu tx_reserve_fail=%llu tx_submit=%llu tx_popped=%llu cq=%llu fq_no_slots=%llu fq_pool_empty=%llu fq_reserve_fail=%llu fq_refill=%llu stuck=%llu cooldown=%u flushes=%llu queue_dropped=%llu\n",
                 i, fwd->pair.wans[i].ifname,
                 ne_ring_count(&fwd->mid_to_wan[i]),
                 (unsigned long long)fwd->pair.wans[i].tx_packets,
@@ -1223,6 +1281,7 @@ void forwarder_print_stats(struct forwarder *fwd)
                 (unsigned long long)fwd->pair.wans[i].tx_reserve_fail,
                 (unsigned long long)fwd->pair.wans[i].tx_submit_calls,
                 (unsigned long long)fwd->pair.wans[i].tx_popped,
+                (unsigned long long)fwd->pair.wans[i].cq_packets,
                 (unsigned long long)fwd->pair.wans[i].fq_no_slots,
                 (unsigned long long)fwd->pair.wans[i].fq_pool_empty,
                 (unsigned long long)fwd->pair.wans[i].fq_reserve_fail,

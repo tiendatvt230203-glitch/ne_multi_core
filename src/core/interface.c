@@ -537,13 +537,15 @@ static void drain_cq(struct ne_port *port, struct ne_pool *pool)
 {
     uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
-    uint32_t n = xsk_ring_cons__peek(&port->cq, NE_BATCH_SIZE, &idx);
-    if (!n)
-        return;
-    for (uint32_t i = 0; i < n; i++)
-        addrs[i] = *xsk_ring_cons__comp_addr(&port->cq, idx + i);
-    xsk_ring_cons__release(&port->cq, n);
-    (void)pool_push(pool, addrs, n);
+    uint32_t n;
+
+    while ((n = xsk_ring_cons__peek(&port->cq, NE_BATCH_SIZE, &idx)) > 0) {
+        for (uint32_t i = 0; i < n; i++)
+            addrs[i] = *xsk_ring_cons__comp_addr(&port->cq, idx + i);
+        xsk_ring_cons__release(&port->cq, n);
+        (void)pool_push(pool, addrs, n);
+        port->cq_packets += n;
+    }
 }
 
 void ne_drain_cq_local(struct ne_pair *p)

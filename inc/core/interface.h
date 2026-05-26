@@ -103,6 +103,7 @@ struct ne_port {
     uint64_t tx_reserve_fail;
     uint64_t tx_submit_calls;
     uint64_t tx_popped;
+    uint64_t cq_packets;
     uint64_t fq_no_slots;
     uint64_t fq_pool_empty;
     uint64_t fq_reserve_fail;
