@@ -519,9 +519,12 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
     }
     int profile_idx = config_select_profile_for_local(fwd->cfg, local_idx);
     const struct crypto_policy *cp = NULL;
-    if (fwd->cfg->crypto_enabled && flow_ok)
+    if (flow_ok)
         cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
                                          src_port, dst_port, proto);
+    if (!cp)
+        goto drop;
+
     int wan_idx = select_wan_for_local(fwd, profile_idx, flow_ok,
                                        src_ip, dst_ip, src_port, dst_port,
                                        proto, job.len);
@@ -533,10 +536,13 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
     if (set_wan_l2(fwd, wan_idx, pkt) != 0)
         goto drop;
 
-    if (!fwd->cfg->crypto_enabled || !cp || cp->action == POLICY_ACTION_BYPASS) {
+    if (cp->action == POLICY_ACTION_BYPASS) {
         (void)emit_local_to_wan(fwd, &job, wan_idx);
         return;
     }
+
+    if (!fwd->cfg->crypto_enabled)
+        goto drop;
 
     int pi = (int)(cp - fwd->cfg->policies);
     if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !policy_crypto_ready[pi])
