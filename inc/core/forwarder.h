@@ -42,6 +42,7 @@ struct forwarder {
     uint64_t local_bypass_to_wan;
     uint64_t local_encrypted_to_wan;
     uint64_t local_split_to_wan;
+    uint64_t local_reflected_drop;
     uint64_t wan_tx_stuck[MAX_INTERFACES];
     uint64_t wan_tx_flushes[MAX_INTERFACES];
     uint64_t wan_tx_dropped[MAX_INTERFACES];

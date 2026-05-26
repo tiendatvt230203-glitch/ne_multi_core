@@ -281,6 +281,19 @@ static int set_local_l2(struct forwarder *fwd, int local_idx, uint8_t *pkt)
     return 0;
 }
 
+static int local_rx_is_reflected_client_frame(struct forwarder *fwd, int local_idx,
+                                              const uint8_t *pkt, uint32_t pkt_len)
+{
+    if (!fwd || !config_wan_bridge_mode(fwd->cfg) ||
+        local_idx < 0 || local_idx >= fwd->local_count || !pkt || pkt_len < 14)
+        return 0;
+    const uint8_t *dst = fwd->locals[local_idx].dst_mac;
+    static const uint8_t zero[MAC_LEN];
+    if (memcmp(dst, zero, MAC_LEN) == 0)
+        return 0;
+    return memcmp(pkt, dst, MAC_LEN) == 0;
+}
+
 static int emit_owned(struct forwarder *fwd, struct ne_ring *dst, struct ne_packet *pkt)
 {
     if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(dst, pkt) != 0) {
@@ -533,11 +546,25 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
     int encrypted = 0;
     int flow_ok = (parse_flow(pkt, job.len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0);
     int local_idx = job.local_idx < fwd->local_count ? job.local_idx : 0;
+    int do_trace = trace_hit(&trace_counter);
+    if (local_rx_is_reflected_client_frame(fwd, local_idx, pkt, job.len)) {
+        if (do_trace) {
+            char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+            ip_to_str(src_ip, src, sizeof(src));
+            ip_to_str(dst_ip, dst, sizeof(dst));
+            fprintf(stderr,
+                    "[TRACE LOCAL-SKIP] reason=reflected_client_frame local=%d len=%u %s:%u -> %s:%u proto=%u dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                    local_idx, job.len, src, src_port, dst, dst_port, proto,
+                    pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5]);
+        }
+        __sync_fetch_and_add(&fwd->local_reflected_drop, 1);
+        ne_frame_free(&fwd->pair, job.addr);
+        return;
+    }
     int profile_idx = config_select_profile_for_local(fwd->cfg, local_idx);
     int wan_idx = select_wan_for_local(fwd, profile_idx, flow_ok,
                                        src_ip, dst_ip, src_port, dst_port,
                                        proto, job.len);
-    int do_trace = trace_hit(&trace_counter);
     if (do_trace) {
         char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
         ip_to_str(src_ip, src, sizeof(src));
@@ -1158,10 +1185,11 @@ void forwarder_print_stats(struct forwarder *fwd)
             (unsigned long long)fwd->local_rx_to_mid,
             (unsigned long long)fwd->wan_rx_to_mid);
     fprintf(stderr,
-            "[STATS] local_path bypass=%llu encrypted=%llu split=%llu no_wan=%llu wan_l2=%llu policy_not_ready=%llu encrypt_fail=%llu wan_congested=%llu\n",
+            "[STATS] local_path bypass=%llu encrypted=%llu split=%llu reflected_skip=%llu no_wan=%llu wan_l2=%llu policy_not_ready=%llu encrypt_fail=%llu wan_congested=%llu\n",
             (unsigned long long)fwd->local_bypass_to_wan,
             (unsigned long long)fwd->local_encrypted_to_wan,
             (unsigned long long)fwd->local_split_to_wan,
+            (unsigned long long)fwd->local_reflected_drop,
             (unsigned long long)fwd->dropped_no_wan,
             (unsigned long long)fwd->dropped_wan_l2,
             (unsigned long long)fwd->dropped_policy_not_ready,

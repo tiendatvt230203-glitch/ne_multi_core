@@ -366,9 +366,9 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     }
 
     for (int i = 0; i < p->local_count; i++)
-        (void)interface_set_queue_count(cfg->locals[i].ifname, DEFAULT_QUEUE_COUNT);
+        NE_TRY(interface_set_queue_count(cfg->locals[i].ifname, DEFAULT_QUEUE_COUNT));
     for (int i = 0; i < p->wan_count; i++)
-        (void)interface_set_queue_count(cfg->wans[i].ifname, DEFAULT_QUEUE_COUNT);
+        NE_TRY(interface_set_queue_count(cfg->wans[i].ifname, DEFAULT_QUEUE_COUNT));
 
     struct xsk_umem_config ucfg = {
         .fill_size = NE_RING,
