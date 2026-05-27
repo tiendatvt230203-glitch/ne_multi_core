@@ -100,6 +100,12 @@ static int rebuild_crypto_runtime(struct app_config *cfg)
             continue;
         if (cp->id >= 0 && cp->id <= 255)
             policy_index_by_action_id[cp->action][(uint8_t)cp->id] = i;
+        if (cp->crypto_mode == CRYPTO_MODE_PQC) {
+            memset(&policy_crypto_ctx[i], 0, sizeof(policy_crypto_ctx[i]));
+            policy_crypto_ctx[i].initialized = true;
+            policy_crypto_ready[i] = 1;
+            continue;
+        }
         if (!key_nonzero(cp->key, AES_KEY_LEN))
             continue;
         crypto_apply_from_policy(cp);
