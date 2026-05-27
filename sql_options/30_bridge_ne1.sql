@@ -9,7 +9,7 @@ DELETE FROM ne_profiles WHERE id = 30;
 INSERT INTO ne_profiles (id, name, description, weight_enable, latency_enable, loss_enable, created_by)
 VALUES (
     30, 'profile30',
-    'L2 UDP 7002, L3 TCP 7003, L4 UDP 7004, bypass any',
+    '',
     TRUE, FALSE, FALSE, 'seed'
 );
 
@@ -19,34 +19,41 @@ INSERT INTO ne_policies (
     src_port, dst_port, method, nonce, encryption_key, created_by
 ) VALUES
 (
-    10, 30, 1, 'L2', 'udp',
+    10, 30, 1, 'L2', NULL,
     ARRAY['192.168.9.2/32']::text[], FALSE,
     ARRAY['192.168.180.2/32']::text[], FALSE,
-    ARRAY['7002']::text[], ARRAY['7002']::text[],
+    NULL, ARRAY['7002']::text[],
     'aes-gcm-128', 12, '87e3855f04321a1a7c661a283570b5bd', 'seed'
 ),
 (
-    20, 30, 2, 'L3', 'udp',
+    20, 30, 2, 'L3', NULL,
     ARRAY['192.168.9.2/32']::text[], FALSE,
     ARRAY['192.168.180.2/32']::text[], FALSE,
-    ARRAY['7003']::text[], ARRAY['7003']::text[],
+    NULL, ARRAY['7003']::text[],
 
     'aes-gcm-128', 12, '1234fc1037ab91a5702b4874b2d293a1', 'seed'
 ),
 (
-    30, 30, 3, 'L4', 'udp',
+    30, 30, 3, 'L4', NULL,
     ARRAY['192.168.9.2/32']::text[], FALSE,
     ARRAY['192.168.180.2/32']::text[], FALSE,
-    ARRAY['7004']::text[], ARRAY['7004']::text[],
+    NULL, ARRAY['7004']::text[],
     'aes-gcm-128', 12, 'aac816a88e013feb4925f9f2af602b3f', 'seed'
 ),
 (
-    40, 30, 4, 'bypass', NULL,
-    NULL, FALSE,
-    NULL, FALSE,
-    NULL, NULL,
-    NULL, NULL, NULL, 'seed'
+    40, 30, 4, 'L2', NULL,
+    ARRAY['192.168.9.2/32']::text[], FALSE,
+    ARRAY['192.168.180.2/32']::text[], FALSE,
+    NULL, ARRAY['7004']::text[],
+    'pqc-gcm', 12, NULL, 'seed'
 );
+-- (
+--     40, 30, 4, 'bypass', NULL,
+--     NULL, FALSE,
+--     NULL, FALSE,
+--     NULL, NULL,
+--     NULL, NULL, NULL, 'seed'
+-- );
 
 
 INSERT INTO ne_lan (interface, profile_id, created_by) VALUES

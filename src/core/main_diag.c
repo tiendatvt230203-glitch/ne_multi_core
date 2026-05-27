@@ -34,7 +34,16 @@ static const char *policy_proto_str(uint8_t proto) {
 }
 
 static const char *crypto_mode_str(int mode) {
-    return (mode == CRYPTO_MODE_GCM) ? "gcm" : "ctr";
+    if (mode == CRYPTO_MODE_GCM) {
+        return "gcm";
+    }
+    if (mode == CRYPTO_MODE_CTR) {
+        return "ctr";
+    }
+    if (mode == CRYPTO_MODE_PQC) {
+        return "pqc-gcm";
+    }
+    return "?";
 }
 
 static int ipv4_netmask_to_prefix(uint32_t mask_be) {
@@ -148,8 +157,17 @@ static void log_profile_policies(const struct app_config *cfg) {
                         dp);
                 continue;
             }
-
-            fprintf(stderr,
+            if (cp->crypto_mode == CRYPTO_MODE_PQC) {
+                fprintf(stderr,
+                        "  policy db_id=%d wire_id=%d prio=%d %s  %s\n"
+                        "    match: %s  src=%s dst=%s  sport=%s dport=%s\n",
+                        cp->db_id, cp->id, cp->priority,
+                        policy_action_name(cp->action),
+                        crypto_mode_str(cp->crypto_mode),
+                        policy_proto_str(cp->protocol), src_c, dst_c, sp, dp);
+            }
+            else {
+                    fprintf(stderr,  
                     "  policy db_id=%d wire_id=%d prio=%d %s  %s-%u nonce=%d\n"
                     "    match: %s  src=%s dst=%s  sport=%s dport=%s\n",
                     cp->db_id,
@@ -164,6 +182,7 @@ static void log_profile_policies(const struct app_config *cfg) {
                     dst_c,
                     sp,
                     dp);
+            }
         }
     }
 }

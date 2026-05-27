@@ -1,12 +1,24 @@
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/core/config.h"
 #include <string.h>
+#include "../../inc/crypto/traffic_crypto.h"
 
 #define L2_FRAG_MAGIC      0x5B
 #define MIN_ETH_PKT        (ETH_HEADER_SIZE + 8)
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
+
+static const byte g_pqc_test_key[32] = {
+    0x2c, 0x8b, 0x3c, 0x70, 0x33, 0x4f, 0x99, 0x07,
+    0x7b, 0x40, 0x8c, 0xe2, 0x99, 0x6c, 0x7b, 0xb4,
+    0x9c, 0x02, 0xf6, 0xa6, 0x1c, 0x97, 0x63, 0xeb,
+    0x06, 0x89, 0xd5, 0x32, 0xbf, 0xa3, 0xae, 0x9c
+};
+
+static const byte g_pqc_test_aad[12] = {
+    0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f, 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xd1
+};
 
 static inline int l2_enc_start_offset(int nonce_size) {
     return ETH_HEADER_SIZE + nonce_size;
@@ -57,16 +69,47 @@ int crypto_layer2_wire_eth_len(void) {
 int crypto_layer2_frag_meta_len(void) {
     int nonce_size = packet_crypto_get_nonce_size();
     int meta = nonce_size + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
-    if (packet_crypto_get_mode() == CRYPTO_MODE_GCM)
+    if (packet_crypto_get_mode() == CRYPTO_MODE_GCM ||
+        packet_crypto_get_mode() == CRYPTO_MODE_PQC)
         meta += AES128_GCM_TAG_SIZE;
     return meta;
 }
 
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
+
     if (unlikely(!ctx || !ctx->initialized || !packet || pkt_len < MIN_ETH_PKT))
         return -1;
     if (!pkt_is_ipv4_eth(packet))
         return (int)pkt_len;
+
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        const int nonce_size = 12;
+        const int l2_enc_start = l2_enc_start_offset(nonce_size);
+        uint8_t marker_byte;
+        if (l2_fake_marker_byte(packet, &marker_byte) < 0)
+            return (int)pkt_len;
+
+        size_t payload_len = pkt_len - ETH_HEADER_SIZE;
+        memmove(packet + l2_enc_start, packet + ETH_HEADER_SIZE, payload_len);
+
+        byte nonce[12] = {0};
+        const byte *key = g_pqc_test_key;
+        const byte *aad = g_pqc_test_aad;
+        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        int rc = trf_pqc_generate_nonce(nonce);
+        if (rc != TRF_PQC_OK)
+            return -1;
+
+        crypto_write_counter(packet, nonce, nonce_size, marker_byte, packet_crypto_get_policy_id());
+
+        int new_len = 0;
+        rc = trf_encrypt_payload_gcm(key, nonce, nonce_size,
+                                     aad, aad_len,
+                                     packet + l2_enc_start, (int)payload_len, &new_len);
+        if (rc != TRF_PQC_OK)
+            return -1;
+        return (int)(ETH_HEADER_SIZE + nonce_size + new_len);
+    }
 
     const int nonce_size = packet_crypto_get_nonce_size();
     const int l2_enc_start = l2_enc_start_offset(nonce_size);
@@ -121,13 +164,47 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         packet[ETH_HEADER_SIZE + nonce_size] == L2_FRAG_MAGIC)
         return (int)pkt_len;
 
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        const int pqc_nonce_size = 12;
+        const int pqc_l2_enc_start = l2_enc_start_offset(pqc_nonce_size);
+        byte nonce[12];
+        uint8_t policy_id;
+        uint8_t proto_flag;
+        const byte *key = g_pqc_test_key;
+        const byte *aad = g_pqc_test_aad;
+        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        crypto_read_counter(packet, pqc_nonce_size, nonce, &policy_id, &proto_flag);
+        (void)policy_id;
+        (void)proto_flag;
+
+        int dec_len = 0;
+        int rc = trf_decrypt_payload_gcm(key, nonce, pqc_nonce_size,
+                                         aad, aad_len,
+                                         packet + pqc_l2_enc_start,
+                                         (int)(pkt_len - pqc_l2_enc_start),
+                                         &dec_len);
+        if (rc != TRF_PQC_OK)
+            return -1;
+
+        uint8_t *work_ptr = packet + pqc_l2_enc_start;
+        if (dec_len >= 2 && work_ptr[0] == 0x08 && work_ptr[1] == 0x00) {
+            packet[12] = 0x08;
+            packet[13] = 0x00;
+            memmove(packet + ETH_HEADER_SIZE, work_ptr + 2, (size_t)dec_len - 2);
+            return ETH_HEADER_SIZE + dec_len - 2;
+        }
+
+        packet[12] = 0x08;
+        packet[13] = 0x00;
+        memmove(packet + ETH_HEADER_SIZE, work_ptr, (size_t)dec_len);
+        return ETH_HEADER_SIZE + dec_len;
+    }
     uint8_t policy_id;
     uint8_t proto_flag;
     uint8_t nonce[16];
     crypto_read_counter(packet, nonce_size, nonce, &policy_id, &proto_flag);
     (void)policy_id;
     (void)proto_flag;
-
     const int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     const int nonce_len = is_gcm ? nonce_size : AES128_IV_SIZE;
 
@@ -190,6 +267,42 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     if (enc_plain_len == 0 || !pkt_is_ipv4_eth(eth_hdr))
         return -1;
 
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        int nonce_size = 12;
+        int enc_off = l2_frag_enc_start_offset(nonce_size);
+        size_t need = (size_t)enc_off + enc_plain_len + AES128_GCM_TAG_SIZE;
+        if (need > out_max)
+            return -1;
+
+        memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
+        uint8_t marker_byte;
+        if (l2_fake_marker_byte(eth_hdr, &marker_byte) < 0)
+            return -1;
+
+        byte nonce[12] = {0};
+        const byte *key = g_pqc_test_key;
+        const byte *aad = g_pqc_test_aad;
+        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        int rc = trf_pqc_generate_nonce(nonce);
+        if (rc != TRF_PQC_OK)
+            return -1;
+
+        memmove(out_buf + enc_off, enc_plain, enc_plain_len);
+        crypto_write_counter(out_buf, nonce, nonce_size, marker_byte, packet_crypto_get_policy_id());
+        out_buf[ETH_HEADER_SIZE + nonce_size] = L2_FRAG_MAGIC;
+        l2_write_frag_tag(out_buf + ETH_HEADER_SIZE + nonce_size + 1, pkt_id, frag_index);
+
+        int new_len = 0;
+        rc = trf_encrypt_payload_gcm(key, nonce, nonce_size,
+                                     aad, aad_len,
+                                     out_buf + enc_off, (int)enc_plain_len, &new_len);
+        if (rc != TRF_PQC_OK)
+            return -1;
+
+        *out_len = (uint32_t)(enc_off + new_len);
+        return 0;
+    }
+
     int nonce_size = packet_crypto_get_nonce_size();
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     int enc_off = l2_frag_enc_start_offset(nonce_size);
@@ -241,6 +354,38 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     uint16_t *out_pkt_id, uint8_t *out_frag_index) {
     if (!ctx || !ctx->initialized || !packet || !out_pkt_id || !out_frag_index)
         return -1;
+    
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        int nonce_size = 12;
+        int enc_off = l2_frag_enc_start_offset(nonce_size);
+        if (pkt_len < (size_t)enc_off || !l2_has_fake_marker(packet))
+            return -1;
+        if (packet[ETH_HEADER_SIZE + nonce_size] != L2_FRAG_MAGIC)
+            return -1;
+
+        l2_read_frag_tag(packet + ETH_HEADER_SIZE + nonce_size + 1, out_pkt_id, out_frag_index);
+
+        byte nonce[12];
+        uint8_t policy_id;
+        uint8_t proto_flag;
+        const byte *key = g_pqc_test_key;
+        const byte *aad = g_pqc_test_aad;
+        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        crypto_read_counter(packet, nonce_size, nonce, &policy_id, &proto_flag);
+        (void)policy_id;
+        (void)proto_flag;
+
+        int dec_len = 0;
+        int rc = trf_decrypt_payload_gcm(key, nonce, nonce_size,
+                                         aad, aad_len,
+                                         packet + enc_off,
+                                         (int)(pkt_len - (size_t)enc_off),
+                                         &dec_len);
+        if (rc != TRF_PQC_OK)
+            return -1;
+        memmove(packet + ETH_HEADER_SIZE, packet + enc_off, (size_t)dec_len);
+        return (int)(ETH_HEADER_SIZE + dec_len);
+    }
 
     int nonce_size = packet_crypto_get_nonce_size();
     int enc_off = l2_frag_enc_start_offset(nonce_size);

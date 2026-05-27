@@ -257,6 +257,12 @@ static int ne_parse_method(const char *v, int pq_null, int *crypto_mode_out, int
         *aes_bits_out = 256;
         return 0;
     }
+
+    if (strcasecmp(v, "pqc-gcm") == 0) {
+        *crypto_mode_out = CRYPTO_MODE_PQC;
+        *aes_bits_out = 256;
+        return 0;
+    }
     /* BE validates method; default for unexpected values */
     *crypto_mode_out = CRYPTO_MODE_GCM;
     *aes_bits_out = 128;
@@ -264,6 +270,7 @@ static int ne_parse_method(const char *v, int pq_null, int *crypto_mode_out, int
 }
 
 static void ne_fill_policy_key(const char *enc_key, int enc_null, int key_len_bytes, uint8_t *out) {
+    
     memset(out, 0, AES_KEY_LEN);
     if (enc_null || !enc_key || !enc_key[0])
         return;
@@ -423,7 +430,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         int enc_null = PQgetisnull(res, r, 11);
         const char *enc_key = enc_null ? NULL : PQgetvalue(res, r, 11);
         int nonce_null = PQgetisnull(res, r, 12);
-
+        
         if (cp_base.action == POLICY_ACTION_BYPASS) {
             cp_base.crypto_mode = CRYPTO_MODE_GCM;
             cp_base.aes_bits = 128;
@@ -432,24 +439,41 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
             cp_base.id = 0;
         } else {
             (void)ne_parse_method(method_txt, method_null, &cp_base.crypto_mode, &cp_base.aes_bits);
-            cp_base.nonce_size = nonce_null ? 12 : atoi(PQgetvalue(res, r, 12));
-            if (cp_base.aes_bits != 256)
-                cp_base.aes_bits = 128;
-            if (cp_base.nonce_size <= 0)
+            if (cp_base.crypto_mode == CRYPTO_MODE_PQC) {
+                cp_base.aes_bits = 256;
                 cp_base.nonce_size = 12;
-            int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
-            ne_fill_policy_key(enc_key, enc_null, key_len, cp_base.key);
-            {
-                int wire_id = ne_wire_id_for_encrypt_key(key_wire_map, NE_KEY_WIRE_MAP_MAX,
-                                                         wire_id_used,
-                                                         cp_base.key, key_len,
-                                                         db_policy_id);
+                
+                int wire_id = ne_wire_id_for_encrypt_key(
+                    key_wire_map, NE_KEY_WIRE_MAP_MAX, wire_id_used,
+                    NULL, 0, db_policy_id
+                );
                 if (wire_id < 0) {
                     fprintf(stderr, "[DB CRYPTO] no free wire policy id (max 255 policies)\n");
                     PQclear(res);
                     return -1;
                 }
                 cp_base.id = wire_id;
+            }
+            else {
+                cp_base.nonce_size = nonce_null ? 12 : atoi(PQgetvalue(res, r, 12));
+                if (cp_base.aes_bits != 256)
+                    cp_base.aes_bits = 128;
+                if (cp_base.nonce_size <= 0)
+                    cp_base.nonce_size = 12;
+                int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
+                ne_fill_policy_key(enc_key, enc_null, key_len, cp_base.key);
+                {
+                    int wire_id = ne_wire_id_for_encrypt_key(key_wire_map, NE_KEY_WIRE_MAP_MAX,
+                                                            wire_id_used,
+                                                            cp_base.key, key_len,
+                                                            db_policy_id);
+                    if (wire_id < 0) {
+                        fprintf(stderr, "[DB CRYPTO] no free wire policy id (max 255 policies)\n");
+                        PQclear(res);
+                        return -1;
+                    }
+                    cp_base.id = wire_id;
+                }
             }
         }
 

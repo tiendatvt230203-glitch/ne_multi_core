@@ -17,7 +17,7 @@
 #include "forwarder.h"
 #include "interface.h"
 #include "main_diag.h"
-
+#include "traffic_crypto.h"
 #define NOTIFY_CHANNEL "xdp_start"
 #define MAX_ACTIVE_PROFILE_IDS 32
 
@@ -283,7 +283,7 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
     return 0;
 }
 
-/* 0 = loaded, 1 = already active (no reload), -1 = error */
+
 static int load_profile_and_run(struct runtime_state *rt,
                                 int *active_ids,
                                 int *active_id_count,
@@ -338,7 +338,10 @@ static int handle_profile_notify(struct runtime_state *rt,
 
 int main(int argc, char **argv) {
     setbuf(stderr, NULL);
-
+    if (trf_pqc_init_global() != TRF_PQC_OK) {
+        fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
+        return 1;
+    }
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
         return 0;
@@ -471,5 +474,6 @@ int main(int argc, char **argv) {
     }
     free(rt);
     PQfinish(listen_conn);
+    trf_pqc_cleanup();
     return 0;
 }

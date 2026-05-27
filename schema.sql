@@ -16,7 +16,8 @@ CREATE TYPE encryption_method_enum AS ENUM (
     'aes-gcm-128',
     'aes-gcm-256',
     'aes-ctr-128',
-    'aes-ctr-256'
+    'aes-ctr-256',
+    'pqc-gcm'
 );
 
 CREATE TABLE pqc (
@@ -37,6 +38,7 @@ CREATE TABLE ne_profiles (
     created_by      VARCHAR(100)    NULL,
     updated_at      TIMESTAMP       NULL,
     updated_by      VARCHAR(100)    NULL,
+
 
     CONSTRAINT uq_encryption_profile_name UNIQUE (name)
 );
@@ -97,3 +99,13 @@ CREATE TABLE ne_wan (
     updated_at      TIMESTAMP       NULL,
     updated_by      VARCHAR(100)    NULL
 );
+
+CREATE TABLE IF NOT EXISTS pqc_identities (
+    profile_id INT PRIMARY KEY REFERENCES xdp_profiles(id) ON DELETE CASCADE,
+    peer_pub TEXT NOT NULL,
+    peer_fingerprint VARCHAR(16),
+    is_initiator BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+
+

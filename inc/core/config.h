@@ -10,6 +10,8 @@
 
 #define CRYPTO_MODE_CTR  0
 #define CRYPTO_MODE_GCM  1
+#define CRYPTO_MODE_PQC 2
+
 
 #define DEFAULT_FRAME_SIZE      4096
 #define DEFAULT_BATCH_SIZE      64
