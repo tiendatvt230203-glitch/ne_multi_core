@@ -15,6 +15,7 @@ int crypto_layer4_get_transport_hdr_size(const uint8_t *transport_hdr, uint8_t i
                                          size_t remaining);
 
 int crypto_layer4_wire_port_len(void);
+int crypto_layer4_frag_meta_len(void);
 int crypto_layer4_tunnel_off_ipv4(const uint8_t *pkt, size_t pkt_len, int *transport_off_out);
 
 int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,

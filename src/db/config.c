@@ -336,29 +336,32 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
         return NULL;
 
     const struct profile_config *p = &cfg->profiles[profile_idx];
+    const struct crypto_policy *best = NULL;
+    int best_priority = 0x7fffffff;
+    int best_id = 0x7fffffff;
 
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < p->policy_count; i++) {
-            int pi = p->policy_indices[i];
-            if (pi < 0 || pi >= cfg->policy_count)
-                continue;
+    for (int i = 0; i < p->policy_count; i++) {
+        int pi = p->policy_indices[i];
+        if (pi < 0 || pi >= cfg->policy_count)
+            continue;
 
-            const struct crypto_policy *cp = &cfg->policies[pi];
-            if (pass == 0) {
-                if (cp->protocol == POLICY_PROTO_ANY)
-                    continue;
-            } else {
-                if (cp->protocol != POLICY_PROTO_ANY)
-                    continue;
-            }
-            int matched = crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol);
-            if (!matched)
-                matched = crypto_policy_match_packet(cp, dst_ip, src_ip, dst_port, src_port, protocol);
-            if (matched)
-                return cp;
+        const struct crypto_policy *cp = &cfg->policies[pi];
+        int matched = crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol);
+        if (!matched)
+            matched = crypto_policy_match_packet(cp, dst_ip, src_ip, dst_port, src_port, protocol);
+        if (!matched)
+            continue;
+
+        if (!best ||
+            cp->priority < best_priority ||
+            (cp->priority == best_priority && cp->id < best_id)) {
+            best = cp;
+            best_priority = cp->priority;
+            best_id = cp->id;
         }
     }
-    return NULL;
+
+    return best;
 }
 
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network) {

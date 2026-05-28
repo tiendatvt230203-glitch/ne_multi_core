@@ -46,11 +46,7 @@ static inline int frag_need_split(uint32_t pkt_len) {
 
 
 static inline int frag_need_split_l4(uint32_t pkt_len) {
-    int overhead = crypto_layer4_wire_port_len() + packet_crypto_get_tunnel_hdr_size() +
-                   FRAG_L4_HDR_SIZE;
-    if (packet_crypto_get_mode() == 1)
-        overhead += 16;
-    return (pkt_len + overhead) > FRAG_MTU;
+    return (pkt_len + crypto_layer4_frag_meta_len()) > FRAG_MTU;
 }
 
 

@@ -32,6 +32,10 @@ uint32_t packet_crypto_next_counter(void);
 void packet_crypto_reset_counter(void);
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot);
+const uint8_t *packet_crypto_get_pqc_test_key(void);
+const uint8_t *packet_crypto_get_pqc_test_aad(void);
+int packet_crypto_get_pqc_test_aad_len(void);
+const uint8_t *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx);
 
 int packet_encrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,

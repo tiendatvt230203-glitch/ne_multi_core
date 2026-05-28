@@ -24,12 +24,127 @@ static struct packet_crypto_ctx base_crypto_ctx;
 static struct packet_crypto_ctx policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int policy_crypto_ready[MAX_CRYPTO_POLICIES];
 static int policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
+static int policy_profile_id_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
 static struct crypto_policy active_policies[MAX_CRYPTO_POLICIES];
 static int active_policy_count;
+static struct packet_crypto_ctx prev_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
+static int prev_policy_crypto_ready[MAX_CRYPTO_POLICIES];
+static int prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
+static int prev_policy_profile_id_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
+static struct crypto_policy prev_active_policies[MAX_CRYPTO_POLICIES];
+static int prev_active_policy_count;
+static int prev_grace_active;
+static uint64_t prev_grace_until_ms;
 
-static struct frag_table wan_frag_l2;
-static struct frag_table wan_frag_l3;
-static struct frag_table wan_frag_l4;
+#define PROFILE_RELOAD_GRACE_MS 3000u
+
+static struct frag_table profile_frag_l2[MAX_PROFILES];
+static struct frag_table profile_frag_l3[MAX_PROFILES];
+static struct frag_table profile_frag_l4[MAX_PROFILES];
+static struct flow_table profile_flow_tables[MAX_PROFILES];
+static int profile_flow_table_ready[MAX_PROFILES];
+static int profile_flow_profile_id[MAX_PROFILES];
+
+static int profile_slot_for_id(int profile_id)
+{
+    for (int i = 0; i < MAX_PROFILES; i++) {
+        if (profile_flow_table_ready[i] && profile_flow_profile_id[i] == profile_id)
+            return i;
+    }
+    return -1;
+}
+
+static int profile_slot_alloc(int profile_id)
+{
+    int slot = profile_slot_for_id(profile_id);
+    if (slot >= 0)
+        return slot;
+    for (int i = 0; i < MAX_PROFILES; i++) {
+        if (!profile_flow_table_ready[i]) {
+            profile_flow_profile_id[i] = profile_id;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int ensure_profile_runtime_slots(struct app_config *cfg)
+{
+    if (!cfg)
+        return -1;
+    for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
+        int profile_id = cfg->profiles[pi].id;
+        int slot = profile_slot_alloc(profile_id);
+        if (slot < 0)
+            return -1;
+        if (!profile_flow_table_ready[slot]) {
+            uint32_t windows[MAX_INTERFACES];
+            memset(windows, 0, sizeof(windows));
+            for (int wi = 0; wi < cfg->wan_count && wi < MAX_INTERFACES; wi++)
+                windows[wi] = cfg->wans[wi].window_size;
+            flow_table_init(&profile_flow_tables[slot], windows, cfg->wan_count);
+            profile_flow_table_ready[slot] = 1;
+            frag_table_init(&profile_frag_l2[slot]);
+            frag_table_init(&profile_frag_l3[slot]);
+            frag_table_init(&profile_frag_l4[slot]);
+        }
+    }
+    return 0;
+}
+
+static void cleanup_stale_profile_slots(const struct app_config *cfg)
+{
+    if (!cfg || prev_grace_active)
+        return;
+    for (int s = 0; s < MAX_PROFILES; s++) {
+        if (!profile_flow_table_ready[s])
+            continue;
+        int pid = profile_flow_profile_id[s];
+        int still_active = 0;
+        for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
+            if (cfg->profiles[pi].id == pid) {
+                still_active = 1;
+                break;
+            }
+        }
+        if (still_active)
+            continue;
+        flow_table_cleanup(&profile_flow_tables[s]);
+        profile_flow_table_ready[s] = 0;
+        profile_flow_profile_id[s] = 0;
+        memset(&profile_frag_l2[s], 0, sizeof(profile_frag_l2[s]));
+        memset(&profile_frag_l3[s], 0, sizeof(profile_frag_l3[s]));
+        memset(&profile_frag_l4[s], 0, sizeof(profile_frag_l4[s]));
+    }
+}
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+}
+
+static void maybe_expire_prev_grace(void)
+{
+    if (!prev_grace_active)
+        return;
+    if (monotonic_ms() >= prev_grace_until_ms)
+        prev_grace_active = 0;
+}
+
+static void snapshot_active_to_prev(void)
+{
+    memcpy(prev_policy_crypto_ctx, policy_crypto_ctx, sizeof(prev_policy_crypto_ctx));
+    memcpy(prev_policy_crypto_ready, policy_crypto_ready, sizeof(prev_policy_crypto_ready));
+    memcpy(prev_policy_index_by_action_id, policy_index_by_action_id, sizeof(prev_policy_index_by_action_id));
+    memcpy(prev_policy_profile_id_by_action_id, policy_profile_id_by_action_id,
+           sizeof(prev_policy_profile_id_by_action_id));
+    memcpy(prev_active_policies, active_policies, sizeof(prev_active_policies));
+    prev_active_policy_count = active_policy_count;
+    prev_grace_active = (prev_active_policy_count > 0) ? 1 : 0;
+    prev_grace_until_ms = monotonic_ms() + PROFILE_RELOAD_GRACE_MS;
+}
 
 static void pin_cpu(unsigned int cpu)
 {
@@ -70,10 +185,21 @@ static void crypto_runtime_reset_indexes(void)
 
 static int rebuild_crypto_runtime(struct app_config *cfg)
 {
+    struct packet_crypto_ctx old_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
+    int old_policy_crypto_ready[MAX_CRYPTO_POLICIES];
+    int old_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
+    struct crypto_policy old_active_policies[MAX_CRYPTO_POLICIES];
+    int old_active_policy_count = active_policy_count;
+    memcpy(old_policy_crypto_ctx, policy_crypto_ctx, sizeof(old_policy_crypto_ctx));
+    memcpy(old_policy_crypto_ready, policy_crypto_ready, sizeof(old_policy_crypto_ready));
+    memcpy(old_policy_index_by_action_id, policy_index_by_action_id, sizeof(old_policy_index_by_action_id));
+    memcpy(old_active_policies, active_policies, sizeof(old_active_policies));
+
     memset(policy_crypto_ready, 0, sizeof(policy_crypto_ready));
     memset(active_policies, 0, sizeof(active_policies));
     active_policy_count = 0;
     crypto_runtime_reset_indexes();
+    memset(policy_profile_id_by_action_id, -1, sizeof(policy_profile_id_by_action_id));
 
     if (!cfg || !cfg->crypto_enabled)
         return 0;
@@ -100,6 +226,25 @@ static int rebuild_crypto_runtime(struct app_config *cfg)
             continue;
         if (cp->id >= 0 && cp->id <= 255)
             policy_index_by_action_id[cp->action][(uint8_t)cp->id] = i;
+
+        int reused = 0;
+        if (cp->id >= 0 && cp->id <= 255) {
+            int old_i = old_policy_index_by_action_id[cp->action][(uint8_t)cp->id];
+            if (old_i >= 0 && old_i < old_active_policy_count && old_policy_crypto_ready[old_i]) {
+                const struct crypto_policy *old_cp = &old_active_policies[old_i];
+                if (old_cp->crypto_mode == cp->crypto_mode &&
+                    old_cp->aes_bits == cp->aes_bits &&
+                    old_cp->nonce_size == cp->nonce_size &&
+                    memcmp(old_cp->key, cp->key, AES_KEY_LEN) == 0) {
+                    policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
+                    policy_crypto_ready[i] = 1;
+                    reused = 1;
+                }
+            }
+        }
+        if (reused)
+            continue;
+
         if (cp->crypto_mode == CRYPTO_MODE_PQC) {
             memset(&policy_crypto_ctx[i], 0, sizeof(policy_crypto_ctx[i]));
             policy_crypto_ctx[i].initialized = true;
@@ -113,6 +258,28 @@ static int rebuild_crypto_runtime(struct app_config *cfg)
             policy_crypto_ready[i] = 1;
     }
 
+    for (int pidx = 0; pidx < cfg->profile_count && pidx < MAX_PROFILES; pidx++) {
+        const struct profile_config *p = &cfg->profiles[pidx];
+        for (int j = 0; j < p->policy_count && j < MAX_CRYPTO_POLICIES; j++) {
+            int pi = p->policy_indices[j];
+            if (pi < 0 || pi >= cfg->policy_count)
+                continue;
+            const struct crypto_policy *cp = &cfg->policies[pi];
+            if (!crypto_action_valid(cp->action))
+                continue;
+            if (cp->id >= 0 && cp->id <= 255) {
+                int old_pid = policy_profile_id_by_action_id[cp->action][(uint8_t)cp->id];
+                if (old_pid > 0 && old_pid != p->id) {
+                    fprintf(stderr,
+                            "[RELOAD] policy id collision action=%d id=%d profile=%d conflicts with profile=%d\n",
+                            cp->action, cp->id, p->id, old_pid);
+                    return -1;
+                }
+                policy_profile_id_by_action_id[cp->action][(uint8_t)cp->id] = p->id;
+            }
+        }
+    }
+
     crypto_apply_default_from_cfg(cfg);
     return 0;
 }
@@ -121,24 +288,56 @@ static struct crypto_dispatch_ctx make_dispatch_ctx(void)
 {
     struct crypto_dispatch_ctx dctx;
     memset(&dctx, 0, sizeof(dctx));
+    maybe_expire_prev_grace();
     dctx.base_ctx = &base_crypto_ctx;
     dctx.per_policy_ctx = policy_crypto_ctx;
     dctx.per_policy_ready = policy_crypto_ready;
     dctx.policies = active_policies;
     dctx.policy_count = active_policy_count;
     dctx.policy_index_by_action_id = policy_index_by_action_id;
+    dctx.prev_per_policy_ctx = prev_policy_crypto_ctx;
+    dctx.prev_per_policy_ready = prev_policy_crypto_ready;
+    dctx.prev_policies = prev_active_policies;
+    dctx.prev_policy_count = prev_active_policy_count;
+    dctx.prev_policy_index_by_action_id = prev_policy_index_by_action_id;
+    dctx.prev_grace_active = prev_grace_active;
     return dctx;
 }
 
 static struct packet_crypto_ctx *ctx_for_policy_action_id(int action, uint8_t id)
 {
+    maybe_expire_prev_grace();
     if (action < 0 || action > POLICY_ACTION_ENCRYPT_L4)
         return NULL;
     int pi = policy_index_by_action_id[action][id];
-    if (pi < 0 || pi >= active_policy_count || !policy_crypto_ready[pi])
-        return NULL;
-    crypto_apply_from_policy(&active_policies[pi]);
-    return &policy_crypto_ctx[pi];
+    if (pi >= 0 && pi < active_policy_count && policy_crypto_ready[pi]) {
+        crypto_apply_from_policy(&active_policies[pi]);
+        return &policy_crypto_ctx[pi];
+    }
+    if (prev_grace_active) {
+        int ppi = prev_policy_index_by_action_id[action][id];
+        if (ppi >= 0 && ppi < prev_active_policy_count && prev_policy_crypto_ready[ppi]) {
+            crypto_apply_from_policy(&prev_active_policies[ppi]);
+            return &prev_policy_crypto_ctx[ppi];
+        }
+    }
+    return NULL;
+}
+
+static int profile_id_for_policy_action_id(int action, uint8_t id)
+{
+    maybe_expire_prev_grace();
+    if (action < 0 || action > POLICY_ACTION_ENCRYPT_L4)
+        return -1;
+    int pid = policy_profile_id_by_action_id[action][id];
+    if (pid > 0)
+        return pid;
+    if (prev_grace_active) {
+        int old_pid = prev_policy_profile_id_by_action_id[action][id];
+        if (old_pid > 0)
+            return old_pid;
+    }
+    return -1;
 }
 
 static int parse_flow(void *pkt_data, uint32_t pkt_len,
@@ -184,16 +383,6 @@ static uint32_t get_dest_ip(void *pkt_data, uint32_t pkt_len)
     if (parse_flow(pkt_data, pkt_len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) != 0)
         return 0;
     return dst_ip;
-}
-
-static void init_wan_flow_table(struct forwarder *fwd)
-{
-    uint32_t windows[MAX_INTERFACES];
-    memset(windows, 0, sizeof(windows));
-    for (int i = 0; i < fwd->wan_count; i++)
-        windows[i] = fwd->cfg->wans[i].window_size;
-    flow_table_init(&fwd->wan_flow_table, windows, fwd->wan_count);
-    fwd->wan_flow_table_ready = 1;
 }
 
 static int same_topology(const struct app_config *a, const struct app_config *b)
@@ -490,9 +679,10 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
     if (profile_idx >= 0 && profile_idx < fwd->cfg->profile_count) {
         struct profile_config *p = &fwd->cfg->profiles[profile_idx];
         if (p->wan_count > 0) {
+            int slot = profile_slot_for_id(p->id);
             int wan_idx;
-            if (flow_ok && fwd->wan_flow_table_ready) {
-                wan_idx = flow_table_get_wan_profile(&fwd->wan_flow_table,
+            if (flow_ok && slot >= 0 && profile_flow_table_ready[slot]) {
+                wan_idx = flow_table_get_wan_profile(&profile_flow_tables[slot],
                                                      src_ip, dst_ip, src_port, dst_port,
                                                      proto, pkt_len,
                                                      p->wan_indices, p->wan_count,
@@ -594,6 +784,8 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
     uint8_t frag_idx = 0;
     if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &pid, &frag_idx)) {
         uint8_t policy_id = pkt[13];
+        int profile_id = profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
+        int slot = (profile_id > 0) ? profile_slot_for_id(profile_id) : -1;
         struct packet_crypto_ctx *ctx = ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
         if (!ctx)
             return -1;
@@ -604,7 +796,9 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
             return -1;
         uint8_t reass[4096];
         uint32_t reass_len = 0;
-        int rr = frag_try_reassemble_l2(&wan_frag_l2, pkt, (uint32_t)nd, opid, ofidx,
+        if (slot < 0)
+            return -1;
+        int rr = frag_try_reassemble_l2(&profile_frag_l2[slot], pkt, (uint32_t)nd, opid, ofidx,
                                         reass, &reass_len);
         if (rr == 0)
             return 1;
@@ -622,6 +816,8 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
             uint8_t policy_id = 0;
             if (crypto_l3_extract_policy_id(fwd->cfg, pkt, pkt_len, &policy_id) != 0)
                 return -1;
+            int profile_id = profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L3, policy_id);
+            int slot = (profile_id > 0) ? profile_slot_for_id(profile_id) : -1;
             struct packet_crypto_ctx *ctx = ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L3, policy_id);
             if (!ctx)
                 return -1;
@@ -632,7 +828,9 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
                 return -1;
             uint8_t reass[4096];
             uint32_t reass_len = 0;
-            int rr = frag_try_reassemble(&wan_frag_l3, pkt, (uint32_t)nd, opid, ofidx,
+            if (slot < 0)
+                return -1;
+            int rr = frag_try_reassemble(&profile_frag_l3[slot], pkt, (uint32_t)nd, opid, ofidx,
                                          reass, &reass_len);
             if (rr == 0)
                 return 1;
@@ -652,6 +850,8 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
             int nonce_size = 0;
             if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, pkt_len, &policy_id, &nonce_size) != 0)
                 return -1;
+            int profile_id = profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L4, policy_id);
+            int slot = (profile_id > 0) ? profile_slot_for_id(profile_id) : -1;
             struct packet_crypto_ctx *ctx = ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L4, policy_id);
             if (!ctx)
                 return -1;
@@ -662,7 +862,9 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
                 return -1;
             uint8_t reass[4096];
             uint32_t reass_len = 0;
-            int rr = frag_try_reassemble_l4(&wan_frag_l4, pkt, (uint32_t)nd, opid, ofidx,
+            if (slot < 0)
+                return -1;
+            int rr = frag_try_reassemble_l4(&profile_frag_l4[slot], pkt, (uint32_t)nd, opid, ofidx,
                                             reass, &reass_len);
             if (rr == 0)
                 return 1;
@@ -803,6 +1005,8 @@ static void *middle_core_thread(void *arg)
         int did_work = 0;
 
         pthread_mutex_lock(&runtime_lock);
+        maybe_expire_prev_grace();
+        cleanup_stale_profile_slots(fwd->cfg);
         if (ne_ring_try_pop(&fwd->wan_to_mid, &job) == 0) {
             process_wan_packet(fwd, job);
             did_work = 1;
@@ -812,9 +1016,13 @@ static void *middle_core_thread(void *arg)
             did_work = 1;
         }
         if (++gc_tick >= 8192) {
-            frag_table_gc(&wan_frag_l2);
-            frag_table_gc(&wan_frag_l3);
-            frag_table_gc(&wan_frag_l4);
+            for (int s = 0; s < MAX_PROFILES; s++) {
+                if (!profile_flow_table_ready[s])
+                    continue;
+                frag_table_gc(&profile_frag_l2[s]);
+                frag_table_gc(&profile_frag_l3[s]);
+                frag_table_gc(&profile_frag_l4[s]);
+            }
             gc_tick = 0;
         }
         pthread_mutex_unlock(&runtime_lock);
@@ -854,10 +1062,16 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     if (rebuild_crypto_runtime(cfg) != 0)
         return -1;
-    frag_table_init(&wan_frag_l2);
-    frag_table_init(&wan_frag_l3);
-    frag_table_init(&wan_frag_l4);
-
+    memset(profile_flow_table_ready, 0, sizeof(profile_flow_table_ready));
+    memset(profile_flow_profile_id, 0, sizeof(profile_flow_profile_id));
+    if (ensure_profile_runtime_slots(cfg) != 0)
+        return -1;
+    prev_active_policy_count = 0;
+    prev_grace_active = 0;
+    prev_grace_until_ms = 0;
+    memset(prev_policy_crypto_ready, 0, sizeof(prev_policy_crypto_ready));
+    memset(prev_policy_index_by_action_id, -1, sizeof(prev_policy_index_by_action_id));
+    memset(prev_active_policies, 0, sizeof(prev_active_policies));
     if (ne_pair_open(&fwd->pair, cfg) != 0)
         return -1;
 
@@ -878,8 +1092,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
             return -1;
         }
     }
-
-    init_wan_flow_table(fwd);
 
     (void)bridge_mac_install(fwd);
 
@@ -906,10 +1118,15 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
     (void)bridge_mac_install(fwd);
-    if (fwd->wan_flow_table_ready)
-        flow_table_cleanup(&fwd->wan_flow_table);
-    init_wan_flow_table(fwd);
+    if (ensure_profile_runtime_slots(cfg) != 0) {
+        pthread_mutex_unlock(&runtime_lock);
+        return -1;
+    }
+    snapshot_active_to_prev();
     int rc = rebuild_crypto_runtime(cfg);
+    if (rc != 0)
+        prev_grace_active = 0;
+    cleanup_stale_profile_slots(cfg);
     pthread_mutex_unlock(&runtime_lock);
     return rc;
 }
@@ -924,9 +1141,12 @@ void forwarder_cleanup(struct forwarder *fwd)
         ne_ring_destroy(&fwd->mid_to_wan[i]);
     for (int i = 0; i < MAX_INTERFACES; i++)
         ne_ring_destroy(&fwd->mid_to_local[i]);
-    if (fwd->wan_flow_table_ready) {
-        flow_table_cleanup(&fwd->wan_flow_table);
-        fwd->wan_flow_table_ready = 0;
+    for (int i = 0; i < MAX_PROFILES; i++) {
+        if (profile_flow_table_ready[i]) {
+            flow_table_cleanup(&profile_flow_tables[i]);
+            profile_flow_table_ready[i] = 0;
+            profile_flow_profile_id[i] = 0;
+        }
     }
     ne_pair_close(&fwd->pair);
 }

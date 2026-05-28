@@ -9,37 +9,6 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-static const byte g_pqc_test_key[32] = {
-    0x2c, 0x8b, 0x3c, 0x70, 0x33, 0x4f, 0x99, 0x07,
-    0x7b, 0x40, 0x8c, 0xe2, 0x99, 0x6c, 0x7b, 0xb4,
-    0x9c, 0x02, 0xf6, 0xa6, 0x1c, 0x97, 0x63, 0xeb,
-    0x06, 0x89, 0xd5, 0x32, 0xbf, 0xa3, 0xae, 0x9c
-};
-
-static const byte g_pqc_test_aad[12] = {
-    0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f, 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xd1
-};
-
-static int key_has_nonzero(const uint8_t *key, size_t len) {
-    if (!key)
-        return 0;
-    for (size_t i = 0; i < len; i++) {
-        if (key[i] != 0)
-            return 1;
-    }
-    return 0;
-}
-
-static const byte *pqc_key_from_ctx_or_test(struct packet_crypto_ctx *ctx) {
-    const byte *key = (const byte *)packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
-    if (key_has_nonzero((const uint8_t *)key, 32))
-        return key;
-
-    if (packet_crypto_init(ctx, g_pqc_test_key) != 0)
-        return NULL;
-    return (const byte *)packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
-}
-
 static inline int l2_enc_start_offset(int nonce_size) {
     return ETH_HEADER_SIZE + nonce_size;
 }
@@ -113,9 +82,9 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memmove(packet + l2_enc_start, packet + ETH_HEADER_SIZE, payload_len);
 
         byte nonce[12] = {0};
-        const byte *key = pqc_key_from_ctx_or_test(ctx);
-        const byte *aad = g_pqc_test_aad;
-        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
         if (!key)
             return -1;
         int rc = trf_pqc_generate_nonce(nonce);
@@ -192,9 +161,9 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         byte nonce[12];
         uint8_t policy_id;
         uint8_t proto_flag;
-        const byte *key = pqc_key_from_ctx_or_test(ctx);
-        const byte *aad = g_pqc_test_aad;
-        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
         if (!key)
             return -1;
         crypto_read_counter(packet, pqc_nonce_size, nonce, &policy_id, &proto_flag);
@@ -304,9 +273,9 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
             return -1;
 
         byte nonce[12] = {0};
-        const byte *key = pqc_key_from_ctx_or_test(ctx);
-        const byte *aad = g_pqc_test_aad;
-        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
         if (!key)
             return -1;
         int rc = trf_pqc_generate_nonce(nonce);
@@ -394,9 +363,9 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
         byte nonce[12];
         uint8_t policy_id;
         uint8_t proto_flag;
-        const byte *key = pqc_key_from_ctx_or_test(ctx);
-        const byte *aad = g_pqc_test_aad;
-        const int aad_len = (int)sizeof(g_pqc_test_aad);
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
         if (!key)
             return -1;
         crypto_read_counter(packet, nonce_size, nonce, &policy_id, &proto_flag);

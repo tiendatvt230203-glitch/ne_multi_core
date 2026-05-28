@@ -57,7 +57,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
             "  %s                    daemon, wait NOTIFY xdp_start\n"
-            "  %s -id <profile_id>   notify daemon (load / unload / no-op)\n",
+            "  %s -id <profile_id>   notify daemon (load / unload / reload)\n",
             prog, prog);
 }
 
@@ -78,7 +78,7 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
 
-        if (strcmp(arg, "-id") == 0 || strcmp(arg, "--id") == 0) {
+        if (strcmp(arg, "-id") == 0) {
             if (*out_id >= 0) {
                 fprintf(stderr, "[FATAL] -id specified more than once\n");
                 return -1;
@@ -94,12 +94,12 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
             continue;
         }
 
-        if (strncmp(arg, "-id=", 4) == 0 || strncmp(arg, "--id=", 5) == 0) {
+        if (strncmp(arg, "-id=", 4) == 0) {
             if (*out_id >= 0) {
                 fprintf(stderr, "[FATAL] -id specified more than once\n");
                 return -1;
             }
-            const char *id_str = (arg[1] == '-') ? strchr(arg, '=') + 1 : arg + 4;
+            const char *id_str = arg + 4;
             if (parse_profile_id_token(id_str, out_id) != 0) {
                 fprintf(stderr, "[FATAL] invalid ne_profiles.id: %s\n", id_str);
                 return -1;
@@ -294,11 +294,10 @@ static int load_profile_and_run(struct runtime_state *rt,
     int added = active_ids_add(active_ids, active_id_count, profile_id);
     if (added < 0)
         return -1;
-    if (added == 0)
-        return 1;
-
+    /* Even if profile is already active, force rebuild to apply DB updates. */
     if (apply_active_configs(rt, active_ids, *active_id_count, profile_id, 0) != 0) {
-        active_ids_remove(active_ids, active_id_count, profile_id);
+        if (added == 1)
+            active_ids_remove(active_ids, active_id_count, profile_id);
         return -1;
     }
     return 0;
@@ -310,8 +309,6 @@ static int handle_profile_notify(struct runtime_state *rt,
                                  int profile_id) {
     if (ne_profile_id_exists(profile_id) == 0) {
         int lr = load_profile_and_run(rt, active_ids, active_id_count, profile_id);
-        if (lr == 1)
-            return 0;
         if (lr != 0) {
             fprintf(stderr, "[ERR] profile %d: load failed\n", profile_id);
             return -1;

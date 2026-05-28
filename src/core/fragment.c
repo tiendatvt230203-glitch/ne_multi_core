@@ -419,10 +419,7 @@ int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
     if (app_len == 0) return -1;
 
     uint32_t frag_overhead = 14u + (uint32_t)ip_hdr_len +
-                             (uint32_t)crypto_layer4_wire_port_len() +
-                             (uint32_t)packet_crypto_get_tunnel_hdr_size() +
-                             FRAG_L4_HDR_SIZE +
-                             (packet_crypto_get_mode() == CRYPTO_MODE_GCM ? 16u : 0u);
+                             (uint32_t)crypto_layer4_frag_meta_len();
     if (frag_overhead >= FRAG_MTU)
         return -1;
     uint32_t max_plain0 = FRAG_MTU - frag_overhead;

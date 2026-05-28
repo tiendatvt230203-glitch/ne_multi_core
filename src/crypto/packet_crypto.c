@@ -35,6 +35,27 @@ static __thread uint8_t tls_dec_cached_key[AES_MAX_KEY_SIZE];
 static __thread int tls_dec_key_cached = 0;
 static __thread int tls_dec_cached_nonce_len = 0;
 
+static const uint8_t g_pqc_test_key[32] = {
+    0x2c, 0x8b, 0x3c, 0x70, 0x33, 0x4f, 0x99, 0x07,
+    0x7b, 0x40, 0x8c, 0xe2, 0x99, 0x6c, 0x7b, 0xb4,
+    0x9c, 0x02, 0xf6, 0xa6, 0x1c, 0x97, 0x63, 0xeb,
+    0x06, 0x89, 0xd5, 0x32, 0xbf, 0xa3, 0xae, 0x9c
+};
+
+static const uint8_t g_pqc_test_aad[12] = {
+    0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f, 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xd1
+};
+
+static int key_has_nonzero(const uint8_t *key, size_t len) {
+    if (!key)
+        return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (key[i] != 0)
+            return 1;
+    }
+    return 0;
+}
+
 static EVP_CIPHER_CTX *get_ctx(void) {
     if (!tls_ctx) {
         tls_ctx = EVP_CIPHER_CTX_new();
@@ -140,6 +161,28 @@ void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot) {
     if (!ctx || slot < 0 || slot >= KEY_SLOT_COUNT) return NULL;
     return ctx->keys[slot];
+}
+
+const uint8_t *packet_crypto_get_pqc_test_key(void) {
+    return g_pqc_test_key;
+}
+
+const uint8_t *packet_crypto_get_pqc_test_aad(void) {
+    return g_pqc_test_aad;
+}
+
+int packet_crypto_get_pqc_test_aad_len(void) {
+    return (int)sizeof(g_pqc_test_aad);
+}
+
+const uint8_t *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx) {
+    const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+    if (key_has_nonzero(key, 32))
+        return key;
+
+    if (packet_crypto_init(ctx, g_pqc_test_key) != 0)
+        return NULL;
+    return packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
 }
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,

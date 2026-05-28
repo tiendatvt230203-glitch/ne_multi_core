@@ -319,9 +319,17 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
         const char *ifname = PQgetvalue(res, r, ifn_col);
         int wi = find_wan_index_by_ifname(cfg, ifname);
         if (wi >= 0) {
+            int weight = 1;
+            if (wcol >= 0 && !PQgetisnull(res, r, wcol)) {
+                const char *wstr = PQgetvalue(res, r, wcol);
+                if (wstr && wstr[0]) {
+                    int parsed = atoi(wstr);
+                    if (parsed > 0)
+                        weight = parsed;
+                }
+            }
             p->wan_indices[p->wan_count] = wi;
-            p->wan_bandwidth_weight[p->wan_count] =
-                (wcol >= 0) ? atoi(PQgetvalue(res, r, wcol)) : 0;
+            p->wan_bandwidth_weight[p->wan_count] = weight;
             p->wan_count++;
         } else {
             fprintf(stderr,

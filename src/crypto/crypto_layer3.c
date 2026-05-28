@@ -1,6 +1,7 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/core/config.h"
 #include <string.h>
+#include "../../inc/crypto/traffic_crypto.h"
 
 #define MIN_ETH_PKT        (ETH_HEADER_SIZE + 8)
 #define IPV4_HDR_SIZE      20
@@ -70,7 +71,8 @@ static int verify_decrypted_payload(const uint8_t *payload, size_t len, uint8_t 
 
 int crypto_layer3_frag_meta_len(void) {
     int meta = packet_crypto_get_tunnel_hdr_size() + CRYPTO_L3_FRAG_TAG_SIZE;
-    if (packet_crypto_get_mode() == CRYPTO_MODE_GCM)
+    if (packet_crypto_get_mode() == CRYPTO_MODE_GCM ||
+        packet_crypto_get_mode() == CRYPTO_MODE_PQC)
         meta += AES128_GCM_TAG_SIZE;
     return meta;
 }
@@ -90,6 +92,37 @@ int crypto_layer3_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (pkt_len >= (size_t)(tunnel_off + nonce_size + 2) &&
         l3_is_frag_tunnel(packet + tunnel_off, nonce_size))
         return (int)pkt_len;
+
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        const int pqc_nonce_size = 12;
+        const int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
+        uint8_t orig_proto = packet[IPV4_PROTO_OFF];
+        size_t payload_len = pkt_len - (size_t)tunnel_off;
+        byte nonce[12] = {0};
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
+        if (!key)
+            return -1;
+        if (trf_pqc_generate_nonce(nonce) != TRF_PQC_OK)
+            return -1;
+
+        memmove(packet + tunnel_off + tunnel_hdr_size, packet + tunnel_off, payload_len);
+        int new_len = 0;
+        if (trf_encrypt_payload_gcm(key, nonce, pqc_nonce_size, aad, aad_len,
+                                    packet + tunnel_off + tunnel_hdr_size, (int)payload_len,
+                                    &new_len) != TRF_PQC_OK)
+            return -1;
+
+        crypto_write_l3_tunnel_header(packet + tunnel_off, nonce, pqc_nonce_size,
+                                      packet_crypto_get_policy_id(), orig_proto);
+        packet[IPV4_PROTO_OFF] = packet_crypto_get_fake_protocol();
+
+        int total_overhead = tunnel_hdr_size + AES128_GCM_TAG_SIZE;
+        uint16_t old_totlen = ((uint16_t)packet[IPV4_TOTLEN_OFF] << 8) | packet[IPV4_TOTLEN_OFF + 1];
+        l3_patch_ipv4(packet + ETH_HEADER_SIZE, ip_hdr_len, old_totlen + (uint16_t)total_overhead);
+        return (int)(pkt_len + (size_t)total_overhead);
+    }
 
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
@@ -152,6 +185,66 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     uint8_t fake_proto = packet_crypto_get_fake_protocol();
     if (packet[IPV4_PROTO_OFF] != fake_proto)
         return (int)pkt_len;
+
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        const int pqc_nonce_size = 12;
+        uint8_t rd_proto_flag, orig_proto;
+        byte nonce[12];
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
+        if (!key)
+            return -1;
+        crypto_read_l3_tunnel_header(packet + tunnel_off, pqc_nonce_size,
+                                     nonce, &rd_proto_flag, NULL, &orig_proto);
+        (void)rd_proto_flag;
+
+        packet[IPV4_PROTO_OFF] = orig_proto;
+
+        int enc_off = tunnel_off + tunnel_hdr_size;
+        size_t total_after_tunnel = pkt_len - (size_t)enc_off;
+        int dec_len = 0;
+        if (trf_decrypt_payload_gcm(key, nonce, pqc_nonce_size, aad, aad_len,
+                                    packet + enc_off, (int)total_after_tunnel, &dec_len) != TRF_PQC_OK)
+            return -1;
+
+        memmove(packet + tunnel_off, packet + enc_off, (size_t)dec_len);
+
+        uint16_t old_totlen = ((uint16_t)packet[IPV4_TOTLEN_OFF] << 8) | packet[IPV4_TOTLEN_OFF + 1];
+        l3_patch_ipv4(packet + ETH_HEADER_SIZE, ip_hdr_len,
+                      old_totlen - (uint16_t)(tunnel_hdr_size + AES128_GCM_TAG_SIZE));
+
+        size_t dec_pkt_len = pkt_len - (size_t)(tunnel_hdr_size + AES128_GCM_TAG_SIZE);
+        size_t transport_off = (size_t)ETH_HEADER_SIZE + (size_t)ip_hdr_len;
+        if (dec_pkt_len > transport_off) {
+            if (orig_proto == 6) {
+                size_t tcp_seg_len = dec_pkt_len - transport_off;
+                if (tcp_seg_len >= 20) {
+                    uint8_t *tcp_seg = packet + transport_off;
+                    tcp_seg[TCP_CKSUM_OFF] = 0;
+                    tcp_seg[TCP_CKSUM_OFF + 1] = 0;
+                    uint16_t tcp_cksum = crypto_calc_tcp_checksum(packet + ETH_HEADER_SIZE,
+                                                                  ip_hdr_len, tcp_seg,
+                                                                  (int)tcp_seg_len);
+                    tcp_seg[TCP_CKSUM_OFF] = (uint8_t)(tcp_cksum >> 8);
+                    tcp_seg[TCP_CKSUM_OFF + 1] = (uint8_t)(tcp_cksum & 0xFF);
+                }
+            } else if (orig_proto == 17) {
+                size_t udp_seg_len = dec_pkt_len - transport_off;
+                if (udp_seg_len >= 8) {
+                    uint8_t *udp_seg = packet + transport_off;
+                    udp_seg[UDP_CKSUM_OFF] = 0;
+                    udp_seg[UDP_CKSUM_OFF + 1] = 0;
+                    uint16_t udp_cksum = crypto_calc_udp_checksum(packet + ETH_HEADER_SIZE,
+                                                                  ip_hdr_len, udp_seg,
+                                                                  (int)udp_seg_len);
+                    udp_seg[UDP_CKSUM_OFF] = (uint8_t)(udp_cksum >> 8);
+                    udp_seg[UDP_CKSUM_OFF + 1] = (uint8_t)(udp_cksum & 0xFF);
+                }
+            }
+        }
+        return (int)(pkt_len - (size_t)(tunnel_hdr_size + AES128_GCM_TAG_SIZE));
+    }
 
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     uint8_t rd_proto_flag, orig_proto;
@@ -257,6 +350,43 @@ int crypto_layer3_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     if (enc_plain_len == 0 || ip_hdr_len < 20)
         return -1;
 
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        int nonce_size = 12;
+        int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
+        int tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
+        int enc_off = tunnel_off + tunnel_hdr_size + CRYPTO_L3_FRAG_TAG_SIZE;
+        size_t need = (size_t)enc_off + enc_plain_len + AES128_GCM_TAG_SIZE;
+        if (need > out_max)
+            return -1;
+
+        memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
+        memcpy(out_buf + ETH_HEADER_SIZE, ip_hdr, (size_t)ip_hdr_len);
+
+        byte nonce[12] = {0};
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
+        if (!key)
+            return -1;
+        if (trf_pqc_generate_nonce(nonce) != TRF_PQC_OK)
+            return -1;
+
+        memmove(out_buf + enc_off, enc_plain, enc_plain_len);
+        out_buf[IPV4_PROTO_OFF] = packet_crypto_get_fake_protocol();
+        l3_write_tunnel_header_frag(out_buf + tunnel_off, nonce, nonce_size);
+        l3_write_frag_tag(out_buf + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
+
+        int new_len = 0;
+        if (trf_encrypt_payload_gcm(key, nonce, nonce_size, aad, aad_len,
+                                    out_buf + enc_off, (int)enc_plain_len, &new_len) != TRF_PQC_OK)
+            return -1;
+
+        size_t ip_payload_len = (size_t)(tunnel_hdr_size + CRYPTO_L3_FRAG_TAG_SIZE + new_len);
+        l3_patch_ipv4(out_buf + ETH_HEADER_SIZE, ip_hdr_len, (uint16_t)(ip_hdr_len + ip_payload_len));
+        *out_len = (uint32_t)(enc_off + new_len);
+        return 0;
+    }
+
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
@@ -334,6 +464,26 @@ int crypto_layer3_decrypt_fragment(struct packet_crypto_ctx *ctx,
         return -1;
 
     l3_read_frag_tag(packet + tunnel_off + tunnel_hdr_size, out_pkt_id, out_frag_index);
+
+    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
+        int nonce_size = 12;
+        int enc_off = tunnel_off + tunnel_hdr_size + CRYPTO_L3_FRAG_TAG_SIZE;
+        byte nonce[12];
+        memcpy(nonce, packet + tunnel_off, nonce_size);
+        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
+        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
+        const int aad_len = packet_crypto_get_pqc_test_aad_len();
+        if (!key)
+            return -1;
+
+        int dec_len = 0;
+        if (trf_decrypt_payload_gcm(key, nonce, nonce_size, aad, aad_len,
+                                    packet + enc_off, (int)(pkt_len - (size_t)enc_off),
+                                    &dec_len) != TRF_PQC_OK)
+            return -1;
+        memmove(packet + tunnel_off, packet + enc_off, (size_t)dec_len);
+        return (int)(tunnel_off + dec_len);
+    }
 
     uint8_t nonce[16];
     memcpy(nonce, packet + tunnel_off, nonce_size);
