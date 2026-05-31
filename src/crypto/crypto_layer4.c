@@ -1,7 +1,7 @@
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/core/config.h"
 #include "../../inc/core/fragment.h"
-#include "../../inc/crypto/traffic_crypto.h"
+#include "../../inc/crypto/crypto_pqc_layer.h"
 #include <string.h>
 
 #define L4_WIRE_PORT_LEN   4
@@ -21,7 +21,7 @@ static void l4_write_tunnel_header_frag(uint8_t *buf, const uint8_t *nonce, int 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size) {
     if (buf[nonce_size + 1] != CRYPTO_L4_TUNNEL_MAGIC)
         return 0;
-    if (packet_crypto_get_mode() != CRYPTO_MODE_PQC && (buf[0] & 0x80) != 0)
+    if (!crypto_mode_is_pqc() && (buf[0] & 0x80) != 0)
         return 0;
     return 1;
 }
@@ -55,9 +55,8 @@ int crypto_layer4_wire_port_len(void) {
 
 int crypto_layer4_frag_meta_len(void) {
     int meta = L4_WIRE_PORT_LEN + packet_crypto_get_tunnel_hdr_size() + FRAG_L4_HDR_SIZE;
-    if (packet_crypto_get_mode() == CRYPTO_MODE_GCM ||
-        packet_crypto_get_mode() == CRYPTO_MODE_PQC)
-        meta += AES128_GCM_TAG_SIZE;
+    if (crypto_mode_uses_gcm_tag())
+        meta += AES_GCM_TAG_SIZE;
     return meta;
 }
 
@@ -139,29 +138,27 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (plain_len == 0)
         return (int)pkt_len;
 
-    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
-        const int pqc_nonce_size = 12;
+    if (crypto_mode_is_pqc()) {
+        const int pqc_nonce_size = CRYPTO_PQC_NONCE_BYTES;
         int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
-        byte nonce[12] = {0};
-        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
-        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
-        const int aad_len = packet_crypto_get_pqc_test_aad_len();
-        if (!key)
-            return -1;
-        if (trf_pqc_generate_nonce(nonce) != TRF_PQC_OK)
-            return -1;
-
+        crypto_pqc_sess_t pqc;
+        byte nonce[CRYPTO_PQC_NONCE_BYTES];
+        int new_len = 0;
         int tunnel_off = plain_off;
         int enc_off = tunnel_off + tunnel_hdr_size;
+
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+            return -1;
+        if (crypto_pqc_generate_nonce(nonce) != 0)
+            return -1;
+
         memmove(packet + enc_off, packet + plain_off, plain_len);
-        int new_len = 0;
-        if (trf_encrypt_payload_gcm(key, nonce, pqc_nonce_size, aad, aad_len,
-                                    packet + enc_off, (int)plain_len, &new_len) != TRF_PQC_OK)
+        if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_off, (int)plain_len, &new_len) != 0)
             return -1;
 
         l4_write_tunnel_header(packet + tunnel_off, nonce, pqc_nonce_size);
 
-        int total_overhead = tunnel_hdr_size + AES128_GCM_TAG_SIZE;
+        int total_overhead = tunnel_hdr_size + AES_GCM_TAG_SIZE;
         size_t ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + (size_t)new_len;
         l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len, ip_payload_len);
         return (int)(pkt_len + (size_t)total_overhead);
@@ -181,12 +178,12 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     int enc_off = tunnel_off + tunnel_hdr_size;
 
     if (is_gcm) {
-        uint8_t tag[AES128_GCM_TAG_SIZE];
+        uint8_t tag[AES_GCM_TAG_SIZE];
         if (crypto_aes_gcm_encrypt(key, nonce, nonce_len, packet + plain_off, (int)plain_len,
                                    tag) != 0)
             return -1;
         memmove(packet + enc_off, packet + plain_off, plain_len);
-        memcpy(packet + enc_off + plain_len, tag, AES128_GCM_TAG_SIZE);
+        memcpy(packet + enc_off + plain_len, tag, AES_GCM_TAG_SIZE);
     } else {
         uint8_t iv[AES128_IV_SIZE];
         crypto_nonce_to_iv(nonce, nonce_size, iv);
@@ -197,7 +194,7 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
     l4_write_tunnel_header(packet + tunnel_off, nonce, nonce_size);
 
-    int total_overhead = tunnel_hdr_size + (is_gcm ? AES128_GCM_TAG_SIZE : 0);
+    int total_overhead = tunnel_hdr_size + (is_gcm ? AES_GCM_TAG_SIZE : 0);
     size_t ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + plain_len;
     l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len, ip_payload_len);
 
@@ -232,21 +229,18 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         !l4_is_tunnel_header(packet + tunnel_off, nonce_size))
         return (int)pkt_len;
 
-    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
-        const int pqc_nonce_size = 12;
-        byte nonce[12];
-        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
-        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
-        const int aad_len = packet_crypto_get_pqc_test_aad_len();
-        if (!key)
-            return -1;
-        memcpy(nonce, packet + tunnel_off, pqc_nonce_size);
-
-        int enc_off = tunnel_off + tunnel_hdr_size;
+    if (crypto_mode_is_pqc()) {
+        const int pqc_nonce_size = CRYPTO_PQC_NONCE_BYTES;
+        crypto_pqc_sess_t pqc;
+        byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int dec_len = 0;
-        if (trf_decrypt_payload_gcm(key, nonce, pqc_nonce_size, aad, aad_len,
-                                    packet + enc_off, (int)(pkt_len - (size_t)enc_off),
-                                    &dec_len) != TRF_PQC_OK)
+        int enc_off = tunnel_off + tunnel_hdr_size;
+
+        memcpy(nonce, packet + tunnel_off, pqc_nonce_size);
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+            return -1;
+        if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
+                                       (int)(pkt_len - (size_t)enc_off), &dec_len) != 0)
             return -1;
 
         memmove(packet + transport_off + L4_WIRE_PORT_LEN, packet + enc_off, (size_t)dec_len);
@@ -262,14 +256,14 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
     int enc_off = tunnel_off + tunnel_hdr_size;
     size_t enc_len;
-    uint8_t tag[AES128_GCM_TAG_SIZE];
+    uint8_t tag[AES_GCM_TAG_SIZE];
     size_t total_after_tunnel = pkt_len - (size_t)enc_off;
 
     if (is_gcm) {
-        if (total_after_tunnel < AES128_GCM_TAG_SIZE)
+        if (total_after_tunnel < AES_GCM_TAG_SIZE)
             return -1;
-        enc_len = total_after_tunnel - AES128_GCM_TAG_SIZE;
-        memcpy(tag, packet + enc_off + enc_len, AES128_GCM_TAG_SIZE);
+        enc_len = total_after_tunnel - AES_GCM_TAG_SIZE;
+        memcpy(tag, packet + enc_off + enc_len, AES_GCM_TAG_SIZE);
     } else {
         enc_len = total_after_tunnel;
     }
@@ -330,11 +324,15 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     if (enc_plain_len == 0)
         return -1;
 
-    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
-        int nonce_size = 12;
+    if (crypto_mode_is_pqc()) {
+        int nonce_size = CRYPTO_PQC_NONCE_BYTES;
         int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
-        int total_overhead = tunnel_hdr_size + FRAG_L4_HDR_SIZE + AES128_GCM_TAG_SIZE;
+        int total_overhead = tunnel_hdr_size + FRAG_L4_HDR_SIZE + AES_GCM_TAG_SIZE;
+        crypto_pqc_sess_t pqc;
+        byte nonce[CRYPTO_PQC_NONCE_BYTES];
+        int new_len = 0;
         size_t need = (size_t)(14 + ip_hdr_len + L4_WIRE_PORT_LEN + total_overhead + enc_plain_len);
+
         if (need > out_max)
             return -1;
 
@@ -346,13 +344,9 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         memcpy(out_buf + offset, wire_ports, L4_WIRE_PORT_LEN);
         offset += L4_WIRE_PORT_LEN;
 
-        byte nonce[12] = {0};
-        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
-        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
-        const int aad_len = packet_crypto_get_pqc_test_aad_len();
-        if (!key)
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
-        if (trf_pqc_generate_nonce(nonce) != TRF_PQC_OK)
+        if (crypto_pqc_generate_nonce(nonce) != 0)
             return -1;
 
         int tunnel_off = offset;
@@ -362,9 +356,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         l4_write_tunnel_header_frag(out_buf + tunnel_off, nonce, nonce_size);
         l4_write_frag_tag(out_buf + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
 
-        int new_len = 0;
-        if (trf_encrypt_payload_gcm(key, nonce, nonce_size, aad, aad_len,
-                                    out_buf + enc_off, (int)enc_plain_len, &new_len) != TRF_PQC_OK)
+        if (crypto_pqc_encrypt_payload(&pqc, nonce, out_buf + enc_off, (int)enc_plain_len, &new_len) != 0)
             return -1;
 
         size_t ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + (size_t)new_len;
@@ -376,7 +368,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
-    int total_overhead = tunnel_hdr_size + FRAG_L4_HDR_SIZE + (is_gcm ? AES128_GCM_TAG_SIZE : 0);
+    int total_overhead = tunnel_hdr_size + FRAG_L4_HDR_SIZE + (is_gcm ? AES_GCM_TAG_SIZE : 0);
     size_t need = (size_t)(14 + ip_hdr_len + L4_WIRE_PORT_LEN + total_overhead + enc_plain_len);
     if (need > out_max)
         return -1;
@@ -407,11 +399,11 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     l4_write_frag_tag(out_buf + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
 
     if (is_gcm) {
-        uint8_t tag[AES128_GCM_TAG_SIZE];
+        uint8_t tag[AES_GCM_TAG_SIZE];
         if (crypto_aes_gcm_encrypt(key, nonce, nonce_len, out_buf + enc_off, (int)enc_plain_len,
                                    tag) != 0)
             return -1;
-        memcpy(out_buf + enc_off + enc_plain_len, tag, AES128_GCM_TAG_SIZE);
+        memcpy(out_buf + enc_off + enc_plain_len, tag, AES_GCM_TAG_SIZE);
     } else {
         uint8_t iv[AES128_IV_SIZE];
         crypto_nonce_to_iv(nonce, nonce_size, iv);
@@ -422,7 +414,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     size_t ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + enc_plain_len;
     l4_fix_ipv4_totlen_and_cksum(out_buf, 14, ip_hdr_len, ip_payload_len);
 
-    *out_len = (uint32_t)(enc_off + enc_plain_len + (is_gcm ? AES128_GCM_TAG_SIZE : 0));
+    *out_len = (uint32_t)(enc_off + enc_plain_len + (is_gcm ? AES_GCM_TAG_SIZE : 0));
     return 0;
 }
 
@@ -459,21 +451,18 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
     l4_read_frag_tag(packet + tunnel_off + tunnel_hdr_size, out_pkt_id, out_frag_index);
 
-    if (packet_crypto_get_mode() == CRYPTO_MODE_PQC) {
-        int nonce_size = 12;
+    if (crypto_mode_is_pqc()) {
+        int pqc_nonce_size = CRYPTO_PQC_NONCE_BYTES;
         int enc_off = tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE;
-        byte nonce[12];
-        memcpy(nonce, packet + tunnel_off, nonce_size);
-        const byte *key = (const byte *)packet_crypto_get_pqc_key_for_ctx(ctx);
-        const byte *aad = (const byte *)packet_crypto_get_pqc_test_aad();
-        const int aad_len = packet_crypto_get_pqc_test_aad_len();
-        if (!key)
-            return -1;
-
+        crypto_pqc_sess_t pqc;
+        byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int dec_len = 0;
-        if (trf_decrypt_payload_gcm(key, nonce, nonce_size, aad, aad_len,
-                                    packet + enc_off, (int)(pkt_len - (size_t)enc_off),
-                                    &dec_len) != TRF_PQC_OK)
+
+        memcpy(nonce, packet + tunnel_off, pqc_nonce_size);
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+            return -1;
+        if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
+                                       (int)(pkt_len - (size_t)enc_off), &dec_len) != 0)
             return -1;
         memmove(packet + transport_off + L4_WIRE_PORT_LEN, packet + enc_off, (size_t)dec_len);
         return (int)(transport_off + L4_WIRE_PORT_LEN + dec_len);
@@ -487,13 +476,13 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
     int enc_off = tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE;
     size_t total_after = pkt_len - (size_t)enc_off;
     size_t enc_len;
-    uint8_t tag[AES128_GCM_TAG_SIZE];
+    uint8_t tag[AES_GCM_TAG_SIZE];
 
     if (is_gcm) {
-        if (total_after < AES128_GCM_TAG_SIZE)
+        if (total_after < AES_GCM_TAG_SIZE)
             return -1;
-        enc_len = total_after - AES128_GCM_TAG_SIZE;
-        memcpy(tag, packet + enc_off + enc_len, AES128_GCM_TAG_SIZE);
+        enc_len = total_after - AES_GCM_TAG_SIZE;
+        memcpy(tag, packet + enc_off + enc_len, AES_GCM_TAG_SIZE);
     } else {
         enc_len = total_after;
     }

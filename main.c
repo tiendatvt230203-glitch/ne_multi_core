@@ -220,6 +220,8 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
     return 0;
 }
 
+static int runtime_stop_forwarder(struct runtime_state *rt);
+
 static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                                 int active_id_count, int trigger_id,
                                 int after_delete) {
@@ -255,7 +257,13 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         rt->active_slot = next_slot;
         return 0;
     }
-    return -1;
+    fprintf(stderr, "[RELOAD] in-place reload failed, restarting dataplane with new topology/config\n");
+    if (runtime_stop_forwarder(rt) != 0)
+        return -1;
+    rt->active_slot = next_slot;
+    if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
+        return -1;
+    return 0;
 }
 
 static void runtime_detach_xdp_from_config(const struct runtime_state *rt) {

@@ -11,7 +11,8 @@
 #define CRYPTO_MODE_CTR  0
 #define CRYPTO_MODE_GCM  1
 #define CRYPTO_MODE_PQC 2
-
+#define CRYPTO_MODE_PQC_GCM 2
+/* PQC GCM wire nonce is always 12 bytes (see CRYPTO_PQC_NONCE_BYTES). */
 
 #define DEFAULT_FRAME_SIZE      4096
 #define DEFAULT_BATCH_SIZE      64
@@ -72,6 +73,7 @@ struct profile_config {
     int wan_count;
     int policy_indices[MAX_CRYPTO_POLICIES];
     int policy_count;
+    char local_identity_fingerprint[16];
 };
 
 struct local_config {

@@ -7,8 +7,9 @@
 
 #define AES_MAX_KEY_SIZE      32
 #define AES128_IV_SIZE        16
-
+#define AES_GCM_TAG_SIZE      16
 #define ETH_HEADER_SIZE       14
+#define CRYPTO_PQC_NONCE_BYTES 12
 
 #define PROTO_FLAG_IPV4  0
 
@@ -16,12 +17,21 @@
 #define KEY_SLOT_CURRENT 1
 #define KEY_SLOT_NEXT    2
 #define KEY_SLOT_COUNT   3
-
 struct packet_crypto_ctx {
     uint8_t master_key[AES_MAX_KEY_SIZE];
     uint8_t keys[KEY_SLOT_COUNT][AES_MAX_KEY_SIZE];
     bool initialized;
+    int crypto_mode;
+    int policy_id;
+    int profile_id;
 };
+typedef unsigned char byte;
+extern const byte g_pqc_test_key[32];
+extern const byte g_pqc_test_aad[12];
+
+const byte *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx);
+const byte *packet_crypto_get_pqc_test_aad(void);
+int packet_crypto_get_pqc_test_aad_len(void);
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,
                        const uint8_t master_key[AES_MAX_KEY_SIZE]);
@@ -32,10 +42,6 @@ uint32_t packet_crypto_next_counter(void);
 void packet_crypto_reset_counter(void);
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot);
-const uint8_t *packet_crypto_get_pqc_test_key(void);
-const uint8_t *packet_crypto_get_pqc_test_aad(void);
-int packet_crypto_get_pqc_test_aad_len(void);
-const uint8_t *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx);
 
 int packet_encrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,
@@ -57,7 +63,6 @@ uint8_t packet_crypto_get_fake_protocol(void);
 void packet_crypto_set_policy_id(uint8_t policy_id);
 uint8_t packet_crypto_get_policy_id(void);
 
-#define AES128_GCM_TAG_SIZE  16
 
 int packet_crypto_get_tunnel_hdr_size(void);
 
@@ -82,12 +87,12 @@ int  packet_crypto_get_aes_bits(void);
 int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
-                           uint8_t tag_out[AES128_GCM_TAG_SIZE]);
+                           uint8_t tag_out[AES_GCM_TAG_SIZE]);
 
 int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
-                           const uint8_t tag[AES128_GCM_TAG_SIZE]);
+                           const uint8_t tag[AES_GCM_TAG_SIZE]);
 
 void crypto_generate_nonce(uint32_t counter, uint8_t proto_flag,
                            uint8_t *out_nonce, int *out_nonce_len);
@@ -100,7 +105,7 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
                             uint8_t *data, int len);
 
 void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
-                          int nonce_size, uint8_t marker_byte, uint8_t policy_id);
+                          int nonce_size, uint8_t policy_id);
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag);
 

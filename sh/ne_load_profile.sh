@@ -68,6 +68,5 @@ ne_psql -t -A -c "SELECT 1 FROM ne_profiles LIMIT 0;" >/dev/null 2>&1 || {
 }
 
 ne_psql_file "${SQL_FILE}"
-ne_psql -c "SELECT pg_notify('xdp_start', '${PROFILE_ID}');"
 
-echo "OK loaded ne_profiles.id=${PROFILE_ID}"
+echo "OK loaded ne_profiles.id=${PROFILE_ID} into Database"

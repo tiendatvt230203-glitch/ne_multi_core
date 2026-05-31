@@ -1,5 +1,6 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 
+#include "../../inc/core/config.h"
 #include "../../inc/crypto/packet_crypto.h"
 
 #include <stddef.h>
@@ -23,7 +24,10 @@ void crypto_apply_from_policy(const struct crypto_policy *cp) {
 
     packet_crypto_set_mode(cp->crypto_mode);
     packet_crypto_set_aes_bits(cp->aes_bits);
-    packet_crypto_set_nonce_size(cp->nonce_size);
+    if (cp->crypto_mode == CRYPTO_MODE_PQC)
+        packet_crypto_set_nonce_size(CRYPTO_PQC_NONCE_BYTES);
+    else
+        packet_crypto_set_nonce_size(cp->nonce_size);
 
 
     if (cp->action == POLICY_ACTION_ENCRYPT_L2)

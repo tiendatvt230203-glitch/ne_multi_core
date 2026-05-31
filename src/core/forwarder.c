@@ -7,6 +7,7 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
+#include "../../inc/crypto/pqc_l2_handshake.h"
 
 #include <net/ethernet.h>
 #include <netinet/ip.h>
@@ -393,10 +394,27 @@ static int same_topology(const struct app_config *a, const struct app_config *b)
         return 0;
     if (a->local_count <= 0 || a->wan_count <= 0)
         return 0;
-    if (strcmp(a->locals[0].ifname, b->locals[0].ifname) != 0)
-        return 0;
+
+    for (int i = 0; i < a->local_count; i++) {
+        int found = 0;
+        for (int j = 0; j < b->local_count; j++) {
+            if (strcmp(a->locals[i].ifname, b->locals[j].ifname) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return 0;
+    }
     for (int i = 0; i < a->wan_count; i++) {
-        if (strcmp(a->wans[i].ifname, b->wans[i].ifname) != 0)
+        int found = 0;
+        for (int j = 0; j < b->wan_count; j++) {
+            if (strcmp(a->wans[i].ifname, b->wans[j].ifname) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
             return 0;
     }
     return 1;
@@ -450,11 +468,12 @@ static int local_rx_is_reflected_client_frame(struct forwarder *fwd, int local_i
 static int has_l2_crypto_marker(const uint8_t *pkt, uint32_t pkt_len)
 {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
-    if (!fake || !pkt || pkt_len < 14)
+    if (!fake || !pkt || pkt_len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN)
         return 0;
-    if (pkt[12] != (uint8_t)(fake >> 8))
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et != fake)
         return 0;
-    return policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][pkt[13]] >= 0;
+    return policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][pkt[CRYPTO_L2_POLICY_OFF]] >= 0;
 }
 
 static int wan_packet_needs_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len)
@@ -701,6 +720,64 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
     return fallback_wan_if_congested(fwd, profile_idx, 0);
 }
 
+static int profile_contains_local(const struct profile_config *p, int local_idx)
+{
+    if (!p || local_idx < 0)
+        return 0;
+    for (int i = 0; i < p->local_count; i++) {
+        if (p->local_indices[i] == local_idx)
+            return 1;
+    }
+    return 0;
+}
+
+static int select_profile_and_policy_for_local(struct forwarder *fwd, int local_idx,
+                                               int flow_ok,
+                                               uint32_t src_ip, uint32_t dst_ip,
+                                               uint16_t src_port, uint16_t dst_port,
+                                               uint8_t proto,
+                                               int *out_profile_idx,
+                                               const struct crypto_policy **out_cp)
+{
+    if (!fwd || !fwd->cfg || !out_profile_idx || !out_cp)
+        return -1;
+
+    const struct crypto_policy *best_cp = NULL;
+    int best_profile = -1;
+    int best_priority = 0x7fffffff;
+    int best_id = 0x7fffffff;
+
+    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+        const struct profile_config *p = &fwd->cfg->profiles[pi];
+        if (!p->enabled)
+            continue;
+        if (!profile_contains_local(p, local_idx))
+            continue;
+
+        const struct crypto_policy *cp = NULL;
+        if (flow_ok)
+            cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto);
+        if (!cp)
+            continue;
+
+        if (!best_cp ||
+            cp->priority < best_priority ||
+            (cp->priority == best_priority && cp->id < best_id)) {
+            best_cp = cp;
+            best_profile = pi;
+            best_priority = cp->priority;
+            best_id = cp->id;
+        }
+    }
+
+    if (!best_cp || best_profile < 0)
+        return -1;
+
+    *out_profile_idx = best_profile;
+    *out_cp = best_cp;
+    return 0;
+}
+
 static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -713,12 +790,11 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
         ne_frame_free(&fwd->pair, job.addr);
         return;
     }
-    int profile_idx = config_select_profile_for_local(fwd->cfg, local_idx);
+    int profile_idx = -1;
     const struct crypto_policy *cp = NULL;
-    if (flow_ok)
-        cp = config_select_crypto_policy(fwd->cfg, profile_idx, src_ip, dst_ip,
-                                         src_port, dst_port, proto);
-    if (!cp)
+    if (select_profile_and_policy_for_local(fwd, local_idx, flow_ok,
+                                            src_ip, dst_ip, src_port, dst_port, proto,
+                                            &profile_idx, &cp) != 0)
         goto drop;
 
     int wan_idx = select_wan_for_local(fwd, profile_idx, flow_ok,
@@ -759,10 +835,13 @@ drop:
 static int decrypt_l2_if_needed(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_len)
 {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
-    if (!fake || *pkt_len < 14 || pkt[12] != (uint8_t)(fake >> 8))
+    if (!fake || *pkt_len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN)
+        return 0;
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et != fake)
         return 0;
 
-    uint8_t policy_id = pkt[13];
+    uint8_t policy_id = pkt[CRYPTO_L2_POLICY_OFF];
     struct packet_crypto_ctx *ctx = ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
     if (!ctx)
         return -1;
@@ -783,7 +862,7 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
     uint16_t pid = 0;
     uint8_t frag_idx = 0;
     if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &pid, &frag_idx)) {
-        uint8_t policy_id = pkt[13];
+        uint8_t policy_id = pkt[CRYPTO_L2_POLICY_OFF];
         int profile_id = profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
         int slot = (profile_id > 0) ? profile_slot_for_id(profile_id) : -1;
         struct packet_crypto_ctx *ctx = ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
@@ -1046,6 +1125,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         fwd->local_count = MAX_INTERFACES;
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
+    
+    pqc_handshake_start_all_profiles(cfg);
 
     for (int i = 0; i < fwd->local_count; i++)
         init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname,

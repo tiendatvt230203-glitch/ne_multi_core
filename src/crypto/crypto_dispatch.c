@@ -64,7 +64,7 @@ int crypto_l3_extract_policy_id(const struct app_config *cfg,
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3 || cp->nonce_size <= 0)
             continue;
-        int ns = cp->nonce_size;
+        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
         if (tunnel_off + ns + 1 >= (int)pkt_len)
             continue;
         if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
@@ -109,7 +109,7 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4 || cp->nonce_size <= 0)
             continue;
-        int ns = cp->nonce_size;
+        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
         if (tunnel_off + ns + 1 >= (int)pkt_len)
             continue;
         uint8_t magic = pkt[tunnel_off + ns + 1];

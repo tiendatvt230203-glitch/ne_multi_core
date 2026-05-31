@@ -318,14 +318,15 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
     for (int r = 0; r < rows && p->wan_count < MAX_PROFILE_INTERFACES; r++) {
         const char *ifname = PQgetvalue(res, r, ifn_col);
         int wi = find_wan_index_by_ifname(cfg, ifname);
+        int weight = 1;
         if (wi >= 0) {
-            int weight = 1;
             if (wcol >= 0 && !PQgetisnull(res, r, wcol)) {
                 const char *wstr = PQgetvalue(res, r, wcol);
                 if (wstr && wstr[0]) {
-                    int parsed = atoi(wstr);
-                    if (parsed > 0)
+                    int parsed = atoi(wstr);  
+                    if (parsed > 0) {
                         weight = parsed;
+                    }
                 }
             }
             p->wan_indices[p->wan_count] = wi;
@@ -338,6 +339,7 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
         }
     }
 }
+
 
 static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int profile_id) {
     char id_str[32];

@@ -8,7 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-
+// 
 static atomic_uint_fast32_t g_pkt_id_counter = 0;
 
 uint16_t frag_next_pkt_id(void) {
@@ -128,7 +128,7 @@ int frag_is_fragment(const struct app_config *cfg,
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3 || cp->nonce_size <= 0)
             continue;
-        int ns = cp->nonce_size;
+        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
         if (tunnel_off + ns + 1 >= (int)pkt_len)
             continue;
         if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L3_FRAG_MAGIC)
@@ -315,19 +315,22 @@ int frag_is_fragment_l2(const struct app_config *cfg,
                         uint16_t *pkt_id, uint8_t *frag_index) {
     if (!cfg)
         return 0;
-    if (pkt_len < (uint32_t)(14 + 4 + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
+    if (pkt_len < (uint32_t)(ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + 4 + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
         return 0;
 
     uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
-    if (!fake_ipv4 || pkt_data[12] != (uint8_t)(fake_ipv4 >> 8))
+    if (!fake_ipv4)
+        return 0;
+    uint16_t et = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
+    if (et != fake_ipv4)
         return 0;
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->nonce_size <= 0)
             continue;
-        int ns = cp->nonce_size;
-        int tag_off = 14 + ns;
+        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
+        int tag_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + ns;
         if (tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE > (int)pkt_len)
             continue;
         if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
@@ -418,8 +421,7 @@ int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
     uint32_t app_len = pkt_len - app_off;
     if (app_len == 0) return -1;
 
-    uint32_t frag_overhead = 14u + (uint32_t)ip_hdr_len +
-                             (uint32_t)crypto_layer4_frag_meta_len();
+    uint32_t frag_overhead = 14u + (uint32_t)ip_hdr_len + (uint32_t)crypto_layer4_frag_meta_len();
     if (frag_overhead >= FRAG_MTU)
         return -1;
     uint32_t max_plain0 = FRAG_MTU - frag_overhead;
@@ -477,7 +479,7 @@ int frag_is_fragment_l4(const struct app_config *cfg,
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4 || cp->nonce_size <= 0)
             continue;
-        int ns = cp->nonce_size;
+        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
         if (tunnel_off + ns + 1 >= (int)pkt_len)
             continue;
         if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L4_FRAG_MAGIC)

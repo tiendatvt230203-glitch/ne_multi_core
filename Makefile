@@ -2,7 +2,7 @@ CC     = gcc
 CLANG  = clang
 
 CFLAGS = -D_GNU_SOURCE -I. -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
-LDFLAGS = -L./lib -Wl,-Bstatic -lxdp -lbpf -Wl,-Bdynamic -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
+LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -Wl,-Bstatic -lxdp -lbpf -Wl,-Bdynamic -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
@@ -22,6 +22,8 @@ APP_SRC = main.c \
           src/crypto/crypto_layer2.c \
           src/crypto/crypto_layer3.c \
           src/crypto/crypto_layer4.c \
+          src/crypto/pqc_handshake.c \
+          src/crypto/pqc_l2_handshake.c \
           src/core/flow_table.c \
           src/core/fragment.c
 APP_OBJ = $(APP_SRC:.c=.o)

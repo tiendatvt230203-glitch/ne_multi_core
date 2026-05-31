@@ -9,7 +9,7 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdatomic.h>
-
+#include "../../inc/crypto/pqc_handshake.h"
 static uint16_t g_fake_ethertype_ipv4 = 0;
 static __thread uint8_t g_fake_protocol = 99;
 static int g_encrypt_layer = 0;
@@ -35,14 +35,14 @@ static __thread uint8_t tls_dec_cached_key[AES_MAX_KEY_SIZE];
 static __thread int tls_dec_key_cached = 0;
 static __thread int tls_dec_cached_nonce_len = 0;
 
-static const uint8_t g_pqc_test_key[32] = {
+const uint8_t g_pqc_test_key[32] = {
     0x2c, 0x8b, 0x3c, 0x70, 0x33, 0x4f, 0x99, 0x07,
     0x7b, 0x40, 0x8c, 0xe2, 0x99, 0x6c, 0x7b, 0xb4,
     0x9c, 0x02, 0xf6, 0xa6, 0x1c, 0x97, 0x63, 0xeb,
     0x06, 0x89, 0xd5, 0x32, 0xbf, 0xa3, 0xae, 0x9c
 };
 
-static const uint8_t g_pqc_test_aad[12] = {
+const uint8_t g_pqc_test_aad[12] = {
     0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f, 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xd1
 };
 
@@ -107,10 +107,20 @@ uint16_t packet_crypto_get_fake_ethertype_ipv4(void) {
 
 void packet_crypto_set_encrypt_layer(int layer) { g_encrypt_layer = layer; }
 
-void packet_crypto_set_mode(int mode) { g_crypto_mode = mode; }
-int  packet_crypto_get_mode(void) { return g_crypto_mode; }
+void packet_crypto_set_mode(int mode) {
+    g_crypto_mode = mode;
+    if (mode == CRYPTO_MODE_PQC)
+        g_nonce_size = CRYPTO_PQC_NONCE_BYTES;
+}
 
-void packet_crypto_set_nonce_size(int size) { g_nonce_size = size; }
+int packet_crypto_get_mode(void) { return g_crypto_mode; }
+
+void packet_crypto_set_nonce_size(int size) {
+    if (g_crypto_mode == CRYPTO_MODE_PQC)
+        g_nonce_size = CRYPTO_PQC_NONCE_BYTES;
+    else
+        g_nonce_size = size > 0 ? size : 12;
+}
 int  packet_crypto_get_nonce_size(void) { return g_nonce_size; }
 
 void packet_crypto_set_aes_bits(int bits) { g_aes_bits = bits; }
@@ -154,17 +164,30 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE],
     memcpy(out_key, hmac_out, key_size);
 }
 
+static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
+    uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
+
+    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC_GCM)
+        return;
+    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
+        return;
+    if (memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) == 0)
+        return;
+
+    memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
+    memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
+    memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
+    fprintf(stderr, "[PQC-DATA] Policy %d key diversified (profile %d)\n",
+            ctx->policy_id, ctx->profile_id);
+}
+
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
-    (void)ctx;
+    check_and_update_pqc_key(ctx);
 }
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot) {
     if (!ctx || slot < 0 || slot >= KEY_SLOT_COUNT) return NULL;
     return ctx->keys[slot];
-}
-
-const uint8_t *packet_crypto_get_pqc_test_key(void) {
-    return g_pqc_test_key;
 }
 
 const uint8_t *packet_crypto_get_pqc_test_aad(void) {
@@ -259,7 +282,7 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
 int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
-                           uint8_t tag_out[AES128_GCM_TAG_SIZE]) {
+                           uint8_t tag_out[AES_GCM_TAG_SIZE]) {
     if (__builtin_expect(len <= 0, 0)) return 0;
 
     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
@@ -299,7 +322,7 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
     if (__builtin_expect(EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
         return -1;
 
-    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES128_GCM_TAG_SIZE, tag_out) != 1, 0))
+    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1, 0))
         return -1;
 
     return 0;
@@ -308,7 +331,7 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
 int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
-                           const uint8_t tag[AES128_GCM_TAG_SIZE]) {
+                           const uint8_t tag[AES_GCM_TAG_SIZE]) {
     if (__builtin_expect(len <= 0, 0)) return 0;
 
     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
@@ -345,7 +368,7 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
     if (__builtin_expect(EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1, 0))
         return -1;
 
-    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES128_GCM_TAG_SIZE,
+    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE,
                                              (void *)tag) != 1, 0))
         return -1;
 
@@ -393,17 +416,19 @@ void crypto_nonce_to_iv(const uint8_t *nonce, int nonce_size,
 }
 
 void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
-                          int nonce_size, uint8_t marker_byte, uint8_t policy_id) {
-    packet[12] = marker_byte;
-    packet[13] = policy_id;
-    memcpy(packet + 14, nonce, nonce_size);
+                          int nonce_size, uint8_t policy_id) {
+    uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
+    packet[12] = (uint8_t)(fake >> 8);
+    packet[13] = (uint8_t)(fake & 0xFF);
+    packet[CRYPTO_L2_POLICY_OFF] = policy_id;
+    memcpy(packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce, nonce_size);
 }
 
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag) {
     if (policy_id)
-        *policy_id = packet[13];
-    memcpy(nonce_out, packet + 14, nonce_size);
+        *policy_id = packet[CRYPTO_L2_POLICY_OFF];
+    memcpy(nonce_out, packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce_size);
     if (proto_flag)
         *proto_flag = nonce_out[0] >> 7;
 }

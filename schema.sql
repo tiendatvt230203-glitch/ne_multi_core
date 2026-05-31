@@ -8,6 +8,8 @@ DROP TYPE IF EXISTS encryption_action_enum CASCADE;
 DROP TYPE IF EXISTS encryption_protocol_enum CASCADE;
 DROP TYPE IF EXISTS encryption_method_enum CASCADE;
 
+DROP FUNCTION IF EXISTS is_valid_ip(text) CASCADE;
+
 CREATE TYPE encryption_action_enum AS ENUM ('L2', 'L3', 'L4', 'bypass');
 
 CREATE TYPE encryption_protocol_enum AS ENUM ('tcp', 'udp', 'icmp', 'ospf');
@@ -19,6 +21,16 @@ CREATE TYPE encryption_method_enum AS ENUM (
     'aes-ctr-256',
     'pqc-gcm'
 );
+
+CREATE OR REPLACE FUNCTION is_valid_ip(txt text) 
+RETURNS boolean AS $$
+BEGIN
+    PERFORM txt::inet;
+    RETURN TRUE;
+EXCEPTION WHEN OTHERS THEN
+    RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
 
 CREATE TABLE pqc (
     id              SERIAL PRIMARY KEY,
@@ -87,7 +99,8 @@ CREATE TABLE ne_wan (
     interface       VARCHAR(100)    NULL,
     profile_id      INT             NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE,
     dst_ip          VARCHAR(45)     NULL,
-    weight          INT             NOT NULL DEFAULT 50 CHECK (weight BETWEEN 0 AND 100),
+    CONSTRAINT chk_dst_ip CHECK (dst_ip IS NULL OR is_valid_ip(dst_ip)),
+    weight          INT             NULL CHECK (weight IS NULL OR weight > 0),
     latency_ip      VARCHAR(45)     NULL,
     latency         INT             NULL CHECK (latency >= 0),
     latency_enable  BOOLEAN         NOT NULL DEFAULT FALSE,
@@ -99,13 +112,9 @@ CREATE TABLE ne_wan (
     updated_at      TIMESTAMP       NULL,
     updated_by      VARCHAR(100)    NULL
 );
-
 CREATE TABLE IF NOT EXISTS pqc_identities (
-    profile_id INT PRIMARY KEY REFERENCES xdp_profiles(id) ON DELETE CASCADE,
+    profile_id INT PRIMARY KEY REFERENCES ne_profiles(id) ON DELETE CASCADE,
     peer_pub TEXT NOT NULL,
     peer_fingerprint VARCHAR(16),
     is_initiator BOOLEAN NOT NULL DEFAULT TRUE
 );
-
-
-

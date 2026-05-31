@@ -144,7 +144,9 @@ int trf_save_key_to_file(const char *filename, const char *data, int mode) {
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0) return -1;
     ssize_t written = write(fd, data, strlen(data));
-    write(fd, "\n", 1);
+    if (write(fd, "\n", 1) < 0) {
+        return -1;
+    }
     close(fd);
     return (written > 0) ? 0 : -1;
 }
@@ -156,14 +158,7 @@ int trf_save_key_to_file(const char *filename, const char *data, int mode) {
 // =========================================================
 // DATA PLANE: ENCRYPTION (AES-GCM / AES-CBC)
 // =========================================================
-// Mô tả hướng dẫn gọi hàm
-// add 207c14f80d4f207c14f80cd1 byte
-// aad_len int sẽ là 12 MAC
-// hai thông số này hard cứng vào chỉ để test mã hóa và chưa động bắt tay
-// Key hard cứng chuỗi 256 là "2c8b3c70334f99077b408ce2996c7bb49c02f6a61c9763eb0689d532bfa3ae9c"
-// nonce mặc đinh ban đầu cho là NULL và call hàm trf_pqc_generate_nonce() để random tránh tình trạng 2 gói tin chung key và chung nonce bị thuật toán XOR bẻ gãy
-// nonce mặc định ban đầu sẽ là byte *nonce = NULL;
-// Nếu lỗi ở đâu thì mặc định sử dụng hàm scrypt_ErrorString
+
 int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
                             const byte* aad, int aad_len,
                             byte* data, int len, int* new_len_out) {

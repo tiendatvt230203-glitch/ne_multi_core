@@ -21,43 +21,9 @@ struct {
     __type(value, __u16);
 } wan_config_map SEC(".maps");
 
-#define IPPROTO_ICMP_VAL 1
 #define IPPROTO_TCP_VAL 6
 #define IPPROTO_UDP_VAL 17
-#define DNS_PORT_VAL 53
-#define NTP_PORT_VAL 123
-#define ETH_P_LLDP_VAL 0x88cc
-#define ETH_P_8021AD_VAL 0x88a8
-#define ETH_P_EAPOL_VAL 0x888e
-#define ETH_P_MACSEC_VAL 0x88e5
-#define ETH_P_PTP_VAL 0x88f7
-
-static __always_inline int read_tcp_udp_ports(void *data, void *data_end, __u8 ip_proto,
-                                              __u16 *sport_out, __u16 *dport_out)
-{
-    *sport_out = 0;
-    *dport_out = 0;
-    if (ip_proto != IPPROTO_TCP_VAL && ip_proto != IPPROTO_UDP_VAL)
-        return 0;
-
-    struct ethhdr *eth = data;
-    struct iphdr *ip = (void *)(eth + 1);
-    if ((void *)(ip + 1) > data_end)
-        return -1;
-
-    __u32 ihl = (__u32)ip->ihl * 4U;
-    if (ihl < 20)
-        return -1;
-
-    __u8 *l4 = (__u8 *)ip + ihl;
-    if ((void *)(l4 + 4) > data_end)
-        return -1;
-
-    __be16 *ports = (__be16 *)l4;
-    *sport_out = bpf_ntohs(ports[0]);
-    *dport_out = bpf_ntohs(ports[1]);
-    return 0;
-}
+#define IPPROTO_CUSTOM_VAL 99
 
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
@@ -80,48 +46,22 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 
-        if (ip->protocol == IPPROTO_ICMP_VAL) {
-            return XDP_PASS;
+        if (ip->protocol == IPPROTO_TCP_VAL || ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_CUSTOM_VAL) {
+            goto redirect;
         }
-        if (ip->protocol == IPPROTO_TCP_VAL || ip->protocol == IPPROTO_UDP_VAL) {
-            __u16 sport = 0;
-            __u16 dport = 0;
-            if (read_tcp_udp_ports(data, data_end, ip->protocol, &sport, &dport) < 0)
-                return XDP_PASS;
-            if (sport == DNS_PORT_VAL || dport == DNS_PORT_VAL ||
-                sport == NTP_PORT_VAL || dport == NTP_PORT_VAL) {
-                return XDP_PASS;
-            }
-        }
-        goto redirect;
-    }
 
-    if (proto == __constant_htons(ETH_P_IPV6))
         return XDP_PASS;
-    if (proto == __constant_htons(ETH_P_LLDP_VAL) ||
-        proto == __constant_htons(ETH_P_8021AD_VAL) ||
-        proto == __constant_htons(ETH_P_EAPOL_VAL) ||
-        proto == __constant_htons(ETH_P_MACSEC_VAL) ||
-        proto == __constant_htons(ETH_P_PTP_VAL))
-        return XDP_PASS;
+    }
 
     int key0 = 0;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
-    __u8 *raw = (void *)eth;
-    if ((void *)(raw + 14) <= data_end) {
-        __u8 marker = 0x88u;
-        if (fake4 && *fake4 != 0)
-            marker = (__u8)(*fake4 >> 8);
-        if (raw[12] == marker || raw[12] == 0x88u) {
-            goto redirect;
-        }
-    }
+    if (fake4 && *fake4 != 0 && proto == bpf_htons(*fake4))
+        goto redirect;
 
     return XDP_PASS;
 
 redirect:
     ;
-
     int queue_id = NE_XSK_QUEUE_ID;
     return bpf_redirect_map(&wan_xsks_map, queue_id, XDP_DROP);
 }
