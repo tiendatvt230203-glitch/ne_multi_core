@@ -659,6 +659,10 @@ int sig_pqc_default_local_fingerprint(char out_fp[16]) {
 
 bool sig_pqc_profile_binding_key_ready(int profile_id) {
     pthread_mutex_lock(&g_key_mutex);
+    if (g_key_ready && g_hs_cfg.profile_id == profile_id) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return true;
+    }
     for (int i = 0; i < g_profile_bindings_count; i++) {
         if (g_profile_bindings[i].profile_id == profile_id) {
             bool ready = g_profile_bindings[i].key_ready;
@@ -671,6 +675,9 @@ bool sig_pqc_profile_binding_key_ready(int profile_id) {
 }
 
 int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key) {
+    if (!out_policy_key)
+        return -1;
+
     pthread_mutex_lock(&g_key_mutex);
 
     profile_key_binding_t *binding = NULL;
@@ -681,21 +688,23 @@ int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key
         }
     }
 
-    if (!binding) {
+    const uint8_t *master = NULL;
+    if (binding) {
+        if (!binding->key_ready && g_key_ready && g_hs_cfg.profile_id == profile_id) {
+            memcpy(binding->master_traffic_key, g_traffic_key, PQC_TRAFFIC_KEY_SZ);
+            binding->key_ready = true;
+        }
+        if (binding->key_ready)
+            master = binding->master_traffic_key;
+    }
+    if (!master && g_key_ready && g_hs_cfg.profile_id == profile_id)
+        master = g_traffic_key;
+
+    if (!master) {
         pthread_mutex_unlock(&g_key_mutex);
         return -1;
     }
 
-    if (!binding->key_ready && g_key_ready && g_hs_cfg.profile_id == profile_id) {
-        memcpy(binding->master_traffic_key, g_traffic_key, PQC_TRAFFIC_KEY_SZ);
-        binding->key_ready = true;
-    }
-
-    if (!binding->key_ready) {
-        pthread_mutex_unlock(&g_key_mutex);
-        return -1;
-    }
-    
     // Diversify key: Policy_Key = HMAC-SHA256(Master_Key, policy_id)
     uint8_t mac_out[32];
     uint8_t msg[4];
@@ -703,8 +712,8 @@ int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key
     msg[1] = (policy_id >> 16) & 0xFF;
     msg[2] = (policy_id >> 8) & 0xFF;
     msg[3] = policy_id & 0xFF;
-    
-    int ret = trf_calculate_hmac(DIGEST_TYPE_SHA256, binding->master_traffic_key, PQC_TRAFFIC_KEY_SZ,
+
+    int ret = trf_calculate_hmac(DIGEST_TYPE_SHA256, master, PQC_TRAFFIC_KEY_SZ,
                                  msg, 4, mac_out);
     if (ret == TRF_PQC_OK) {
         memcpy(out_policy_key, mac_out, PQC_TRAFFIC_KEY_SZ);

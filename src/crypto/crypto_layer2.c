@@ -94,6 +94,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
         if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + l2_enc_start, (int)payload_len, &new_len) != 0)
             return -1;
+        packet_crypto_log_pqc_policy_key(ctx, "L2-encrypt");
         return (int)(l2_enc_start + (size_t)new_len);
     }
 
