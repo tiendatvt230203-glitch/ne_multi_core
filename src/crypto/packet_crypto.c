@@ -8,6 +8,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
 #include <stdatomic.h>
 #include "../../inc/crypto/pqc_handshake.h"
 static uint16_t g_fake_ethertype_ipv4 = 0;
@@ -129,6 +130,50 @@ static const EVP_CIPHER *get_gcm_cipher(void) {
 
 static int get_key_size(void) {
     return (g_aes_bits == 256) ? 32 : 16;
+}
+
+static int gcm_ctx_prepare(EVP_CIPHER_CTX *evp, int encrypt,
+                           const uint8_t key[AES_MAX_KEY_SIZE], int key_size,
+                           const uint8_t *nonce, int nonce_len,
+                           uint8_t *cached_key, int *key_cached, int *cached_nonce_len) {
+    int key_changed = !*key_cached ||
+                      memcmp(cached_key, key, (size_t)key_size) != 0 ||
+                      *cached_nonce_len != nonce_len;
+
+    if (__builtin_expect(key_changed, 0)) {
+        if (EVP_CIPHER_CTX_reset(evp) != 1)
+            return -1;
+
+        if (encrypt) {
+            if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+                return -1;
+            if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+                return -1;
+            if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
+                return -1;
+        } else {
+            if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+                return -1;
+            if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+                return -1;
+            if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
+                return -1;
+        }
+
+        memcpy(cached_key, key, (size_t)key_size);
+        *key_cached = 1;
+        *cached_nonce_len = nonce_len;
+        return 0;
+    }
+
+    if (encrypt) {
+        if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
+            return -1;
+    } else {
+        if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
+            return -1;
+    }
+    return 0;
 }
 
 uint32_t packet_crypto_next_counter(void) {
@@ -307,46 +352,28 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
-    if (__builtin_expect(len <= 0, 0)) return 0;
+    if (__builtin_expect(len <= 0, 0))
+        return 0;
 
     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
-    if (__builtin_expect(!evp, 0)) return -1;
+    if (__builtin_expect(!evp, 0))
+        return -1;
 
-    int out_len;
-    int key_size = get_key_size();
+    const int key_size = get_key_size();
+    if (gcm_ctx_prepare(evp, 1, key, key_size, nonce, nonce_len,
+                        tls_cached_key, &tls_key_cached, &tls_cached_nonce_len) != 0)
+        return -1;
 
-
-    int key_changed = !tls_key_cached ||
-                      memcmp(tls_cached_key, key, key_size) != 0 ||
-                      tls_cached_nonce_len != nonce_len;
-
-    if (__builtin_expect(key_changed, 0)) {
-
-        if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
-            return -1;
-
-        if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
-            return -1;
-
-        if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
-            return -1;
-
-        memcpy(tls_cached_key, key, key_size);
-        tls_key_cached = 1;
-        tls_cached_nonce_len = nonce_len;
-    } else {
-
-        if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
-            return -1;
-    }
-
+    int out_len = 0;
     if (__builtin_expect(EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1, 0))
         return -1;
 
-    if (__builtin_expect(EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
+    int final_len = 0;
+    if (__builtin_expect(EVP_EncryptFinal_ex(evp, data + out_len, &final_len) != 1, 0))
         return -1;
 
-    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1, 0))
+    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE,
+                                             tag_out) != 1, 0))
         return -1;
 
     return 0;
@@ -356,39 +383,19 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
-    if (__builtin_expect(len <= 0, 0)) return 0;
+    if (__builtin_expect(len <= 0, 0))
+        return 0;
 
     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
-    if (__builtin_expect(!evp, 0)) return -1;
+    if (__builtin_expect(!evp, 0))
+        return -1;
 
-    int out_len;
-    int key_size = get_key_size();
+    const int key_size = get_key_size();
+    if (gcm_ctx_prepare(evp, 0, key, key_size, nonce, nonce_len,
+                        tls_dec_cached_key, &tls_dec_key_cached, &tls_dec_cached_nonce_len) != 0)
+        return -1;
 
-
-    int key_changed = !tls_dec_key_cached ||
-                      memcmp(tls_dec_cached_key, key, key_size) != 0 ||
-                      tls_dec_cached_nonce_len != nonce_len;
-
-    if (__builtin_expect(key_changed, 0)) {
-
-        if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
-            return -1;
-
-        if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
-            return -1;
-
-        if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
-            return -1;
-
-        memcpy(tls_dec_cached_key, key, key_size);
-        tls_dec_key_cached = 1;
-        tls_dec_cached_nonce_len = nonce_len;
-    } else {
-
-        if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
-            return -1;
-    }
-
+    int out_len = 0;
     if (__builtin_expect(EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1, 0))
         return -1;
 
@@ -396,8 +403,12 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                                              (void *)tag) != 1, 0))
         return -1;
 
-    if (__builtin_expect(EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
+    int final_len = 0;
+    uint8_t final_buf[16];
+    if (__builtin_expect(EVP_DecryptFinal_ex(evp, final_buf, &final_len) != 1, 0)) {
+        OPENSSL_cleanse(data, (size_t)len);
         return -1;
+    }
 
     return 0;
 }

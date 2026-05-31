@@ -240,11 +240,92 @@ int frag_try_reassemble(struct frag_table *ft,
     return -1;
 }
 
+static void frag_l2_write_tag(uint8_t *buf, uint16_t pkt_id, uint8_t frag_index) {
+    buf[0] = (uint8_t)(pkt_id >> 8);
+    buf[1] = (uint8_t)(pkt_id & 0xFF);
+    buf[2] = frag_index;
+    buf[3] = 0;
+}
+
+static int frag_l2_enc_off(int nonce_size) {
+    return ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
+}
+
+static int frag_l2_wrap_piece(const uint8_t *eth_hdr,
+                              const uint8_t *plain, uint32_t plain_len,
+                              uint16_t pkt_id, uint8_t frag_index,
+                              uint8_t *out_buf, size_t out_max, uint32_t *out_len) {
+    if (!eth_hdr || !plain || !out_buf || !out_len || plain_len == 0)
+        return -1;
+
+    int nonce_size = packet_crypto_get_nonce_size();
+    int enc_off = frag_l2_enc_off(nonce_size);
+    int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
+    size_t need = (size_t)enc_off + plain_len + (is_gcm ? AES_GCM_TAG_SIZE : 0);
+    if (need > out_max || !packet_crypto_get_fake_ethertype_ipv4())
+        return -1;
+
+    memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
+    memmove(out_buf + enc_off, plain, plain_len);
+
+    uint8_t nonce[16];
+    int nonce_len = 0;
+    uint32_t counter = packet_crypto_next_counter();
+    crypto_generate_nonce(counter, PROTO_FLAG_IPV4, nonce, &nonce_len);
+    crypto_write_counter(out_buf, nonce, nonce_size, packet_crypto_get_policy_id());
+    out_buf[ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size] = CRYPTO_L2_FRAG_MAGIC;
+    frag_l2_write_tag(out_buf + ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size + 1,
+                      pkt_id, frag_index);
+    if (is_gcm)
+        memset(out_buf + enc_off + plain_len, 0, AES_GCM_TAG_SIZE);
+
+    *out_len = (uint32_t)need;
+    return 0;
+}
+
+static int frag_l2_inner_view(const uint8_t *pkt, uint32_t pkt_len,
+                              const uint8_t **inner, uint32_t *inner_len) {
+    uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
+    if (!fake)
+        return -1;
+
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    int wire_eth = crypto_layer2_wire_eth_len();
+
+    if (et == fake) {
+        int nonce_size = packet_crypto_get_nonce_size();
+        int enc_off = frag_l2_enc_off(nonce_size);
+        if (pkt_len < (uint32_t)enc_off)
+            return -1;
+        if (pkt[ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size] != CRYPTO_L2_FRAG_MAGIC)
+            return -1;
+
+        size_t total_after = pkt_len - (size_t)enc_off;
+        size_t plain_len = total_after;
+        if (packet_crypto_get_mode() == CRYPTO_MODE_GCM) {
+            if (total_after < AES_GCM_TAG_SIZE)
+                return -1;
+            plain_len = total_after - AES_GCM_TAG_SIZE;
+        }
+        *inner = pkt + enc_off;
+        *inner_len = (uint32_t)plain_len;
+        return 0;
+    }
+
+    if (pkt_len < (uint32_t)(wire_eth + 20))
+        return -1;
+    *inner = pkt + wire_eth;
+    *inner_len = pkt_len - (uint32_t)wire_eth;
+    return 0;
+}
+
 int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
                               uint8_t *pkt_data, uint32_t pkt_len,
                               size_t frag0_max, uint32_t *frag0_len,
                               uint8_t *frag1, size_t frag1_max,
                               uint32_t *frag1_len) {
+    (void)ctx;
+
     if (pkt_len < 14 + 20)
         return -1;
 
@@ -300,11 +381,11 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
     const uint8_t *frag1_plain = (transport_hdr_len >= 0)
                                    ? ip_payload + app_off + half1
                                    : ip_payload + half1;
-    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag1_plain, half2,
-                                              pkt_id, 1, frag1, frag1_max, frag1_len) != 0)
+    if (frag_l2_wrap_piece(eth_hdr, frag1_plain, half2, pkt_id, 1,
+                           frag1, frag1_max, frag1_len) != 0)
         return -1;
-    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, frag0_plain_len,
-                                              pkt_id, 0, pkt_data, frag0_max, frag0_len) != 0)
+    if (frag_l2_wrap_piece(eth_hdr, ip_hdr, frag0_plain_len, pkt_id, 0,
+                           pkt_data, frag0_max, frag0_len) != 0)
         return -1;
 
     return 0;
@@ -325,16 +406,20 @@ int frag_is_fragment_l2(const struct app_config *cfg,
     if (et != fake_ipv4)
         return 0;
 
+    uint8_t policy_id = pkt_data[CRYPTO_L2_POLICY_OFF];
+
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->nonce_size <= 0)
             continue;
+        if ((uint8_t)cp->id != policy_id)
+            continue;
         int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
         int tag_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + ns;
         if (tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE > (int)pkt_len)
-            continue;
+            return 0;
         if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
-            continue;
+            return 0;
         frag_read_hdr(pkt_data + tag_off + 1, pkt_id, frag_index);
         if (*frag_index > 1)
             return 0;
@@ -347,12 +432,12 @@ int frag_try_reassemble_l2(struct frag_table *ft,
                            const uint8_t *pkt_data, uint32_t pkt_len,
                            uint16_t pkt_id, uint8_t frag_index,
                            uint8_t *out_buf, uint32_t *out_len) {
-    int wire_eth = crypto_layer2_wire_eth_len();
-    if (pkt_len < (uint32_t)(wire_eth + 20))
+    const uint8_t *inner;
+    uint32_t inner_len;
+    if (frag_l2_inner_view(pkt_data, pkt_len, &inner, &inner_len) < 0)
         return -1;
 
-    const uint8_t *inner = pkt_data + wire_eth;
-    uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
+    int wire_eth = crypto_layer2_wire_eth_len();
 
     int idx = pkt_id % FRAG_TABLE_SIZE;
     struct frag_entry *entry = &ft->entries[idx];

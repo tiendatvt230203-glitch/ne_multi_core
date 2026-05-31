@@ -503,16 +503,14 @@ static int wan_packet_needs_crypto(struct forwarder *fwd, const uint8_t *pkt, ui
     if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled || !pkt)
         return 0;
 
+    if (has_l2_crypto_marker(pkt, pkt_len))
+        return 1;
+
     uint16_t pid = 0;
     uint8_t frag_idx = 0;
-    if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
-        return 1;
     if (frag_is_fragment(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
         return 1;
     if (frag_is_fragment_l4(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
-        return 1;
-
-    if (has_l2_crypto_marker(pkt, pkt_len))
         return 1;
 
     uint8_t policy_id = 0;
@@ -890,19 +888,11 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
         uint8_t policy_id = pkt[CRYPTO_L2_POLICY_OFF];
         int profile_id = profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
         int slot = (profile_id > 0) ? profile_slot_for_id(profile_id) : -1;
-        struct packet_crypto_ctx *ctx = ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
-        if (!ctx)
-            return -1;
-        uint16_t opid = 0;
-        uint8_t ofidx = 0;
-        int nd = crypto_layer2_decrypt_fragment(ctx, pkt, pkt_len, &opid, &ofidx);
-        if (nd < 0)
+        if (slot < 0)
             return -1;
         uint8_t reass[4096];
         uint32_t reass_len = 0;
-        if (slot < 0)
-            return -1;
-        int rr = frag_try_reassemble_l2(&profile_frag_l2[slot], pkt, (uint32_t)nd, opid, ofidx,
+        int rr = frag_try_reassemble_l2(&profile_frag_l2[slot], pkt, pkt_len, pid, frag_idx,
                                         reass, &reass_len);
         if (rr == 0)
             return 1;
