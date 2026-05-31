@@ -581,6 +581,8 @@ static void* pqc_handshake_thread(void* arg) {
 }
 
 int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *peer_ip) {
+    sig_pqc_ensure_profile_binding(profile_id);
+
     pthread_mutex_lock(&g_key_mutex);
     if (g_hs_started) {
         pthread_mutex_unlock(&g_key_mutex);
@@ -622,17 +624,54 @@ int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]) {
     return 0;
 }
 
+int sig_pqc_ensure_profile_binding(int profile_id) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_profile_bindings_count; i++) {
+        if (g_profile_bindings[i].profile_id == profile_id) {
+            pthread_mutex_unlock(&g_key_mutex);
+            return 0;
+        }
+    }
+    if (g_profile_bindings_count >= MAX_IDENTITY_REGISTRY) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -1;
+    }
+    profile_key_binding_t *b = &g_profile_bindings[g_profile_bindings_count++];
+    memset(b, 0, sizeof(*b));
+    b->profile_id = profile_id;
+    pthread_mutex_unlock(&g_key_mutex);
+    return 0;
+}
+
+int sig_pqc_default_local_fingerprint(char out_fp[16]) {
+    if (!out_fp)
+        return -1;
+    pthread_mutex_lock(&g_key_mutex);
+    if (g_registry_count <= 0) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -1;
+    }
+    strncpy(out_fp, g_identity_registry[0].fingerprint, 15);
+    out_fp[15] = '\0';
+    pthread_mutex_unlock(&g_key_mutex);
+    return 0;
+}
+
+bool sig_pqc_profile_binding_key_ready(int profile_id) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_profile_bindings_count; i++) {
+        if (g_profile_bindings[i].profile_id == profile_id) {
+            bool ready = g_profile_bindings[i].key_ready;
+            pthread_mutex_unlock(&g_key_mutex);
+            return ready;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return false;
+}
+
 int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key) {
     pthread_mutex_lock(&g_key_mutex);
-    
-    printf("[PQC-DEBUG] sig_pqc_diversify_key (policy_id=%d, profile_id=%d): g_profile_bindings_count = %d, array_addr = %p\n",
-           policy_id, profile_id, g_profile_bindings_count, (void*)g_profile_bindings);
-    for (int i = 0; i < g_profile_bindings_count; i++) {
-        printf("[PQC-DEBUG]   -> Binding[%d]: profile_id=%d, key_ready=%s, master_traffic_key_addr=%p\n",
-               i, g_profile_bindings[i].profile_id,
-               g_profile_bindings[i].key_ready ? "TRUE" : "FALSE",
-               (void*)g_profile_bindings[i].master_traffic_key);
-    }
 
     profile_key_binding_t *binding = NULL;
     for (int i = 0; i < g_profile_bindings_count; i++) {
@@ -641,15 +680,18 @@ int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key
             break;
         }
     }
-    
+
     if (!binding) {
-        printf("[PQC-DEBUG] sig_pqc_diversify_key: NO binding found for profile_id %d!\n", profile_id);
         pthread_mutex_unlock(&g_key_mutex);
         return -1;
     }
+
+    if (!binding->key_ready && g_key_ready && g_hs_cfg.profile_id == profile_id) {
+        memcpy(binding->master_traffic_key, g_traffic_key, PQC_TRAFFIC_KEY_SZ);
+        binding->key_ready = true;
+    }
+
     if (!binding->key_ready) {
-        printf("[PQC-DEBUG] sig_pqc_diversify_key: Binding found for profile_id %d, but key_ready is FALSE!\n",
-               profile_id);
         pthread_mutex_unlock(&g_key_mutex);
         return -1;
     }

@@ -553,6 +553,26 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     }
     PQclear(res);
 
+    {
+        PGresult *id_res = PQexecParams(conn,
+            "SELECT peer_pub, peer_fingerprint, is_initiator "
+            "FROM pqc_identities WHERE profile_id = $1",
+            1, NULL, params, NULL, NULL, 0);
+        if (PQresultStatus(id_res) == PGRES_TUPLES_OK && PQntuples(id_res) > 0) {
+            const char *peer_pub = PQgetvalue(id_res, 0, 0);
+            const char *peer_fp = PQgetvalue(id_res, 0, 1);
+            const char *initiator = PQgetvalue(id_res, 0, 2);
+            p->has_pqc_identity = 1;
+            p->pqc_is_initiator = (initiator && (initiator[0] == 't' || initiator[0] == 'T')) ? 1 : 0;
+            if (peer_fp && peer_fp[0] != '\0')
+                strncpy(p->peer_fingerprint, peer_fp, sizeof(p->peer_fingerprint) - 1);
+            if (peer_pub && peer_pub[0] != '\0')
+                strncpy(p->pqc_peer_pub, peer_pub, sizeof(p->pqc_peer_pub) - 1);
+            fprintf(stderr, "[DB] pqc_identities loaded for profile %d\n", p->id);
+        }
+        PQclear(id_res);
+    }
+
     return 0;
 }
 

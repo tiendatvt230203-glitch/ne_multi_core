@@ -110,6 +110,7 @@ void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_
 /**
  * Run handshake initialization across all configured profiles.
  */
+void pqc_runtime_setup_profiles(struct app_config *cfg);
 void pqc_handshake_start_all_profiles(struct app_config *cfg);
 
 #ifdef __cplusplus

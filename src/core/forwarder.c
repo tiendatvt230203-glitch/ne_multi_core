@@ -8,6 +8,7 @@
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
+#include "../../inc/crypto/pqc_handshake.h"
 
 #include <net/ethernet.h>
 #include <netinet/ip.h>
@@ -184,6 +185,19 @@ static void crypto_runtime_reset_indexes(void)
     }
 }
 
+void forwarder_pre_diversify_pqc_keys(int profile_id)
+{
+    for (int i = 0; i < active_policy_count; i++) {
+        if (!policy_crypto_ready[i])
+            continue;
+        if (policy_crypto_ctx[i].crypto_mode != CRYPTO_MODE_PQC)
+            continue;
+        if (policy_crypto_ctx[i].profile_id != profile_id)
+            continue;
+        packet_crypto_update_keys(&policy_crypto_ctx[i]);
+    }
+}
+
 static int rebuild_crypto_runtime(struct app_config *cfg)
 {
     struct packet_crypto_ctx old_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
@@ -283,7 +297,8 @@ static int rebuild_crypto_runtime(struct app_config *cfg)
             if (cp->crypto_mode == CRYPTO_MODE_PQC && policy_crypto_ready[pi]) {
                 policy_crypto_ctx[pi].profile_id = p->id;
                 policy_crypto_ctx[pi].policy_id = cp->id;
-                packet_crypto_update_keys(&policy_crypto_ctx[pi]);
+                if (sig_pqc_profile_binding_key_ready(p->id))
+                    packet_crypto_update_keys(&policy_crypto_ctx[pi]);
             }
         }
     }
@@ -1133,6 +1148,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
     
+    pqc_runtime_setup_profiles(cfg);
     pqc_handshake_start_all_profiles(cfg);
 
     for (int i = 0; i < fwd->local_count; i++)
@@ -1211,6 +1227,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     }
     snapshot_active_to_prev();
+    pqc_runtime_setup_profiles(cfg);
     int rc = rebuild_crypto_runtime(cfg);
     if (rc != 0)
         prev_grace_active = 0;

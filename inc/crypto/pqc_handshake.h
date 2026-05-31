@@ -76,6 +76,10 @@ int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_l
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);
 
+int sig_pqc_ensure_profile_binding(int profile_id);
+bool sig_pqc_profile_binding_key_ready(int profile_id);
+int sig_pqc_default_local_fingerprint(char out_fp[16]);
+
 void sig_pqc_feed_rx_packet(const uint8_t *udp_payload, int payload_len);
 
 #endif

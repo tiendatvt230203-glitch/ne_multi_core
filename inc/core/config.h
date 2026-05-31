@@ -74,6 +74,11 @@ struct profile_config {
     int policy_indices[MAX_CRYPTO_POLICIES];
     int policy_count;
     char local_identity_fingerprint[16];
+    char peer_fingerprint[16];
+    int pqc_is_initiator;
+    int has_pqc_identity;
+#define PQC_PEER_PUB_MAX 8192
+    char pqc_peer_pub[PQC_PEER_PUB_MAX];
 };
 
 struct local_config {

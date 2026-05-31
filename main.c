@@ -17,6 +17,7 @@
 #include "forwarder.h"
 #include "interface.h"
 #include "main_diag.h"
+#include "pqc_handshake.h"
 #include "traffic_crypto.h"
 #define NOTIFY_CHANNEL "xdp_start"
 #define MAX_ACTIVE_PROFILE_IDS 32
@@ -347,6 +348,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
         return 1;
     }
+    sig_pqc_load_keys_from_disk();
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
         return 0;
