@@ -98,9 +98,23 @@ static void fmt_mac(char *out, size_t outsz, const uint8_t mac[MAC_LEN]) {
 }
 
 static void log_interface_names(const struct app_config *cfg) {
-    fprintf(stderr, "[WAN] ");
-    for (int i = 0; i < cfg->wan_count; i++)
-        fprintf(stderr, "%s%s", i ? ", " : "", cfg->wans[i].ifname);
+    fprintf(stderr, "[WAN dataplane] ");
+    int first = 1;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (!cfg->wans[i].dataplane)
+            continue;
+        fprintf(stderr, "%s%s", first ? "" : ", ", cfg->wans[i].ifname);
+        first = 0;
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "[WAN handshake] ");
+    first = 1;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (cfg->wans[i].dataplane)
+            continue;
+        fprintf(stderr, "%s%s", first ? "" : ", ", cfg->wans[i].ifname);
+        first = 0;
+    }
     fprintf(stderr, "\n");
 
     fprintf(stderr, "[LAN] ");

@@ -276,8 +276,11 @@ static void runtime_detach_xdp_from_config(const struct runtime_state *rt) {
     interface_xdp_detach_all_from_config(cfg);
     for (int i = 0; i < cfg->local_count; i++)
         fprintf(stderr, "[STOP] XDP detached LAN %s\n", cfg->locals[i].ifname);
-    for (int i = 0; i < cfg->wan_count; i++)
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (!cfg->wans[i].dataplane)
+            continue;
         fprintf(stderr, "[STOP] XDP detached WAN %s\n", cfg->wans[i].ifname);
+    }
 }
 
 static int runtime_stop_forwarder(struct runtime_state *rt) {

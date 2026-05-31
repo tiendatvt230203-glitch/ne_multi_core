@@ -450,7 +450,7 @@ static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
     iface->ifindex = if_nametoindex(ifname);
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
-    iface->queue_count = 1;
+    iface->queue_count = 0;
     iface->ring_size = NE_RING;
     iface->batch_size = NE_BATCH_SIZE;
     iface->frame_size = NE_FRAME;
@@ -681,13 +681,13 @@ static int fallback_wan_if_congested(struct forwarder *fwd, int profile_idx, int
         for (int i = 0; i < p->wan_count; i++) {
             if (sumw > 0 && p->wan_bandwidth_weight[i] <= 0)
                 continue;
-            int wi = p->wan_indices[i];
-            if (!wan_has_tx_room(fwd, wi))
+            int dp = config_wan_cfg_to_dp(fwd->cfg, p->wan_indices[i]);
+            if (dp < 0 || !wan_has_tx_room(fwd, dp))
                 continue;
-            uint32_t depth = ne_ring_count(&fwd->mid_to_wan[wi]);
+            uint32_t depth = ne_ring_count(&fwd->mid_to_wan[dp]);
             if (depth < best_depth) {
                 best_depth = depth;
-                best = wi;
+                best = dp;
             }
         }
     }
@@ -733,9 +733,12 @@ static int select_wan_for_local(struct forwarder *fwd, int profile_idx, int flow
                                                          p->wan_bandwidth_weight,
                                                          p->wan_count);
             }
-            if (wan_idx >= 0 && wan_idx < fwd->wan_count) {
-                wan_idx = fallback_wan_if_congested(fwd, profile_idx, wan_idx);
-                return wan_idx;
+            if (wan_idx >= 0) {
+                int dp = config_wan_cfg_to_dp(fwd->cfg, wan_idx);
+                if (dp >= 0 && dp < fwd->wan_count) {
+                    dp = fallback_wan_if_congested(fwd, profile_idx, dp);
+                    return dp;
+                }
             }
         }
     }
@@ -1048,7 +1051,7 @@ static void *local_core_thread(void *arg)
             if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
-        ne_recv_release_local(&fwd->pair, (uint32_t)rcvd);
+        ne_recv_release_local(&fwd->pair);
     }
     return NULL;
 }
@@ -1090,7 +1093,7 @@ static void *wan_core_thread(void *arg)
             if (ne_ring_try_push(&fwd->wan_to_mid, &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
-        ne_recv_release_wan(&fwd->pair, (uint32_t)rcvd);
+        ne_recv_release_wan(&fwd->pair);
     }
     return NULL;
 }
@@ -1136,13 +1139,13 @@ static void *middle_core_thread(void *arg)
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
-    if (!fwd || !cfg || cfg->local_count <= 0 || cfg->wan_count <= 0)
+    if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
         return -1;
 
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
-    fwd->wan_count = cfg->wan_count;
+    fwd->wan_count = config_count_dataplane_wans(cfg);
     if (fwd->local_count > MAX_INTERFACES)
         fwd->local_count = MAX_INTERFACES;
     if (fwd->wan_count > MAX_INTERFACES)
@@ -1151,9 +1154,14 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     for (int i = 0; i < fwd->local_count; i++)
         init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname,
                         cfg->locals[i].src_mac, cfg->locals[i].dst_mac);
-    for (int i = 0; i < fwd->wan_count; i++)
-        init_iface_meta(&fwd->wans[i], cfg->wans[i].ifname,
-                        cfg->wans[i].src_mac, cfg->wans[i].dst_mac);
+    for (int di = 0; di < fwd->wan_count; di++) {
+        int ci = config_wan_dp_to_cfg(cfg, di);
+        if (ci < 0)
+            return -1;
+        fwd->wan_cfg_idx[di] = ci;
+        init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
+                        cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
+    }
 
     interface_xdp_detach_all_from_config(cfg);
     interface_reset_redirect_maps();
@@ -1218,11 +1226,21 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     (void)bridge_mac_prepare(cfg);
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
-    fwd->wan_count = cfg->wan_count;
+    fwd->wan_count = config_count_dataplane_wans(cfg);
     if (fwd->local_count > MAX_INTERFACES)
         fwd->local_count = MAX_INTERFACES;
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
+    for (int di = 0; di < fwd->wan_count; di++) {
+        int ci = config_wan_dp_to_cfg(cfg, di);
+        if (ci < 0) {
+            pthread_mutex_unlock(&runtime_lock);
+            return -1;
+        }
+        fwd->wan_cfg_idx[di] = ci;
+        init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
+                        cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
+    }
     (void)bridge_mac_install(fwd);
     if (ensure_profile_runtime_slots(cfg) != 0) {
         pthread_mutex_unlock(&runtime_lock);

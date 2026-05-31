@@ -417,24 +417,14 @@ void pqc_l2_cleanup_peer(struct pqc_l2_peer *peer) {
 }
 
 int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
-    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+    (void)profile_idx;
+    if (!cfg)
         return -1;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (wan_is_handshake_only(&cfg->wans[i]))
+            return i;
     }
-    const struct profile_config *p = &cfg->profiles[profile_idx];
-    if (p->wan_count <= 0) {
-        return -1;
-    }
-    int chosen_w_idx = p->wan_indices[0];
-    for (int w = 0; w < p->wan_count; w++) {
-        int w_idx = p->wan_indices[w];
-        if (w_idx >= 0 && w_idx < cfg->wan_count) {
-            if (cfg->wans[w_idx].dst_ip != 0) {
-                chosen_w_idx = w_idx;
-                break;
-            }
-        }
-    }
-    return chosen_w_idx;
+    return -1;
 }
 
 void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_idx, char *out_peer_ip, const char **out_wan_ifname) {

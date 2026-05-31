@@ -88,15 +88,22 @@ struct ne_pool {
     pthread_spinlock_t lock;
 };
 
-struct ne_port {
+struct ne_xsk_queue {
     struct xsk_socket *xsk;
     struct xsk_ring_cons rx;
     struct xsk_ring_prod tx;
     struct xsk_ring_prod fq;
     struct xsk_ring_cons cq;
+    uint32_t rx_pending;
+};
+
+struct ne_iface {
     int ifindex;
     char ifname[IF_NAMESIZE];
+    int queue_count;
+    struct ne_xsk_queue queues[MAX_QUEUES];
     uint64_t tx_no_free;
+    uint32_t tx_queue_rr;
 };
 
 struct ne_pair {
@@ -105,12 +112,12 @@ struct ne_pair {
     uint32_t frame_size;
     uint32_t n_frames;
     struct xsk_umem *umem;
-    struct ne_port locals[MAX_INTERFACES];
+    struct ne_iface locals[MAX_INTERFACES];
     int local_count;
-    struct ne_port wans[MAX_INTERFACES];
+    struct ne_iface wans[MAX_INTERFACES];
     int wan_count;
-    uint32_t local_rx_pending[MAX_INTERFACES];
-    uint32_t wan_rx_pending[MAX_INTERFACES];
+    int local_queue_total;
+    int wan_queue_total;
     struct ne_pool pool;
     struct bpf_object *bpf_locals[MAX_INTERFACES];
     struct bpf_object *bpf_wans[MAX_INTERFACES];
@@ -130,8 +137,8 @@ void ne_pair_close(struct ne_pair *p);
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-void ne_recv_release_local(struct ne_pair *p, uint32_t n);
-void ne_recv_release_wan(struct ne_pair *p, uint32_t n);
+void ne_recv_release_local(struct ne_pair *p);
+void ne_recv_release_wan(struct ne_pair *p);
 
 void ne_drain_cq_local(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);

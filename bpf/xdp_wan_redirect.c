@@ -5,11 +5,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define NE_XSK_QUEUE_ID 0
-
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
-    __uint(max_entries, 8);
+    __uint(max_entries, 64);
     __type(key, int);
     __type(value, int);
 } wan_xsks_map SEC(".maps");
@@ -62,8 +60,8 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 
 redirect:
     ;
-    int queue_id = NE_XSK_QUEUE_ID;
-    return bpf_redirect_map(&wan_xsks_map, queue_id, XDP_DROP);
+    __u32 qid = ctx->rx_queue_index;
+    return bpf_redirect_map(&wan_xsks_map, qid, XDP_DROP);
 }
 
 char _license[] SEC("license") = "GPL";

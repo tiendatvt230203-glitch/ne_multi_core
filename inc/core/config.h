@@ -21,7 +21,9 @@
 #define DEFAULT_RING_SIZE       262144
 #define DEFAULT_RING_SIZE_WAN   32768
 #define WAN_REORDER_WINDOW_KB   10240
-#define DEFAULT_QUEUE_COUNT         1
+#define DEFAULT_QUEUE_COUNT         4
+#define NE_LOCAL_QUEUE_TARGET       4
+#define NE_WAN_QUEUE_TARGET         4
 #define MAX_PROFILES 32
 #define MAX_PROFILE_INTERFACES 16
 #define MAX_CRYPTO_POLICIES 128
@@ -106,7 +108,13 @@ struct wan_config {
     uint32_t batch_size;
     uint32_t frame_size;
     int queue_count;
+    int dataplane; /* 0 = có dst_ip (peer IP), chỉ PQC handshake; 1 = L2 traffic (enp7/enp8) */
 };
+
+static inline int wan_is_handshake_only(const struct wan_config *w)
+{
+    return w && w->dst_ip != 0;
+}
 
 struct app_config {
     uint32_t global_frame_size;
@@ -134,6 +142,45 @@ struct app_config {
     struct crypto_policy policies[MAX_CRYPTO_POLICIES];
     int policy_count;
 };
+
+static inline int config_count_dataplane_wans(const struct app_config *cfg)
+{
+    int n = 0;
+    if (!cfg)
+        return 0;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (cfg->wans[i].dataplane)
+            n++;
+    }
+    return n;
+}
+
+static inline int config_wan_cfg_to_dp(const struct app_config *cfg, int cfg_idx)
+{
+    if (!cfg || cfg_idx < 0 || cfg_idx >= cfg->wan_count || !cfg->wans[cfg_idx].dataplane)
+        return -1;
+    int dp = 0;
+    for (int i = 0; i < cfg_idx; i++) {
+        if (cfg->wans[i].dataplane)
+            dp++;
+    }
+    return dp;
+}
+
+static inline int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx)
+{
+    if (!cfg || dp_idx < 0)
+        return -1;
+    int seen = 0;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (!cfg->wans[i].dataplane)
+            continue;
+        if (seen == dp_idx)
+            return i;
+        seen++;
+    }
+    return -1;
+}
 
 int parse_mac(const char *str, uint8_t *mac);
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network);

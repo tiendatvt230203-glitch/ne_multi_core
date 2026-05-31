@@ -7,8 +7,6 @@
 
 #define IPPROTO_ICMP_VAL 1
 #define ETH_P_ARP_VAL 0x0806
-#define NE_XSK_QUEUE_ID 0
-
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __uint(max_entries, 64);
@@ -46,10 +44,7 @@ int xdp_redirect_prog(struct xdp_md *ctx)
 
 redirect:
     ;
-    __u32 qid = NE_XSK_QUEUE_ID;
-    int *sock = bpf_map_lookup_elem(&xsks_map, &qid);
-    if (!sock)
-        return XDP_PASS;
+    __u32 qid = ctx->rx_queue_index;
     return bpf_redirect_map(&xsks_map, qid, 0);
 }
 
