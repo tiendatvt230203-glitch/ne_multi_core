@@ -1148,9 +1148,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
     
-    pqc_runtime_setup_profiles(cfg);
-    pqc_handshake_start_all_profiles(cfg);
-
     for (int i = 0; i < fwd->local_count; i++)
         init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname,
                         cfg->locals[i].src_mac, cfg->locals[i].dst_mac);
@@ -1166,6 +1163,11 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     if (rebuild_crypto_runtime(cfg) != 0)
         return -1;
+
+    /* Peer + policy ctx must be ready before HS thread derives into policy_crypto_ctx. */
+    pqc_runtime_setup_profiles(cfg);
+    pqc_handshake_start_all_profiles(cfg);
+
     memset(profile_flow_table_ready, 0, sizeof(profile_flow_table_ready));
     memset(profile_flow_profile_id, 0, sizeof(profile_flow_profile_id));
     if (ensure_profile_runtime_slots(cfg) != 0)
@@ -1227,8 +1229,11 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     }
     snapshot_active_to_prev();
-    pqc_runtime_setup_profiles(cfg);
     int rc = rebuild_crypto_runtime(cfg);
+    if (rc == 0) {
+        pqc_runtime_setup_profiles(cfg);
+        pqc_handshake_start_all_profiles(cfg);
+    }
     if (rc != 0)
         prev_grace_active = 0;
     cleanup_stale_profile_slots(cfg);

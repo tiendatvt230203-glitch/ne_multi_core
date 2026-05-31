@@ -118,6 +118,15 @@ static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t
     memcpy(out_key, hash, PQC_TRAFFIC_KEY_SZ);
 }
 
+static void pqc_log_master_key_ready(int profile_id, const uint8_t master[PQC_TRAFFIC_KEY_SZ]) {
+    const uint8_t *tail = master + PQC_TRAFFIC_KEY_SZ - 10;
+    fprintf(stderr,
+            "[PQC-KEY] HS-SUCCESS profile=%d master_tail20=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+            profile_id, tail[0], tail[1], tail[2], tail[3], tail[4],
+            tail[5], tail[6], tail[7], tail[8], tail[9]);
+    forwarder_pre_diversify_pqc_keys(profile_id);
+}
+
 static uint64_t get_time_ms_hs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -226,7 +235,7 @@ static void* pqc_l2_handshake_thread_run(void) {
                                 }
                                 pthread_mutex_unlock(&g_key_mutex);
                                 fprintf(stderr, "[PQC-HS-L2] Handshake SUCCESS!\n");
-                                forwarder_pre_diversify_pqc_keys(g_hs_cfg.profile_id);
+                                pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
                                 free(rx_payload);
                                 break;
                             }
@@ -292,7 +301,7 @@ static void* pqc_l2_handshake_thread_run(void) {
                             }
                             pthread_mutex_unlock(&g_key_mutex);
                             fprintf(stderr, "[PQC-HS-L2] Responder Handshake SUCCESS!\n");
-                            forwarder_pre_diversify_pqc_keys(g_hs_cfg.profile_id);
+                            pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
                         }
                     }
                 }
@@ -470,7 +479,7 @@ static void* pqc_handshake_thread(void* arg) {
                                 }
                                 pthread_mutex_unlock(&g_key_mutex);
                                 fprintf(stderr, "[PQC-HS] Handshake SUCCESS!\n");
-                                forwarder_pre_diversify_pqc_keys(g_hs_cfg.profile_id);
+                                pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
                                 break;
                             }
                         }
@@ -560,7 +569,7 @@ static void* pqc_handshake_thread(void* arg) {
                             }
                             pthread_mutex_unlock(&g_key_mutex);
                             fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS!\n");
-                            forwarder_pre_diversify_pqc_keys(g_hs_cfg.profile_id);
+                            pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
                         } else {
                             fprintf(stderr, "[PQC-HS] ERROR: Responder KEM encapsulation failed!\n");
                         }
@@ -585,7 +594,19 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
 
     pthread_mutex_lock(&g_key_mutex);
     if (g_hs_started) {
+        if (g_key_ready) {
+            pthread_mutex_unlock(&g_key_mutex);
+            return 0;
+        }
+        /* Reload -id: peer/initiator may arrive after first start; refresh cfg for running thread. */
+        g_hs_cfg.profile_id = profile_id;
+        if (wan_ifname)
+            strncpy(g_hs_cfg.wan_ifname, wan_ifname, 63);
+        if (peer_ip)
+            strncpy(g_hs_cfg.peer_ip, peer_ip, 63);
         pthread_mutex_unlock(&g_key_mutex);
+        fprintf(stderr, "[PQC-HS] profile %d: handshake thread already running (waiting for peer/HELLO)\n",
+                profile_id);
         return 0;
     }
     g_hs_started = true;
@@ -593,7 +614,7 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
     pthread_mutex_unlock(&g_key_mutex);
 
     if (wan_ifname) strncpy(g_hs_cfg.wan_ifname, wan_ifname, 63);
-    strncpy(g_hs_cfg.peer_ip, peer_ip, 63);
+    if (peer_ip) strncpy(g_hs_cfg.peer_ip, peer_ip, 63);
 
     pthread_t thread_id;
     if (pthread_create(&thread_id, NULL, pqc_handshake_thread, NULL) != 0) {
@@ -1002,4 +1023,15 @@ void sig_pqc_load_keys_from_disk(void) {
         }
     }
     closedir(dir);
+
+    pthread_mutex_lock(&g_key_mutex);
+    int nreg = g_registry_count;
+    int nbind = g_profile_bindings_count;
+    bool peer_ok = (g_peer_id_pub != NULL);
+    pthread_mutex_unlock(&g_key_mutex);
+
+    fprintf(stderr, "[PQC-LOAD] registry=%d binding_slots=%d peer_pub=%s\n",
+            nreg, nbind, peer_ok ? "loaded" : "MISSING");
+    if (nreg == 0)
+        fprintf(stderr, "[PQC-LOAD] WARN: no identity under /dev/shm/.enc_config — HS cannot start\n");
 }

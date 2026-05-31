@@ -217,6 +217,18 @@ const uint8_t *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx) 
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     if (key_has_nonzero(key, 32))
         return key;
+
+    /* HS finished but ctx slots empty — sync from RAM master (post-refactor path). */
+    if (sig_pqc_is_key_ready() && ctx->profile_id > 0) {
+        uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
+        if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) == 0) {
+            memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
+            memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
+            memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
+            packet_crypto_log_pqc_policy_key(ctx, "sync-hs");
+            return packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+        }
+    }
     return NULL;
 }
 

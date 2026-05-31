@@ -519,6 +519,14 @@ void pqc_handshake_start_all_profiles(struct app_config *cfg) {
                                      peer_ip_str, local_fp[0] ? local_fp : NULL, wan_ifname);
         fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s (initiator=%d)\n",
                 prof->id, wan_ifname, peer_ip_str, prof->pqc_is_initiator);
+        if (!prof->has_pqc_identity)
+            fprintf(stderr, "[PQC-HS] WARN profile %d: no pqc_identities in DB — set peer_pub + is_initiator\n",
+                    prof->id);
+        if (!prof->pqc_is_initiator)
+            fprintf(stderr, "[PQC-HS] WARN profile %d: RESPONDER — must receive peer HELLO (UDP :7090 or L2)\n",
+                    prof->id);
+        else
+            fprintf(stderr, "[PQC-HS] profile %d: INITIATOR — will send HELLO to %s\n", prof->id, peer_ip_str);
         sig_pqc_handshake_start(prof->id, wan_ifname, peer_ip_str);
     }
 }
