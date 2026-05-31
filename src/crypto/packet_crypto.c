@@ -35,13 +35,6 @@ static __thread uint8_t tls_dec_cached_key[AES_MAX_KEY_SIZE];
 static __thread int tls_dec_key_cached = 0;
 static __thread int tls_dec_cached_nonce_len = 0;
 
-const uint8_t g_pqc_test_key[32] = {
-    0x2c, 0x8b, 0x3c, 0x70, 0x33, 0x4f, 0x99, 0x07,
-    0x7b, 0x40, 0x8c, 0xe2, 0x99, 0x6c, 0x7b, 0xb4,
-    0x9c, 0x02, 0xf6, 0xa6, 0x1c, 0x97, 0x63, 0xeb,
-    0x06, 0x89, 0xd5, 0x32, 0xbf, 0xa3, 0xae, 0x9c
-};
-
 const uint8_t g_pqc_test_aad[12] = {
     0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f, 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xd1
 };
@@ -167,7 +160,7 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE],
 static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
     uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
 
-    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC_GCM)
+    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC)
         return;
     if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
         return;
@@ -199,13 +192,14 @@ int packet_crypto_get_pqc_test_aad_len(void) {
 }
 
 const uint8_t *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx) {
+    if (!ctx || !ctx->initialized)
+        return NULL;
+
+    packet_crypto_update_keys(ctx);
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     if (key_has_nonzero(key, 32))
         return key;
-
-    if (packet_crypto_init(ctx, g_pqc_test_key) != 0)
-        return NULL;
-    return packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+    return NULL;
 }
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,

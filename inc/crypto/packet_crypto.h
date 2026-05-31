@@ -26,7 +26,6 @@ struct packet_crypto_ctx {
     int profile_id;
 };
 typedef unsigned char byte;
-extern const byte g_pqc_test_key[32];
 extern const byte g_pqc_test_aad[12];
 
 const byte *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx);

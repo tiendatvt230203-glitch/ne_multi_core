@@ -249,6 +249,8 @@ static int rebuild_crypto_runtime(struct app_config *cfg)
         if (cp->crypto_mode == CRYPTO_MODE_PQC) {
             memset(&policy_crypto_ctx[i], 0, sizeof(policy_crypto_ctx[i]));
             policy_crypto_ctx[i].initialized = true;
+            policy_crypto_ctx[i].crypto_mode = CRYPTO_MODE_PQC;
+            policy_crypto_ctx[i].policy_id = cp->id;
             policy_crypto_ready[i] = 1;
             continue;
         }
@@ -277,6 +279,11 @@ static int rebuild_crypto_runtime(struct app_config *cfg)
                     return -1;
                 }
                 policy_profile_id_by_action_id[cp->action][(uint8_t)cp->id] = p->id;
+            }
+            if (cp->crypto_mode == CRYPTO_MODE_PQC && policy_crypto_ready[pi]) {
+                policy_crypto_ctx[pi].profile_id = p->id;
+                policy_crypto_ctx[pi].policy_id = cp->id;
+                packet_crypto_update_keys(&policy_crypto_ctx[pi]);
             }
         }
     }

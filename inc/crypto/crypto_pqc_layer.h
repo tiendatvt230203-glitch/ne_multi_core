@@ -23,9 +23,12 @@ static inline int crypto_pqc_sess_load(struct packet_crypto_ctx *ctx, crypto_pqc
     if (!ctx || !sess)
         return -1;
     sess->key = packet_crypto_get_pqc_key_for_ctx(ctx);
+    if (!sess->key)
+        return -1;
+    /* Public wire AAD (not secret); both peers must use the same bytes for GCM. */
     sess->aad = packet_crypto_get_pqc_test_aad();
     sess->aad_len = packet_crypto_get_pqc_test_aad_len();
-    return sess->key ? 0 : -1;
+    return 0;
 }
 
 static inline int crypto_pqc_generate_nonce(byte nonce[CRYPTO_PQC_NONCE_BYTES]) {
