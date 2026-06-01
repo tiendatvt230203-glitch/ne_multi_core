@@ -584,6 +584,7 @@ static uint32_t flow_hash_symmetric(uint32_t src_ip, uint32_t dst_ip,
     return h;
 }
 
+/* Sticky per 5-tuple: same connection → same crypto worker + same core_id on wire. */
 static uint8_t crypto_core_for_flow(uint32_t src_ip, uint32_t dst_ip,
                                     uint16_t src_port, uint16_t dst_port,
                                     uint8_t protocol)
@@ -1033,6 +1034,7 @@ static void dispatch_local_packet(struct forwarder *fwd, struct ne_packet job)
     if (set_wan_l2(fwd, wan_idx, pkt) != 0)
         goto drop;
 
+    /* Bypass: chọn profile + gộp kênh WAN rồi emit; không ring crypto, không core 2/3. */
     if (cp->action == POLICY_ACTION_BYPASS) {
         (void)emit_local_to_wan(fwd, &job, wan_idx);
         return;
@@ -1245,6 +1247,7 @@ static void forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job)
 static void dispatch_wan_packet(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
+    /* Gói cleartext: forward LAN trực tiếp trên core 11, không decrypt / không core 2/3. */
     if (wan_packet_needs_crypto(fwd, pkt, job.len)) {
         job.op = NE_OP_DECRYPT_WAN;
         job.crypto_core = pick_crypto_core_for_wan_pkt(fwd, pkt, job.len);
@@ -1355,7 +1358,6 @@ static void *local_core_thread(void *arg)
                 break;
         }
 
-        work += dispatch_drain_local(fwd);
         if (work > 0) {
             idle = 0;
             continue;
@@ -1417,6 +1419,7 @@ static void *wan_core_thread(void *arg)
                 break;
         }
 
+        work += dispatch_drain_local(fwd);
         work += dispatch_drain_wan(fwd);
         dispatch_periodic_gc(fwd);
         if (work > 0) {
