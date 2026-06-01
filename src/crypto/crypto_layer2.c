@@ -1,24 +1,32 @@
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/core/config.h"
+#include "../../inc/core/interface.h"
 #include "../../inc/crypto/crypto_pqc_layer.h"
 #include <string.h>
 
-#define L2_FRAG_MAGIC      0x5B
 #define MIN_ETH_PKT        (ETH_HEADER_SIZE + 8)
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
+static inline int l2_nonce_size(void) {
+    return crypto_mode_is_pqc() ? CRYPTO_PQC_NONCE_BYTES : packet_crypto_get_nonce_size();
+}
+
+static inline int l2_magic_off(int nonce_size) {
+    return ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_LEN + nonce_size;
+}
+
 static inline int l2_enc_start_offset(int nonce_size) {
-    return ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size;
+    return l2_magic_off(nonce_size);
 }
 
 static inline int l2_frag_enc_start_offset(int nonce_size) {
-    return ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
+    return l2_magic_off(nonce_size) + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
 }
 
 static inline int l2_wire_nonce_size(void) {
-    return crypto_mode_is_pqc() ? CRYPTO_PQC_NONCE_BYTES : packet_crypto_get_nonce_size();
+    return l2_nonce_size();
 }
 
 static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
@@ -52,13 +60,27 @@ static int l2_has_fake_ethertype(const uint8_t *packet) {
     return l2_pkt_fake_ethertype(packet);
 }
 
+int crypto_l2_read_core_id(const uint8_t *pkt, uint32_t pkt_len, int nonce_size) {
+    if (!pkt || nonce_size <= 0)
+        return 0;
+    int magic_off = l2_magic_off(nonce_size);
+    if (pkt_len >= (uint32_t)(magic_off + 1) && pkt[magic_off] == CRYPTO_L2_FRAG_MAGIC) {
+        int tag_off = magic_off + 1;
+        if (pkt_len >= (uint32_t)(tag_off + CRYPTO_L2_FRAG_TAG_SIZE))
+            return pkt[tag_off + 3] % NE_CRYPTO_WORKERS;
+    }
+    if (pkt_len >= (uint32_t)(CRYPTO_L2_CORE_OFF + CRYPTO_L2_CORE_LEN))
+        return pkt[CRYPTO_L2_CORE_OFF] % NE_CRYPTO_WORKERS;
+    return 0;
+}
+
 int crypto_layer2_wire_eth_len(void) {
     return ETH_HEADER_SIZE;
 }
 
 int crypto_layer2_frag_meta_len(void) {
     int nonce_size = packet_crypto_get_nonce_size();
-    int meta = CRYPTO_L2_POLICY_LEN + nonce_size + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
+    int meta = CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_LEN + nonce_size + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
     if (crypto_mode_uses_gcm_tag())
         meta += AES_GCM_TAG_SIZE;
     return meta;
@@ -147,8 +169,8 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (!l2_has_fake_ethertype(packet))
         return (int)pkt_len;
 
-    if (pkt_len >= (size_t)(ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + wire_ns + 1) &&
-        packet[ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + wire_ns] == L2_FRAG_MAGIC)
+    if (pkt_len >= (size_t)(l2_magic_off(wire_ns) + 1) &&
+        packet[l2_magic_off(wire_ns)] == CRYPTO_L2_FRAG_MAGIC)
         return (int)pkt_len;
 
     if (crypto_mode_is_pqc()) {
@@ -225,7 +247,7 @@ static void l2_write_frag_tag(uint8_t *buf, uint16_t pkt_id, uint8_t frag_index)
     buf[0] = (uint8_t)(pkt_id >> 8);
     buf[1] = (uint8_t)(pkt_id & 0xFF);
     buf[2] = frag_index;
-    buf[3] = 0;
+    buf[3] = packet_crypto_get_crypto_core();
 }
 
 static void l2_read_frag_tag(const uint8_t *buf, uint16_t *pkt_id, uint8_t *frag_index) {
@@ -265,9 +287,8 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
         memmove(out_buf + enc_off, enc_plain, enc_plain_len);
         crypto_write_counter(out_buf, nonce, nonce_size, packet_crypto_get_policy_id());
-        out_buf[ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size] = L2_FRAG_MAGIC;
-        l2_write_frag_tag(out_buf + ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size + 1,
-                          pkt_id, frag_index);
+        out_buf[l2_magic_off(nonce_size)] = CRYPTO_L2_FRAG_MAGIC;
+        l2_write_frag_tag(out_buf + l2_magic_off(nonce_size) + 1, pkt_id, frag_index);
 
         if (crypto_pqc_encrypt_payload(&pqc, nonce, out_buf + enc_off, (int)enc_plain_len, &new_len) != 0)
             return -1;
@@ -299,9 +320,8 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
     memmove(out_buf + enc_off, enc_plain, enc_plain_len);
     crypto_write_counter(out_buf, nonce, nonce_size, packet_crypto_get_policy_id());
-    out_buf[ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size] = L2_FRAG_MAGIC;
-    l2_write_frag_tag(out_buf + ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size + 1,
-                      pkt_id, frag_index);
+    out_buf[l2_magic_off(nonce_size)] = CRYPTO_L2_FRAG_MAGIC;
+    l2_write_frag_tag(out_buf + l2_magic_off(nonce_size) + 1, pkt_id, frag_index);
 
     if (is_gcm) {
         uint8_t tag[AES_GCM_TAG_SIZE];
@@ -335,11 +355,10 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
         if (pkt_len < (size_t)enc_off || !l2_has_fake_ethertype(packet))
             return -1;
-        if (packet[ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size] != L2_FRAG_MAGIC)
+        if (packet[l2_magic_off(nonce_size)] != CRYPTO_L2_FRAG_MAGIC)
             return -1;
 
-        l2_read_frag_tag(packet + ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + nonce_size + 1,
-                         out_pkt_id, out_frag_index);
+        l2_read_frag_tag(packet + l2_magic_off(nonce_size) + 1, out_pkt_id, out_frag_index);
 
         if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
@@ -357,11 +376,10 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
     if (pkt_len < (size_t)enc_off || !l2_has_fake_ethertype(packet))
         return -1;
-    if (packet[ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + wire_ns] != L2_FRAG_MAGIC)
+    if (packet[l2_magic_off(wire_ns)] != CRYPTO_L2_FRAG_MAGIC)
         return -1;
 
-    l2_read_frag_tag(packet + ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + wire_ns + 1,
-                     out_pkt_id, out_frag_index);
+    l2_read_frag_tag(packet + l2_magic_off(wire_ns) + 1, out_pkt_id, out_frag_index);
 
     uint8_t nonce[16];
     crypto_read_counter(packet, wire_ns, nonce, NULL, NULL);

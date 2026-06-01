@@ -21,6 +21,7 @@ static __thread int g_aes_bits = 128;
 
 
 static __thread uint8_t g_policy_id = 0;
+static __thread uint8_t g_crypto_core = 0;
 
 static atomic_uint_fast32_t g_nonce_counter = 0;
 
@@ -456,14 +457,15 @@ void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
     packet[12] = (uint8_t)(fake >> 8);
     packet[13] = (uint8_t)(fake & 0xFF);
     packet[CRYPTO_L2_POLICY_OFF] = policy_id;
-    memcpy(packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce, nonce_size);
+    packet[CRYPTO_L2_CORE_OFF] = packet_crypto_get_crypto_core();
+    memcpy(packet + CRYPTO_L2_NONCE_OFF, nonce, nonce_size);
 }
 
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag) {
     if (policy_id)
         *policy_id = packet[CRYPTO_L2_POLICY_OFF];
-    memcpy(nonce_out, packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce_size);
+    memcpy(nonce_out, packet + CRYPTO_L2_NONCE_OFF, nonce_size);
     if (proto_flag)
         *proto_flag = nonce_out[0] >> 7;
 }
@@ -537,28 +539,6 @@ uint16_t crypto_calc_udp_checksum(const uint8_t *ip_hdr, int ip_hdr_len,
     return (uint16_t)(~sum);
 }
 
-void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len) {
-    (void)pkt_len;
-    packet[12] = 0x08;
-    packet[13] = 0x00;
-}
-
-int packet_encrypt(struct packet_crypto_ctx *ctx,
-                   uint8_t *packet,
-                   size_t pkt_len) {
-    packet_crypto_update_keys(ctx);
-
-    switch (g_encrypt_layer) {
-    case 2:
-        return crypto_layer2_encrypt(ctx, packet, pkt_len);
-    case 3:
-        return crypto_layer3_encrypt(ctx, packet, pkt_len);
-    case 4:
-        return crypto_layer4_encrypt(ctx, packet, pkt_len);
-    default:
-        return -1;
-    }
-}
 
 int packet_decrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,
@@ -582,3 +562,6 @@ uint8_t packet_crypto_get_fake_protocol(void) { return g_fake_protocol; }
 
 void packet_crypto_set_policy_id(uint8_t policy_id) { g_policy_id = policy_id; }
 uint8_t packet_crypto_get_policy_id(void) { return g_policy_id; }
+
+void packet_crypto_set_crypto_core(uint8_t core) { g_crypto_core = core; }
+uint8_t packet_crypto_get_crypto_core(void) { return g_crypto_core; }

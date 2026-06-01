@@ -33,7 +33,7 @@ struct frag_table {
     struct frag_entry entries[FRAG_TABLE_SIZE];
 };
 
-uint16_t frag_next_pkt_id(void);
+uint16_t frag_next_pkt_id(int worker);
 
 void frag_table_init(struct frag_table *ft);
 

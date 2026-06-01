@@ -6,9 +6,14 @@
 #define CRYPTO_L2_FRAG_TAG_SIZE  4
 #define CRYPTO_L2_FRAG_MAGIC     0x5B
 
-/* Byte 12-13: full fake EtherType (e.g. 0x88B5); byte 14: policy_id; then nonce. */
+/* [eth 14][policy_id][core_id][nonce…][payload…]; frag: magic + tag after nonce. */
 #define CRYPTO_L2_POLICY_OFF     ETH_HEADER_SIZE
 #define CRYPTO_L2_POLICY_LEN     1
+#define CRYPTO_L2_CORE_LEN       1
+#define CRYPTO_L2_CORE_OFF       (CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN)
+#define CRYPTO_L2_NONCE_OFF      (CRYPTO_L2_CORE_OFF + CRYPTO_L2_CORE_LEN)
+
+int crypto_l2_read_core_id(const uint8_t *pkt, uint32_t pkt_len, int nonce_size);
 
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);

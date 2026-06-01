@@ -44,10 +44,6 @@ void packet_crypto_reset_counter(void);
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot);
 
-int packet_encrypt(struct packet_crypto_ctx *ctx,
-                   uint8_t *packet,
-                   size_t pkt_len);
-
 int packet_decrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,
                    size_t pkt_len);
@@ -63,6 +59,9 @@ uint8_t packet_crypto_get_fake_protocol(void);
 
 void packet_crypto_set_policy_id(uint8_t policy_id);
 uint8_t packet_crypto_get_policy_id(void);
+
+void packet_crypto_set_crypto_core(uint8_t core);
+uint8_t packet_crypto_get_crypto_core(void);
 
 
 int packet_crypto_get_tunnel_hdr_size(void);
@@ -109,8 +108,6 @@ void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
                           int nonce_size, uint8_t policy_id);
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag);
-
-void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len);
 
 uint16_t crypto_calc_ip_checksum(const uint8_t *ip_hdr, int hdr_len);
 

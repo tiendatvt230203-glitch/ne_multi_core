@@ -10,9 +10,12 @@
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
-#define NE_CPU_LOC     0u
-#define NE_CPU_MID     3u
-#define NE_CPU_WAN     11u
+#define NE_CPU_LOC        0u
+#define NE_CPU_DISPATCH   1u
+#define NE_CPU_CRYPTO0    2u
+#define NE_CPU_CRYPTO1    3u
+#define NE_CRYPTO_WORKERS 2u
+#define NE_CPU_WAN        11u
 
 struct bpf_object;
 
@@ -63,12 +66,21 @@ enum ne_packet_dir {
     NE_DIR_WAN = 1,
 };
 
+enum ne_packet_op {
+    NE_OP_NONE = 0,
+    NE_OP_ENCRYPT_LOCAL = 1,
+    NE_OP_DECRYPT_WAN = 2,
+};
+
 struct ne_packet {
     uint64_t addr;
     uint32_t len;
     uint8_t dir;
     uint8_t wan_idx;
     uint8_t local_idx;
+    uint8_t crypto_core;
+    uint8_t policy_pi;
+    uint8_t op;
 };
 
 struct ne_ring {
