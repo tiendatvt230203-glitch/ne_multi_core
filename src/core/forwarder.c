@@ -1147,29 +1147,112 @@ static void crypto_process_wan_decrypt(struct forwarder *fwd, struct ne_packet *
     forward_wan_to_local(fwd, job);
 }
 
+static void io_drain_local_tx(struct forwarder *fwd)
+{
+    for (int li = 0; li < fwd->local_count; li++) {
+        int n;
+        do {
+            n = ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
+        } while (n > 0);
+    }
+}
+
+static int io_poll_local_rx(struct forwarder *fwd, struct ne_packet *batch)
+{
+    int total = 0;
+
+    for (;;) {
+        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
+        if (rcvd <= 0)
+            break;
+
+        uint32_t pushed = 0;
+        if (ne_ring_try_push_burst(&fwd->local_to_mid, batch, (uint32_t)rcvd, &pushed) != 0) {
+            for (uint32_t i = pushed; i < (uint32_t)rcvd; i++)
+                ne_frame_free(&fwd->pair, batch[i].addr);
+        }
+        ne_recv_release_local(&fwd->pair);
+        total += rcvd;
+        if (rcvd < (int)NE_BATCH_SIZE)
+            break;
+    }
+    return total;
+}
+
+static int io_drain_wan_tx(struct forwarder *fwd)
+{
+    int total = 0;
+
+    for (int wi = 0; wi < fwd->wan_count; wi++) {
+        if (fwd->wan_tx_cooldown[wi] > 0) {
+            fwd->wan_tx_cooldown[wi]--;
+            continue;
+        }
+        uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
+        uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
+        int sent = 0;
+        int any_sent = 0;
+        do {
+            sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
+            if (sent > 0)
+                any_sent = 1;
+            total += sent;
+        } while (sent > 0);
+
+        if (any_sent || before == 0)
+            fwd->wan_tx_stuck[wi] = 0;
+        else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
+            uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
+            if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
+                (void)flush_wan_queue(fwd, wi);
+                fwd->wan_tx_cooldown[wi] = 65535;
+                fwd->wan_tx_stuck[wi] = 0;
+            }
+        }
+    }
+    return total;
+}
+
+static int io_poll_wan_rx(struct forwarder *fwd, struct ne_packet *batch)
+{
+    int total = 0;
+
+    for (;;) {
+        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
+        if (rcvd <= 0)
+            break;
+
+        uint32_t pushed = 0;
+        if (ne_ring_try_push_burst(&fwd->wan_to_mid, batch, (uint32_t)rcvd, &pushed) != 0) {
+            for (uint32_t i = pushed; i < (uint32_t)rcvd; i++)
+                ne_frame_free(&fwd->pair, batch[i].addr);
+        }
+        ne_recv_release_wan(&fwd->pair);
+        total += rcvd;
+        if (rcvd < (int)NE_BATCH_SIZE)
+            break;
+    }
+    return total;
+}
+
 static void *local_core_thread(void *arg)
 {
     struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
+    unsigned idle = 0;
     pin_cpu(NE_CPU_LOC);
 
     while (running) {
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
-        for (int li = 0; li < fwd->local_count; li++)
-            (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
-
-        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
-        if (rcvd <= 0) {
-            sched_yield();
+        io_drain_local_tx(fwd);
+        int work = io_poll_local_rx(fwd, batch);
+        if (work > 0) {
+            idle = 0;
             continue;
         }
-
-        for (int i = 0; i < rcvd; i++) {
-            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0)
-                ne_frame_free(&fwd->pair, batch[i].addr);
-        }
-        ne_recv_release_local(&fwd->pair);
+        if (++idle >= NE_IO_IDLE_SPIN)
+            sched_yield();
     }
     return NULL;
 }
@@ -1178,40 +1261,20 @@ static void *wan_core_thread(void *arg)
 {
     struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
+    unsigned idle = 0;
     pin_cpu(NE_CPU_WAN);
 
     while (running) {
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
-        for (int wi = 0; wi < fwd->wan_count; wi++) {
-            if (fwd->wan_tx_cooldown[wi] > 0)
-                fwd->wan_tx_cooldown[wi]--;
-            uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
-            uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
-            int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
-            if (sent > 0) {
-                fwd->wan_tx_stuck[wi] = 0;
-            } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
-                uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
-                if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
-                    (void)flush_wan_queue(fwd, wi);
-                    fwd->wan_tx_cooldown[wi] = 65535;
-                    fwd->wan_tx_stuck[wi] = 0;
-                }
-            }
-        }
-
-        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
-        if (rcvd <= 0) {
-            sched_yield();
+        int work = io_drain_wan_tx(fwd);
+        work += io_poll_wan_rx(fwd, batch);
+        if (work > 0) {
+            idle = 0;
             continue;
         }
-
-        for (int i = 0; i < rcvd; i++) {
-            if (ne_ring_try_push(&fwd->wan_to_mid, &batch[i]) != 0)
-                ne_frame_free(&fwd->pair, batch[i].addr);
-        }
-        ne_recv_release_wan(&fwd->pair);
+        if (++idle >= NE_IO_IDLE_SPIN)
+            sched_yield();
     }
     return NULL;
 }

@@ -9,7 +9,8 @@
 #define NE_RING        8192u
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
-#define NE_BATCH_SIZE  64u
+#define NE_BATCH_SIZE  128u
+#define NE_IO_IDLE_SPIN  4096u
 #define NE_CPU_LOC        0u
 #define NE_CPU_DISPATCH   1u
 #define NE_CPU_CRYPTO0    2u
@@ -141,6 +142,8 @@ struct ne_pair {
 int ne_ring_init(struct ne_ring *r, uint32_t cap);
 void ne_ring_destroy(struct ne_ring *r);
 int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt);
+int ne_ring_try_push_burst(struct ne_ring *r, const struct ne_packet *pkts,
+                           uint32_t n, uint32_t *pushed_out);
 int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt);
 uint32_t ne_ring_count(const struct ne_ring *r);
 
@@ -162,6 +165,7 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx);
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
+void ne_frame_free_batch(struct ne_pair *p, const uint64_t *addrs, uint32_t n);
 
 void interface_reset_redirect_maps(void);
 int interface_push_encrypt_filters(const struct app_config *cfg);
