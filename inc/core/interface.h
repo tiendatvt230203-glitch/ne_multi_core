@@ -9,14 +9,14 @@
 #define NE_RING        8192u
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
-#define NE_BATCH_SIZE  128u
+#define NE_BATCH_SIZE    128u
 #define NE_IO_IDLE_SPIN  4096u
-#define NE_CPU_LOC        0u
-#define NE_CPU_DISPATCH   1u
-#define NE_CPU_CRYPTO0    2u
-#define NE_CPU_CRYPTO1    3u
-#define NE_CRYPTO_WORKERS 2u
-#define NE_CPU_WAN        11u
+#define NE_CPU_LOC          0u
+#define NE_CPU_CRYPTO0      2u
+#define NE_CPU_CRYPTO1      3u
+#define NE_CPU_WAN          11u
+#define NE_CRYPTO_WORKERS      2u
+#define NE_CRYPTO_CORE_MASK    (NE_CRYPTO_WORKERS - 1u) /* workers must be power of 2 */
 
 struct bpf_object;
 
@@ -165,7 +165,6 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx);
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
-void ne_frame_free_batch(struct ne_pair *p, const uint64_t *addrs, uint32_t n);
 
 void interface_reset_redirect_maps(void);
 int interface_push_encrypt_filters(const struct app_config *cfg);

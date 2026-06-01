@@ -16,6 +16,8 @@
 #include <netinet/udp.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <time.h>
 
 static volatile int running = 1;
@@ -39,9 +41,9 @@ static uint64_t prev_grace_until_ms;
 
 #define PROFILE_RELOAD_GRACE_MS 3000u
 
-static struct frag_table profile_frag_l2[NE_CRYPTO_WORKERS][MAX_PROFILES];
-static struct frag_table profile_frag_l3[NE_CRYPTO_WORKERS][MAX_PROFILES];
-static struct frag_table profile_frag_l4[NE_CRYPTO_WORKERS][MAX_PROFILES];
+static struct frag_table *profile_frag_l2[NE_CRYPTO_WORKERS][MAX_PROFILES];
+static struct frag_table *profile_frag_l3[NE_CRYPTO_WORKERS][MAX_PROFILES];
+static struct frag_table *profile_frag_l4[NE_CRYPTO_WORKERS][MAX_PROFILES];
 static struct flow_table profile_flow_tables[MAX_PROFILES];
 static int profile_flow_table_ready[MAX_PROFILES];
 static int profile_flow_profile_id[MAX_PROFILES];
@@ -74,6 +76,41 @@ static int profile_slot_alloc(int profile_id)
     return -1;
 }
 
+static void profile_frag_tables_free(int slot)
+{
+    if (slot < 0 || slot >= MAX_PROFILES)
+        return;
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        free(profile_frag_l2[w][slot]);
+        free(profile_frag_l3[w][slot]);
+        free(profile_frag_l4[w][slot]);
+        profile_frag_l2[w][slot] = NULL;
+        profile_frag_l3[w][slot] = NULL;
+        profile_frag_l4[w][slot] = NULL;
+    }
+}
+
+static int profile_frag_tables_alloc(int slot)
+{
+    if (slot < 0 || slot >= MAX_PROFILES)
+        return -1;
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        if (profile_frag_l2[w][slot])
+            continue;
+        profile_frag_l2[w][slot] = calloc(1, sizeof(struct frag_table));
+        profile_frag_l3[w][slot] = calloc(1, sizeof(struct frag_table));
+        profile_frag_l4[w][slot] = calloc(1, sizeof(struct frag_table));
+        if (!profile_frag_l2[w][slot] || !profile_frag_l3[w][slot] || !profile_frag_l4[w][slot]) {
+            profile_frag_tables_free(slot);
+            return -1;
+        }
+        frag_table_init(profile_frag_l2[w][slot]);
+        frag_table_init(profile_frag_l3[w][slot]);
+        frag_table_init(profile_frag_l4[w][slot]);
+    }
+    return 0;
+}
+
 static int ensure_profile_runtime_slots(struct app_config *cfg)
 {
     if (!cfg)
@@ -89,12 +126,12 @@ static int ensure_profile_runtime_slots(struct app_config *cfg)
             for (int wi = 0; wi < cfg->wan_count && wi < MAX_INTERFACES; wi++)
                 windows[wi] = cfg->wans[wi].window_size;
             flow_table_init(&profile_flow_tables[slot], windows, cfg->wan_count);
-            profile_flow_table_ready[slot] = 1;
-            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-                frag_table_init(&profile_frag_l2[w][slot]);
-                frag_table_init(&profile_frag_l3[w][slot]);
-                frag_table_init(&profile_frag_l4[w][slot]);
+            if (profile_frag_tables_alloc(slot) != 0) {
+                flow_table_cleanup(&profile_flow_tables[slot]);
+                profile_flow_profile_id[slot] = 0;
+                return -1;
             }
+            profile_flow_table_ready[slot] = 1;
         }
     }
     return 0;
@@ -118,13 +155,9 @@ static void cleanup_stale_profile_slots(const struct app_config *cfg)
         if (still_active)
             continue;
         flow_table_cleanup(&profile_flow_tables[s]);
+        profile_frag_tables_free(s);
         profile_flow_table_ready[s] = 0;
         profile_flow_profile_id[s] = 0;
-        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            memset(&profile_frag_l2[w][s], 0, sizeof(profile_frag_l2[w][s]));
-            memset(&profile_frag_l3[w][s], 0, sizeof(profile_frag_l3[w][s]));
-            memset(&profile_frag_l4[w][s], 0, sizeof(profile_frag_l4[w][s]));
-        }
     }
 }
 
@@ -506,30 +539,48 @@ static int has_l2_crypto_marker(const uint8_t *pkt, uint32_t pkt_len)
     return policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][pkt[CRYPTO_L2_POLICY_OFF]] >= 0;
 }
 
+static int wan_packet_needs_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len)
+{
+    if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled || !pkt)
+        return 0;
+
+    uint16_t pid = 0;
+    uint8_t frag_idx = 0;
+    if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return 1;
+    if (frag_is_fragment(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return 1;
+    if (frag_is_fragment_l4(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return 1;
+
+    if (has_l2_crypto_marker(pkt, pkt_len))
+        return 1;
+
+    uint8_t policy_id = 0;
+    if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, pkt_len, &policy_id) == 0)
+        return 1;
+
+    int nonce_size = 0;
+    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, pkt_len,
+                                         &policy_id, &nonce_size) == 0)
+        return 1;
+
+    return 0;
+}
+
 static uint32_t flow_hash_symmetric(uint32_t src_ip, uint32_t dst_ip,
                                     uint16_t src_port, uint16_t dst_port,
                                     uint8_t protocol)
 {
-    uint32_t a = src_ip;
-    uint32_t b = dst_ip;
-    uint16_t pa = src_port;
-    uint16_t pb = dst_port;
-    if (a > b) {
-        uint32_t t = a;
-        a = b;
-        b = t;
-    }
-    if (pa > pb) {
-        uint16_t t = pa;
-        pa = pb;
-        pb = t;
-    }
-    uint32_t h = a ^ (b << 1);
-    h ^= ((uint32_t)pa << 16) | (uint32_t)pb;
-    h ^= ((uint32_t)protocol << 24);
-    h ^= h >> 16;
-    h *= 0x7feb352du;
-    h ^= h >> 15;
+    uint32_t a = src_ip < dst_ip ? src_ip : dst_ip;
+    uint32_t b = src_ip < dst_ip ? dst_ip : src_ip;
+    uint16_t p0 = src_port < dst_port ? src_port : dst_port;
+    uint16_t p1 = src_port < dst_port ? dst_port : src_port;
+    uint32_t h = (uint32_t)protocol;
+    h = h * 31u + a;
+    h = h * 31u + b;
+    h = h * 31u + (uint32_t)p0;
+    h = h * 31u + (uint32_t)p1;
     return h;
 }
 
@@ -538,7 +589,7 @@ static uint8_t crypto_core_for_flow(uint32_t src_ip, uint32_t dst_ip,
                                     uint8_t protocol)
 {
     return (uint8_t)(flow_hash_symmetric(src_ip, dst_ip, src_port, dst_port, protocol)
-                     % NE_CRYPTO_WORKERS);
+                     & NE_CRYPTO_CORE_MASK);
 }
 
 static int l2_policy_nonce_size(uint8_t policy_id)
@@ -551,13 +602,111 @@ static int l2_policy_nonce_size(uint8_t policy_id)
     return packet_crypto_get_nonce_size();
 }
 
-static uint8_t pick_crypto_core_for_wan_pkt(const uint8_t *pkt, uint32_t pkt_len)
+static int wan_pkt_ipv4_hdr_len(const uint8_t *pkt, uint32_t pkt_len, int *ip_hdr_len_out)
 {
+    if (!pkt || pkt_len < 14u + 20u)
+        return -1;
+    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != 0x0800)
+        return -1;
+    int ihl = (pkt[14] & 0x0F) * 4;
+    if (ihl < 20 || pkt_len < 14u + (uint32_t)ihl)
+        return -1;
+    *ip_hdr_len_out = ihl;
+    return 0;
+}
+
+static uint8_t pick_frag_core_l3(const struct app_config *cfg, const uint8_t *pkt,
+                                 uint32_t pkt_len)
+{
+    int ip_hdr_len;
+    int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
+
+    if (!cfg || wan_pkt_ipv4_hdr_len(pkt, pkt_len, &ip_hdr_len) != 0)
+        return 0;
+    if (pkt[14 + 9] != packet_crypto_get_fake_protocol())
+        return 0;
+
+    int tunnel_off = 14 + ip_hdr_len;
+    if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + CRYPTO_L3_FRAG_TAG_SIZE))
+        return 0;
+
+    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
+        const struct crypto_policy *cp = &cfg->policies[pi];
+        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3 || cp->nonce_size <= 0)
+            continue;
+        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
+        if (tunnel_off + ns + 1 >= (int)pkt_len)
+            continue;
+        if (pkt[tunnel_off + ns + 1] != CRYPTO_L3_FRAG_MAGIC)
+            continue;
+        if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
+            continue;
+        const uint8_t *tag = pkt + tunnel_off + tunnel_hdr_size;
+        return (uint8_t)(tag[3] & NE_CRYPTO_CORE_MASK);
+    }
+    return 0;
+}
+
+static uint8_t pick_frag_core_l4(const struct app_config *cfg, const uint8_t *pkt,
+                                 uint32_t pkt_len)
+{
+    if (!cfg || pkt_len < 14u + 20u + 8u)
+        return 0;
+
+    uint16_t ether_type = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (ether_type != 0x0800)
+        return 0;
+
+    uint8_t ip_proto = pkt[14 + 9];
+    if (ip_proto != 6 && ip_proto != 17)
+        return 0;
+
+    int ip_hdr_len = (pkt[14] & 0x0F) * 4;
+    if (ip_hdr_len < 20)
+        return 0;
+
+    int tunnel_off = 14 + ip_hdr_len + crypto_layer4_wire_port_len();
+    int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
+    if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE))
+        return 0;
+
+    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
+        const struct crypto_policy *cp = &cfg->policies[pi];
+        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4 || cp->nonce_size <= 0)
+            continue;
+        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
+        if (tunnel_off + ns + 1 >= (int)pkt_len)
+            continue;
+        if (pkt[tunnel_off + ns + 1] != CRYPTO_L4_FRAG_MAGIC)
+            continue;
+        if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
+            continue;
+        const uint8_t *tag = pkt + tunnel_off + tunnel_hdr_size;
+        return (uint8_t)(tag[3] & NE_CRYPTO_CORE_MASK);
+    }
+    return 0;
+}
+
+static uint8_t pick_crypto_core_for_wan_pkt(struct forwarder *fwd, const uint8_t *pkt,
+                                            uint32_t pkt_len)
+{
+    uint16_t pid = 0;
+    uint8_t frag_idx = 0;
+
     if (has_l2_crypto_marker(pkt, pkt_len)) {
         uint8_t policy_id = pkt[CRYPTO_L2_POLICY_OFF];
         int ns = l2_policy_nonce_size(policy_id);
-        return (uint8_t)(crypto_l2_read_core_id(pkt, pkt_len, ns) % NE_CRYPTO_WORKERS);
+        return (uint8_t)(crypto_l2_read_core_id(pkt, pkt_len, ns) & NE_CRYPTO_CORE_MASK);
     }
+    if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &pid, &frag_idx)) {
+        uint8_t policy_id = pkt[CRYPTO_L2_POLICY_OFF];
+        int ns = l2_policy_nonce_size(policy_id);
+        return (uint8_t)(crypto_l2_read_core_id(pkt, pkt_len, ns) & NE_CRYPTO_CORE_MASK);
+    }
+    if (frag_is_fragment(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return pick_frag_core_l3(fwd->cfg, pkt, pkt_len);
+    if (frag_is_fragment_l4(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
+        return pick_frag_core_l4(fwd->cfg, pkt, pkt_len);
 
     uint32_t src_ip = 0, dst_ip = 0;
     uint16_t src_port = 0, dst_port = 0;
@@ -568,41 +717,13 @@ static uint8_t pick_crypto_core_for_wan_pkt(const uint8_t *pkt, uint32_t pkt_len
     return 0;
 }
 
-static int push_to_crypto_worker(struct forwarder *fwd, struct ne_packet *job)
+static int push_to_crypto(struct forwarder *fwd, struct ne_packet *job)
 {
-    if (job->crypto_core >= NE_CRYPTO_WORKERS)
-        job->crypto_core = 0;
+    job->crypto_core &= NE_CRYPTO_CORE_MASK;
     if (ne_ring_try_push(&fwd->dispatch_to_crypto[job->crypto_core], job) != 0) {
         ne_frame_free(&fwd->pair, job->addr);
         return -1;
     }
-    return 0;
-}
-
-static int wan_packet_needs_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len)
-{
-    if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled || !pkt)
-        return 0;
-
-    if (has_l2_crypto_marker(pkt, pkt_len))
-        return 1;
-
-    uint16_t pid = 0;
-    uint8_t frag_idx = 0;
-    if (frag_is_fragment(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
-        return 1;
-    if (frag_is_fragment_l4(fwd->cfg, pkt, pkt_len, &pid, &frag_idx))
-        return 1;
-
-    uint8_t policy_id = 0;
-    if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, pkt_len, &policy_id) == 0)
-        return 1;
-
-    int nonce_size = 0;
-    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, pkt_len,
-                                         &policy_id, &nonce_size) == 0)
-        return 1;
-
     return 0;
 }
 
@@ -638,9 +759,7 @@ static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
     if (frag0_len == 0 || frag1_len == 0)
         return -1;
 
-    struct ne_packet tail = { .len = frag1_len, .dir = NE_DIR_WAN,
-                              .wan_idx = (uint8_t)wan_idx,
-                              .crypto_core = job->crypto_core };
+    struct ne_packet tail = { .len = frag1_len, .dir = NE_DIR_WAN, .wan_idx = (uint8_t)wan_idx };
     if (ne_frame_alloc(&fwd->pair, &tail.addr) != 0)
         return -1;
 
@@ -660,20 +779,16 @@ static int emit_split_pair_to_wan(struct forwarder *fwd, struct ne_packet *job,
 }
 
 static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
-                                   const struct crypto_policy *cp, int wan_idx,
-                                   int worker)
+                                   const struct crypto_policy *cp, int wan_idx)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t pkt_len = job->len;
     int sent_split = 0;
-    int pi = (int)(cp - fwd->cfg->policies);
-
-    packet_crypto_set_crypto_core((uint8_t)worker);
 
     if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(pkt_len)) {
         uint8_t f2[4096];
         uint32_t l1 = 0, l2 = 0;
-        if (frag_split_and_encrypt_l2(&policy_crypto_ctx[pi],
+        if (frag_split_and_encrypt_l2(&policy_crypto_ctx[cp - fwd->cfg->policies],
                                       pkt, pkt_len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
@@ -685,7 +800,7 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(pkt_len)) {
         uint8_t f2[4096];
         uint32_t l1 = 0, l2 = 0;
-        if (frag_split_and_encrypt(&policy_crypto_ctx[pi],
+        if (frag_split_and_encrypt(&policy_crypto_ctx[cp - fwd->cfg->policies],
                                    pkt, pkt_len, fwd->pair.frame_size, &l1,
                                    f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
@@ -697,7 +812,7 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L4 && frag_need_split_l4(pkt_len)) {
         uint8_t f2[4096];
         uint32_t l1 = 0, l2 = 0;
-        if (frag_split_and_encrypt_l4(&policy_crypto_ctx[pi],
+        if (frag_split_and_encrypt_l4(&policy_crypto_ctx[cp - fwd->cfg->policies],
                                       pkt, pkt_len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
@@ -711,11 +826,11 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
     if (!sent_split) {
         int new_len = -1;
         if (cp->action == POLICY_ACTION_ENCRYPT_L2)
-            new_len = crypto_layer2_encrypt(&policy_crypto_ctx[pi], pkt, pkt_len);
+            new_len = crypto_layer2_encrypt(&policy_crypto_ctx[cp - fwd->cfg->policies], pkt, pkt_len);
         else if (cp->action == POLICY_ACTION_ENCRYPT_L3)
-            new_len = crypto_layer3_encrypt(&policy_crypto_ctx[pi], pkt, pkt_len);
+            new_len = crypto_layer3_encrypt(&policy_crypto_ctx[cp - fwd->cfg->policies], pkt, pkt_len);
         else if (cp->action == POLICY_ACTION_ENCRYPT_L4)
-            new_len = crypto_layer4_encrypt(&policy_crypto_ctx[pi], pkt, pkt_len);
+            new_len = crypto_layer4_encrypt(&policy_crypto_ctx[cp - fwd->cfg->policies], pkt, pkt_len);
         if (new_len < 0)
             return -1;
         job->len = (uint32_t)new_len;
@@ -936,8 +1051,8 @@ static void dispatch_local_packet(struct forwarder *fwd, struct ne_packet job)
     job.crypto_core = flow_ok
                           ? crypto_core_for_flow(src_ip, dst_ip, src_port, dst_port, proto)
                           : 0;
-    if (push_to_crypto_worker(fwd, &job) != 0)
-        goto drop;
+    if (push_to_crypto(fwd, &job) != 0)
+        return;
     return;
 
 drop:
@@ -951,9 +1066,11 @@ static void crypto_process_local_encrypt(struct forwarder *fwd, struct ne_packet
 
     const struct crypto_policy *cp = &fwd->cfg->policies[job->policy_pi];
     crypto_apply_from_policy(cp);
-    packet_crypto_set_crypto_core((uint8_t)worker);
+    if (job->crypto_core != (uint8_t)worker)
+        job->crypto_core = (uint8_t)worker;
+    packet_crypto_set_crypto_core(job->crypto_core);
 
-    int enc_rc = encrypt_split_or_single(fwd, job, cp, job->wan_idx, worker);
+    int enc_rc = encrypt_split_or_single(fwd, job, cp, job->wan_idx);
     if (enc_rc < 0)
         goto drop;
     if (enc_rc > 0)
@@ -965,10 +1082,10 @@ drop:
     ne_frame_free(&fwd->pair, job->addr);
 }
 
-static int decrypt_l2_if_needed(uint8_t *pkt, uint32_t *pkt_len)
+static int decrypt_l2_if_needed(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_len)
 {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
-    if (!fake || *pkt_len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN)
+    if (!fake || *pkt_len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_LEN)
         return 0;
     uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
     if (et != fake)
@@ -982,6 +1099,7 @@ static int decrypt_l2_if_needed(uint8_t *pkt, uint32_t *pkt_len)
     if (new_len < 0)
         return -1;
     *pkt_len = (uint32_t)new_len;
+    (void)fwd;
     return 0;
 }
 
@@ -998,22 +1116,26 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job, int 
         int profile_id = profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
         int slot = (profile_id > 0) ? profile_slot_for_id(profile_id) : -1;
         struct packet_crypto_ctx *ctx = ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
-        if (!ctx || slot < 0)
+        if (!ctx)
             return -1;
-        int nd = crypto_layer2_decrypt_fragment(ctx, pkt, pkt_len, &pid, &frag_idx);
+        uint16_t opid = 0;
+        uint8_t ofidx = 0;
+        int nd = crypto_layer2_decrypt_fragment(ctx, pkt, pkt_len, &opid, &ofidx);
         if (nd < 0)
             return -1;
         uint8_t reass[4096];
         uint32_t reass_len = 0;
-        int rr = frag_try_reassemble_l2(&profile_frag_l2[worker][slot], pkt, (uint32_t)nd,
-                                        pid, frag_idx, reass, &reass_len);
+        if (slot < 0 || !profile_frag_l2[worker][slot])
+            return -1;
+        int rr = frag_try_reassemble_l2(profile_frag_l2[worker][slot], pkt, (uint32_t)nd, opid,
+                                        ofidx, reass, &reass_len);
         if (rr == 0)
             return 1;
         if (rr != 1)
             return -1;
         memcpy(pkt, reass, reass_len);
         pkt_len = reass_len;
-    } else if (decrypt_l2_if_needed(pkt, &pkt_len) != 0) {
+    } else if (decrypt_l2_if_needed(fwd, pkt, &pkt_len) != 0) {
         return -1;
     }
 
@@ -1035,10 +1157,10 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job, int 
                 return -1;
             uint8_t reass[4096];
             uint32_t reass_len = 0;
-            if (slot < 0)
+            if (slot < 0 || !profile_frag_l3[worker][slot])
                 return -1;
-            int rr = frag_try_reassemble(&profile_frag_l3[worker][slot], pkt, (uint32_t)nd,
-                                         opid, ofidx, reass, &reass_len);
+            int rr = frag_try_reassemble(profile_frag_l3[worker][slot], pkt, (uint32_t)nd, opid,
+                                         ofidx, reass, &reass_len);
             if (rr == 0)
                 return 1;
             if (rr != 1)
@@ -1069,10 +1191,10 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job, int 
                 return -1;
             uint8_t reass[4096];
             uint32_t reass_len = 0;
-            if (slot < 0)
+            if (slot < 0 || !profile_frag_l4[worker][slot])
                 return -1;
-            int rr = frag_try_reassemble_l4(&profile_frag_l4[worker][slot], pkt, (uint32_t)nd,
-                                            opid, ofidx, reass, &reass_len);
+            int rr = frag_try_reassemble_l4(profile_frag_l4[worker][slot], pkt, (uint32_t)nd, opid,
+                                          ofidx, reass, &reass_len);
             if (rr == 0)
                 return 1;
             if (rr != 1)
@@ -1125,8 +1247,8 @@ static void dispatch_wan_packet(struct forwarder *fwd, struct ne_packet job)
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     if (wan_packet_needs_crypto(fwd, pkt, job.len)) {
         job.op = NE_OP_DECRYPT_WAN;
-        job.crypto_core = pick_crypto_core_for_wan_pkt(pkt, job.len);
-        if (push_to_crypto_worker(fwd, &job) != 0)
+        job.crypto_core = pick_crypto_core_for_wan_pkt(fwd, pkt, job.len);
+        if (push_to_crypto(fwd, &job) != 0)
             ne_frame_free(&fwd->pair, job.addr);
         return;
     }
@@ -1147,92 +1269,55 @@ static void crypto_process_wan_decrypt(struct forwarder *fwd, struct ne_packet *
     forward_wan_to_local(fwd, job);
 }
 
-static void io_drain_local_tx(struct forwarder *fwd)
+static int dispatch_drain_local(struct forwarder *fwd)
 {
-    for (int li = 0; li < fwd->local_count; li++) {
-        int n;
-        do {
-            n = ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
-        } while (n > 0);
+    struct ne_packet job;
+    int n = 0;
+
+    while (n < (int)NE_BATCH_SIZE && ne_ring_try_pop(&fwd->local_to_mid, &job) == 0) {
+        dispatch_local_packet(fwd, job);
+        n++;
     }
+    return n;
 }
 
-static int io_poll_local_rx(struct forwarder *fwd, struct ne_packet *batch)
+static int dispatch_drain_wan(struct forwarder *fwd)
 {
-    int total = 0;
+    struct ne_packet job;
+    int n = 0;
 
-    for (;;) {
-        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
-        if (rcvd <= 0)
-            break;
-
-        uint32_t pushed = 0;
-        if (ne_ring_try_push_burst(&fwd->local_to_mid, batch, (uint32_t)rcvd, &pushed) != 0) {
-            for (uint32_t i = pushed; i < (uint32_t)rcvd; i++)
-                ne_frame_free(&fwd->pair, batch[i].addr);
-        }
-        ne_recv_release_local(&fwd->pair);
-        total += rcvd;
-        if (rcvd < (int)NE_BATCH_SIZE)
-            break;
+    while (n < (int)NE_BATCH_SIZE && ne_ring_try_pop(&fwd->wan_to_mid, &job) == 0) {
+        dispatch_wan_packet(fwd, job);
+        n++;
     }
-    return total;
+    return n;
 }
 
-static int io_drain_wan_tx(struct forwarder *fwd)
+static void dispatch_periodic_gc(struct forwarder *fwd)
 {
-    int total = 0;
+    static uint32_t gc_tick;
 
-    for (int wi = 0; wi < fwd->wan_count; wi++) {
-        if (fwd->wan_tx_cooldown[wi] > 0) {
-            fwd->wan_tx_cooldown[wi]--;
-            continue;
-        }
-        uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
-        uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
-        int sent = 0;
-        int any_sent = 0;
-        do {
-            sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
-            if (sent > 0)
-                any_sent = 1;
-            total += sent;
-        } while (sent > 0);
+    maybe_expire_prev_grace();
+    if (++gc_tick < 8192)
+        return;
+    gc_tick = 0;
 
-        if (any_sent || before == 0)
-            fwd->wan_tx_stuck[wi] = 0;
-        else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
-            uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
-            if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
-                (void)flush_wan_queue(fwd, wi);
-                fwd->wan_tx_cooldown[wi] = 65535;
-                fwd->wan_tx_stuck[wi] = 0;
-            }
+    pthread_mutex_lock(&runtime_lock);
+    cleanup_stale_profile_slots(fwd->cfg);
+    pthread_mutex_unlock(&runtime_lock);
+
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        for (int s = 0; s < MAX_PROFILES; s++) {
+            if (!profile_flow_table_ready[s])
+                continue;
+            if (profile_frag_l2[w][s])
+                frag_table_gc(profile_frag_l2[w][s]);
+            if (profile_frag_l3[w][s])
+                frag_table_gc(profile_frag_l3[w][s]);
+            if (profile_frag_l4[w][s])
+                frag_table_gc(profile_frag_l4[w][s]);
         }
     }
-    return total;
-}
-
-static int io_poll_wan_rx(struct forwarder *fwd, struct ne_packet *batch)
-{
-    int total = 0;
-
-    for (;;) {
-        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
-        if (rcvd <= 0)
-            break;
-
-        uint32_t pushed = 0;
-        if (ne_ring_try_push_burst(&fwd->wan_to_mid, batch, (uint32_t)rcvd, &pushed) != 0) {
-            for (uint32_t i = pushed; i < (uint32_t)rcvd; i++)
-                ne_frame_free(&fwd->pair, batch[i].addr);
-        }
-        ne_recv_release_wan(&fwd->pair);
-        total += rcvd;
-        if (rcvd < (int)NE_BATCH_SIZE)
-            break;
-    }
-    return total;
 }
 
 static void *local_core_thread(void *arg)
@@ -1243,10 +1328,34 @@ static void *local_core_thread(void *arg)
     pin_cpu(NE_CPU_LOC);
 
     while (running) {
+        int work = 0;
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
-        io_drain_local_tx(fwd);
-        int work = io_poll_local_rx(fwd, batch);
+        for (int li = 0; li < fwd->local_count; li++) {
+            int n;
+            do {
+                n = ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
+                if (n > 0)
+                    work = 1;
+            } while (n > 0);
+        }
+
+        for (;;) {
+            int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
+            if (rcvd <= 0)
+                break;
+            uint32_t pushed = 0;
+            if (ne_ring_try_push_burst(&fwd->local_to_mid, batch, (uint32_t)rcvd, &pushed) != 0) {
+                for (uint32_t i = pushed; i < (uint32_t)rcvd; i++)
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+            }
+            ne_recv_release_local(&fwd->pair);
+            work = 1;
+            if (rcvd < (int)NE_BATCH_SIZE)
+                break;
+        }
+
+        work += dispatch_drain_local(fwd);
         if (work > 0) {
             idle = 0;
             continue;
@@ -1265,10 +1374,51 @@ static void *wan_core_thread(void *arg)
     pin_cpu(NE_CPU_WAN);
 
     while (running) {
+        int work = 0;
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
-        int work = io_drain_wan_tx(fwd);
-        work += io_poll_wan_rx(fwd, batch);
+        for (int wi = 0; wi < fwd->wan_count; wi++) {
+            if (fwd->wan_tx_cooldown[wi] > 0)
+                fwd->wan_tx_cooldown[wi]--;
+            uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
+            uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
+            int sent;
+            int any_sent = 0;
+            do {
+                sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
+                if (sent > 0)
+                    any_sent = 1;
+            } while (sent > 0);
+            if (any_sent) {
+                fwd->wan_tx_stuck[wi] = 0;
+                work = 1;
+            } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
+                uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
+                if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
+                    (void)flush_wan_queue(fwd, wi);
+                    fwd->wan_tx_cooldown[wi] = 65535;
+                    fwd->wan_tx_stuck[wi] = 0;
+                }
+            }
+        }
+
+        for (;;) {
+            int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
+            if (rcvd <= 0)
+                break;
+            uint32_t pushed = 0;
+            if (ne_ring_try_push_burst(&fwd->wan_to_mid, batch, (uint32_t)rcvd, &pushed) != 0) {
+                for (uint32_t i = pushed; i < (uint32_t)rcvd; i++)
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+            }
+            ne_recv_release_wan(&fwd->pair);
+            work = 1;
+            if (rcvd < (int)NE_BATCH_SIZE)
+                break;
+        }
+
+        work += dispatch_drain_wan(fwd);
+        dispatch_periodic_gc(fwd);
         if (work > 0) {
             idle = 0;
             continue;
@@ -1279,66 +1429,33 @@ static void *wan_core_thread(void *arg)
     return NULL;
 }
 
-static void *crypto_worker_thread(void *arg)
+static void *crypto_core_thread(void *arg)
 {
     struct crypto_worker_arg *wa = arg;
     struct forwarder *fwd = wa->fwd;
     int worker = wa->worker;
     struct ne_packet job;
+    unsigned idle = 0;
 
     pin_cpu(NE_CPU_CRYPTO0 + (unsigned int)worker);
 
     while (running) {
-        if (ne_ring_try_pop(&fwd->dispatch_to_crypto[worker], &job) == 0) {
+        int batch = 0;
+        while (batch < (int)NE_BATCH_SIZE &&
+               ne_ring_try_pop(&fwd->dispatch_to_crypto[worker], &job) == 0) {
             if (job.op == NE_OP_ENCRYPT_LOCAL)
                 crypto_process_local_encrypt(fwd, &job, worker);
             else if (job.op == NE_OP_DECRYPT_WAN)
                 crypto_process_wan_decrypt(fwd, &job, worker);
             else
                 ne_frame_free(&fwd->pair, job.addr);
+            batch++;
+        }
+        if (batch > 0) {
+            idle = 0;
             continue;
         }
-        sched_yield();
-    }
-    return NULL;
-}
-
-static void *dispatch_core_thread(void *arg)
-{
-    struct forwarder *fwd = arg;
-    struct ne_packet job;
-    uint32_t gc_tick = 0;
-    pin_cpu(NE_CPU_DISPATCH);
-
-    while (running) {
-        int did_work = 0;
-
-        pthread_mutex_lock(&runtime_lock);
-        maybe_expire_prev_grace();
-        cleanup_stale_profile_slots(fwd->cfg);
-        if (ne_ring_try_pop(&fwd->wan_to_mid, &job) == 0) {
-            dispatch_wan_packet(fwd, job);
-            did_work = 1;
-        }
-        if (ne_ring_try_pop(&fwd->local_to_mid, &job) == 0) {
-            dispatch_local_packet(fwd, job);
-            did_work = 1;
-        }
-        if (++gc_tick >= 8192) {
-            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-                for (int s = 0; s < MAX_PROFILES; s++) {
-                    if (!profile_flow_table_ready[s])
-                        continue;
-                    frag_table_gc(&profile_frag_l2[w][s]);
-                    frag_table_gc(&profile_frag_l3[w][s]);
-                    frag_table_gc(&profile_frag_l4[w][s]);
-                }
-            }
-            gc_tick = 0;
-        }
-        pthread_mutex_unlock(&runtime_lock);
-
-        if (!did_work)
+        if (++idle >= NE_IO_IDLE_SPIN)
             sched_yield();
     }
     return NULL;
@@ -1487,6 +1604,7 @@ void forwarder_cleanup(struct forwarder *fwd)
     for (int i = 0; i < MAX_PROFILES; i++) {
         if (profile_flow_table_ready[i]) {
             flow_table_cleanup(&profile_flow_tables[i]);
+            profile_frag_tables_free(i);
             profile_flow_table_ready[i] = 0;
             profile_flow_profile_id[i] = 0;
         }
@@ -1503,18 +1621,12 @@ void forwarder_run(struct forwarder *fwd)
 
     if (pthread_create(&fwd->local_thread, NULL, local_core_thread, fwd) != 0)
         return;
-    if (pthread_create(&fwd->dispatch_thread, NULL, dispatch_core_thread, fwd) != 0) {
-        running = 0;
-        pthread_join(fwd->local_thread, NULL);
-        return;
-    }
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
         crypto_args[w].fwd = fwd;
         crypto_args[w].worker = w;
-        if (pthread_create(&fwd->crypto_thread[w], NULL, crypto_worker_thread, &crypto_args[w]) != 0) {
+        if (pthread_create(&fwd->crypto_thread[w], NULL, crypto_core_thread, &crypto_args[w]) != 0) {
             running = 0;
             pthread_join(fwd->local_thread, NULL);
-            pthread_join(fwd->dispatch_thread, NULL);
             for (int j = 0; j < w; j++)
                 pthread_join(fwd->crypto_thread[j], NULL);
             return;
@@ -1523,17 +1635,17 @@ void forwarder_run(struct forwarder *fwd)
     if (pthread_create(&fwd->wan_thread, NULL, wan_core_thread, fwd) != 0) {
         running = 0;
         pthread_join(fwd->local_thread, NULL);
-        pthread_join(fwd->dispatch_thread, NULL);
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
             pthread_join(fwd->crypto_thread[w], NULL);
         return;
     }
 
+    fwd->threads_started = 1;
     pthread_join(fwd->local_thread, NULL);
-    pthread_join(fwd->dispatch_thread, NULL);
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         pthread_join(fwd->crypto_thread[w], NULL);
     pthread_join(fwd->wan_thread, NULL);
+    fwd->threads_started = 0;
 }
 
 void forwarder_stop(void)

@@ -67,10 +67,10 @@ int crypto_l2_read_core_id(const uint8_t *pkt, uint32_t pkt_len, int nonce_size)
     if (pkt_len >= (uint32_t)(magic_off + 1) && pkt[magic_off] == CRYPTO_L2_FRAG_MAGIC) {
         int tag_off = magic_off + 1;
         if (pkt_len >= (uint32_t)(tag_off + CRYPTO_L2_FRAG_TAG_SIZE))
-            return pkt[tag_off + 3] % NE_CRYPTO_WORKERS;
+            return pkt[tag_off + 3] & NE_CRYPTO_CORE_MASK;
     }
     if (pkt_len >= (uint32_t)(CRYPTO_L2_CORE_OFF + CRYPTO_L2_CORE_LEN))
-        return pkt[CRYPTO_L2_CORE_OFF] % NE_CRYPTO_WORKERS;
+        return pkt[CRYPTO_L2_CORE_OFF] & NE_CRYPTO_CORE_MASK;
     return 0;
 }
 

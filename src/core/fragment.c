@@ -1,20 +1,18 @@
 #define _POSIX_C_SOURCE 199309L
 #include "../../inc/core/fragment.h"
-#include "../../inc/core/interface.h"
 #include "../../inc/crypto/packet_crypto.h"
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/core/config.h"
 #include <string.h>
+#include <stdlib.h>
 #include <stdatomic.h>
+// 
+static atomic_uint_fast32_t g_pkt_id_counter = 0;
 
-static atomic_uint_fast32_t g_pkt_id_counter[NE_CRYPTO_WORKERS];
-
-uint16_t frag_next_pkt_id(int worker) {
-    if (worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
-        worker = 0;
-    return (uint16_t)(atomic_fetch_add(&g_pkt_id_counter[worker], 1) & 0xFFFF);
+uint16_t frag_next_pkt_id(void) {
+    return (uint16_t)(atomic_fetch_add(&g_pkt_id_counter, 1) & 0xFFFF);
 }
 
 void frag_table_init(struct frag_table *ft) {
@@ -187,7 +185,7 @@ int frag_split_and_encrypt(struct packet_crypto_ctx *ctx,
     if (half1 >= app_len)
         half1 = app_len - 1;
     uint32_t half2 = app_len - half1;
-    uint16_t pkt_id = frag_next_pkt_id(packet_crypto_get_crypto_core());
+    uint16_t pkt_id = frag_next_pkt_id();
 
     uint32_t frag0_plain_len = (uint32_t)ip_hdr_len + (uint32_t)transport_hdr_len + half1;
     if (crypto_layer3_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, ip_hdr_len,
@@ -247,7 +245,7 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
                               size_t frag0_max, uint32_t *frag0_len,
                               uint8_t *frag1, size_t frag1_max,
                               uint32_t *frag1_len) {
-    if (!ctx || pkt_len < 14 + 20)
+    if (pkt_len < 14 + 20)
         return -1;
 
     const uint8_t *eth_hdr = pkt_data;
@@ -290,7 +288,7 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
         half1 = app_len - 1;
     uint32_t half2 = app_len - half1;
 
-    uint16_t pkt_id = frag_next_pkt_id(packet_crypto_get_crypto_core());
+    uint16_t pkt_id = frag_next_pkt_id();
 
     uint32_t frag0_plain_len;
     if (transport_hdr_len >= 0) {
@@ -302,11 +300,11 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
     const uint8_t *frag1_plain = (transport_hdr_len >= 0)
                                    ? ip_payload + app_off + half1
                                    : ip_payload + half1;
-    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag1_plain, half2, pkt_id, 1,
-                                              frag1, frag1_max, frag1_len) != 0)
+    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag1_plain, half2,
+                                              pkt_id, 1, frag1, frag1_max, frag1_len) != 0)
         return -1;
-    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, frag0_plain_len, pkt_id, 0,
-                                              pkt_data, frag0_max, frag0_len) != 0)
+    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, frag0_plain_len,
+                                              pkt_id, 0, pkt_data, frag0_max, frag0_len) != 0)
         return -1;
 
     return 0;
@@ -317,7 +315,8 @@ int frag_is_fragment_l2(const struct app_config *cfg,
                         uint16_t *pkt_id, uint8_t *frag_index) {
     if (!cfg)
         return 0;
-    if (pkt_len < (uint32_t)(ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_LEN + 4 + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
+    if (pkt_len < (uint32_t)(ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_LEN + 4 + 1 +
+                            CRYPTO_L2_FRAG_TAG_SIZE))
         return 0;
 
     uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
@@ -327,21 +326,17 @@ int frag_is_fragment_l2(const struct app_config *cfg,
     if (et != fake_ipv4)
         return 0;
 
-    uint8_t policy_id = pkt_data[CRYPTO_L2_POLICY_OFF];
-
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->nonce_size <= 0)
             continue;
-        if ((uint8_t)cp->id != policy_id)
-            continue;
         int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
-        int magic_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_LEN + ns;
-        if (magic_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE > (int)pkt_len)
-            return 0;
-        if (pkt_data[magic_off] != CRYPTO_L2_FRAG_MAGIC)
-            return 0;
-        frag_read_hdr(pkt_data + magic_off + 1, pkt_id, frag_index);
+        int tag_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_LEN + ns;
+        if (tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE > (int)pkt_len)
+            continue;
+        if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
+            continue;
+        frag_read_hdr(pkt_data + tag_off + 1, pkt_id, frag_index);
         if (*frag_index > 1)
             return 0;
         return 1;
@@ -353,12 +348,12 @@ int frag_try_reassemble_l2(struct frag_table *ft,
                            const uint8_t *pkt_data, uint32_t pkt_len,
                            uint16_t pkt_id, uint8_t frag_index,
                            uint8_t *out_buf, uint32_t *out_len) {
-    if (pkt_len < ETH_HEADER_SIZE + 20)
+    int wire_eth = crypto_layer2_wire_eth_len();
+    if (pkt_len < (uint32_t)(wire_eth + 20))
         return -1;
 
-    const uint8_t *inner = pkt_data + ETH_HEADER_SIZE;
-    uint32_t inner_len = pkt_len - ETH_HEADER_SIZE;
-    int wire_eth = crypto_layer2_wire_eth_len();
+    const uint8_t *inner = pkt_data + wire_eth;
+    uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
 
     int idx = pkt_id % FRAG_TABLE_SIZE;
     struct frag_entry *entry = &ft->entries[idx];
@@ -439,7 +434,7 @@ int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
         half1 = app_len - 1;
     uint32_t half2 = app_len - half1;
 
-    uint16_t pkt_id = frag_next_pkt_id(packet_crypto_get_crypto_core());
+    uint16_t pkt_id = frag_next_pkt_id();
 
     const uint8_t *eth_hdr = pkt_data;
     const uint8_t *ip_hdr = pkt_data + 14;
