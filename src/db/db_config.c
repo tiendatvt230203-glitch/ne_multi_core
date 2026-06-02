@@ -53,6 +53,9 @@ static int parse_ipv4_addr(const char *v, uint32_t *out_ip) {
 
 static uint8_t parse_protocol_name(const char *v) {
     if (str_is_any(v)) return POLICY_PROTO_ANY;
+    if (strcasecmp(v, "tcp/udp") == 0) return POLICY_PROTO_TCP_UDP;
+    if (strcasecmp(v, "tcp_udp") == 0) return POLICY_PROTO_TCP_UDP;
+    if (strcasecmp(v, "tcp-udp") == 0) return POLICY_PROTO_TCP_UDP;
     if (strcasecmp(v, "tcp") == 0) return 6;
     if (strcasecmp(v, "udp") == 0) return 17;
     if (strcasecmp(v, "icmp") == 0) return 1;
@@ -406,7 +409,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         "array_to_string(dst_ip, ','), invert_dst_ip, "
         "array_to_string(src_port, ','), "
         "array_to_string(dst_port, ','), "
-        "method::text, encryption_key, nonce "
+        "method::text, encryption_key "
         "FROM ne_policies WHERE profile_id = $1 ORDER BY priority ASC, id ASC",
         1, NULL, params, NULL, NULL, 0);
 
@@ -445,20 +448,17 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         const char *method_txt = method_null ? NULL : PQgetvalue(res, r, 10);
         int enc_null = PQgetisnull(res, r, 11);
         const char *enc_key = enc_null ? NULL : PQgetvalue(res, r, 11);
-        int nonce_null = PQgetisnull(res, r, 12);
-        
+
         if (cp_base.action == POLICY_ACTION_BYPASS) {
             cp_base.crypto_mode = CRYPTO_MODE_GCM;
             cp_base.aes_bits = 128;
-            cp_base.nonce_size = 12;
             memset(cp_base.key, 0, sizeof(cp_base.key));
             cp_base.id = 0;
         } else {
             (void)ne_parse_method(method_txt, method_null, &cp_base.crypto_mode, &cp_base.aes_bits);
             if (cp_base.crypto_mode == CRYPTO_MODE_PQC) {
                 cp_base.aes_bits = 256;
-                cp_base.nonce_size = 12;
-                
+
                 int wire_id = ne_wire_id_for_encrypt_key(
                     key_wire_map, NE_KEY_WIRE_MAP_MAX, wire_id_used,
                     NULL, 0, db_policy_id
@@ -471,11 +471,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 cp_base.id = wire_id;
             }
             else {
-                cp_base.nonce_size = nonce_null ? 12 : atoi(PQgetvalue(res, r, 12));
                 if (cp_base.aes_bits != 256)
                     cp_base.aes_bits = 128;
-                if (cp_base.nonce_size <= 0)
-                    cp_base.nonce_size = 12;
                 int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
                 ne_fill_policy_key(enc_key, enc_null, key_len, cp_base.key);
                 {
@@ -760,7 +757,6 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg) {
     cfg->fake_ethertype_ipv4 = 0;
     cfg->crypto_mode = CRYPTO_MODE_CTR;
     cfg->aes_bits = 128;
-    cfg->nonce_size = 12;
     memset(cfg->crypto_key, 0, sizeof(cfg->crypto_key));
 
     if (cfg->policy_count <= 0)
@@ -797,7 +793,6 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg) {
         const struct crypto_policy *cp = &cfg->policies[first_key_pi];
         cfg->crypto_mode = cp->crypto_mode;
         cfg->aes_bits = (cp->aes_bits == 256) ? 256 : 128;
-        cfg->nonce_size = (cp->nonce_size > 0) ? cp->nonce_size : 12;
         memcpy(cfg->crypto_key, cp->key, sizeof(cfg->crypto_key));
     }
 

@@ -305,7 +305,7 @@ static void l4_write_frag_tag(uint8_t *buf, uint16_t pkt_id, uint8_t frag_index)
     buf[0] = (uint8_t)(pkt_id >> 8);
     buf[1] = (uint8_t)(pkt_id & 0xFF);
     buf[2] = frag_index;
-    buf[3] = packet_crypto_get_crypto_core();
+    buf[3] = 0;
 }
 
 static void l4_read_frag_tag(const uint8_t *buf, uint16_t *pkt_id, uint8_t *frag_index) {

@@ -62,9 +62,9 @@ int crypto_l3_extract_policy_id(const struct app_config *cfg,
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
-        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3 || cp->nonce_size <= 0)
+        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3)
             continue;
-        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
+        const int ns = PACKET_CRYPTO_NONCE_BYTES;
         if (tunnel_off + ns + 1 >= (int)pkt_len)
             continue;
         if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
@@ -78,9 +78,8 @@ int crypto_l3_extract_policy_id(const struct app_config *cfg,
 int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
                                       uint8_t *pkt,
                                       uint32_t pkt_len,
-                                      uint8_t *policy_id_out,
-                                      int *nonce_size_out) {
-    if (!cfg || !pkt || !policy_id_out || !nonce_size_out)
+                                      uint8_t *policy_id_out) {
+    if (!cfg || !pkt || !policy_id_out)
         return -1;
 
     int l3_off = crypto_eth_ipv4_offset(pkt, pkt_len);
@@ -107,9 +106,9 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
-        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4 || cp->nonce_size <= 0)
+        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4)
             continue;
-        int ns = (cp->crypto_mode == CRYPTO_MODE_PQC) ? CRYPTO_PQC_NONCE_BYTES : cp->nonce_size;
+        const int ns = PACKET_CRYPTO_NONCE_BYTES;
         if (tunnel_off + ns + 1 >= (int)pkt_len)
             continue;
         uint8_t magic = pkt[tunnel_off + ns + 1];
@@ -117,7 +116,6 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
             continue;
         if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
             continue;
-        *nonce_size_out = ns;
         *policy_id_out = (uint8_t)cp->id;
         return 0;
     }
@@ -201,8 +199,7 @@ int crypto_decrypt_packet_auto_by_action(
 
 
         uint8_t policy_id = 0;
-        int nonce_size = 0;
-        if (crypto_l4_extract_policy_id_ipv4(cfg, pkt, *pkt_len, &policy_id, &nonce_size) != 0)
+        if (crypto_l4_extract_policy_id_ipv4(cfg, pkt, *pkt_len, &policy_id) != 0)
             return 0;
         int pi = lookup_policy_index(dctx,
                                      dctx->policies, dctx->policy_count,
@@ -210,13 +207,11 @@ int crypto_decrypt_packet_auto_by_action(
                                      POLICY_ACTION_ENCRYPT_L4, policy_id);
         if (pi >= 0 && dctx->per_policy_ready && dctx->per_policy_ready[pi]) {
             const struct crypto_policy *cp = &dctx->policies[pi];
-            if (cp->nonce_size > 0 && cp->nonce_size == nonce_size) {
-                crypto_apply_from_policy(cp);
-                int new_len = crypto_layer4_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
-                if (new_len >= 0 && new_len < (int)*pkt_len) {
-                    *pkt_len = (uint32_t)new_len;
-                    return 0;
-                }
+            crypto_apply_from_policy(cp);
+            int new_len = crypto_layer4_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
+            if (new_len >= 0 && new_len < (int)*pkt_len) {
+                *pkt_len = (uint32_t)new_len;
+                return 0;
             }
         }
 
@@ -227,13 +222,11 @@ int crypto_decrypt_packet_auto_by_action(
                                           POLICY_ACTION_ENCRYPT_L4, policy_id);
             if (ppi >= 0 && dctx->prev_per_policy_ready && dctx->prev_per_policy_ready[ppi]) {
                 const struct crypto_policy *cp_prev = &dctx->prev_policies[ppi];
-                if (cp_prev->nonce_size > 0 && cp_prev->nonce_size == nonce_size) {
-                    crypto_apply_from_policy(cp_prev);
-                    int new_len = crypto_layer4_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
-                    if (new_len >= 0 && new_len < (int)*pkt_len) {
-                        *pkt_len = (uint32_t)new_len;
-                        return 0;
-                    }
+                crypto_apply_from_policy(cp_prev);
+                int new_len = crypto_layer4_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
+                if (new_len >= 0 && new_len < (int)*pkt_len) {
+                    *pkt_len = (uint32_t)new_len;
+                    return 0;
                 }
             }
         }

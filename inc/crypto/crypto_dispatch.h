@@ -33,8 +33,7 @@ int crypto_l3_extract_policy_id(const struct app_config *cfg,
 int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
                                       uint8_t *pkt,
                                       uint32_t pkt_len,
-                                      uint8_t *policy_id_out,
-                                      int *nonce_size_out);
+                                      uint8_t *policy_id_out);
 
 int crypto_decrypt_packet_auto_by_action(
     int crypto_enabled,

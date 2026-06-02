@@ -22,6 +22,8 @@ static const char *policy_action_name(int action) {
 static const char *policy_proto_str(uint8_t proto) {
     if (proto == POLICY_PROTO_ANY)
         return "any";
+    if (proto == POLICY_PROTO_TCP_UDP)
+        return "tcp/udp";
     if (proto == 6)
         return "tcp";
     if (proto == 17)
@@ -182,7 +184,7 @@ static void log_profile_policies(const struct app_config *cfg) {
             }
             else {
                     fprintf(stderr,  
-                    "  policy db_id=%d wire_id=%d prio=%d %s  %s-%u nonce=%d\n"
+                    "  policy db_id=%d wire_id=%d prio=%d %s  %s-%u\n"
                     "    match: %s  src=%s dst=%s  sport=%s dport=%s\n",
                     cp->db_id,
                     cp->id,
@@ -190,7 +192,6 @@ static void log_profile_policies(const struct app_config *cfg) {
                     policy_action_name(cp->action),
                     crypto_mode_str(cp->crypto_mode),
                     (unsigned)cp->aes_bits,
-                    cp->nonce_size,
                     policy_proto_str(cp->protocol),
                     src_c,
                     dst_c,

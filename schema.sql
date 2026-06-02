@@ -12,7 +12,7 @@ DROP FUNCTION IF EXISTS is_valid_ip(text) CASCADE;
 
 CREATE TYPE encryption_action_enum AS ENUM ('L2', 'L3', 'L4', 'bypass');
 
-CREATE TYPE encryption_protocol_enum AS ENUM ('tcp', 'udp', 'icmp', 'ospf');
+CREATE TYPE encryption_protocol_enum AS ENUM ('tcp', 'udp', 'tcp/udp', 'icmp', 'ospf');
 
 CREATE TYPE encryption_method_enum AS ENUM (
     'aes-gcm-128',
@@ -71,7 +71,6 @@ CREATE TABLE ne_policies (
     dst_port        TEXT[]          NULL,
     method          encryption_method_enum   NULL,
     encryption_key  VARCHAR(512)    NULL,
-    nonce           INT             NULL CHECK (nonce IN (4, 8, 12, 16)),
     created_at      TIMESTAMP       NOT NULL DEFAULT NOW(),
     created_by      VARCHAR(100)    NULL,
     updated_at      TIMESTAMP       NULL,

@@ -321,8 +321,12 @@ static int crypto_policy_match_packet(const struct crypto_policy *cp,
     }
 #endif
 
-    if (cp->protocol != POLICY_PROTO_ANY && cp->protocol != protocol)
+    if (cp->protocol == POLICY_PROTO_TCP_UDP) {
+        if (protocol != 6 && protocol != 17)
+            return 0;
+    } else if (cp->protocol != POLICY_PROTO_ANY && cp->protocol != protocol) {
         return 0;
+    }
 
     return 1;
 }

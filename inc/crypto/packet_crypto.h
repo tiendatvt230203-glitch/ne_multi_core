@@ -9,7 +9,8 @@
 #define AES128_IV_SIZE        16
 #define AES_GCM_TAG_SIZE      16
 #define ETH_HEADER_SIZE       14
-#define CRYPTO_PQC_NONCE_BYTES 12
+#define PACKET_CRYPTO_NONCE_BYTES 12
+#define CRYPTO_PQC_NONCE_BYTES PACKET_CRYPTO_NONCE_BYTES
 
 #define PROTO_FLAG_IPV4  0
 
@@ -44,6 +45,10 @@ void packet_crypto_reset_counter(void);
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot);
 
+int packet_encrypt(struct packet_crypto_ctx *ctx,
+                   uint8_t *packet,
+                   size_t pkt_len);
+
 int packet_decrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,
                    size_t pkt_len);
@@ -60,9 +65,6 @@ uint8_t packet_crypto_get_fake_protocol(void);
 void packet_crypto_set_policy_id(uint8_t policy_id);
 uint8_t packet_crypto_get_policy_id(void);
 
-void packet_crypto_set_crypto_core(uint8_t core);
-uint8_t packet_crypto_get_crypto_core(void);
-
 
 int packet_crypto_get_tunnel_hdr_size(void);
 
@@ -78,8 +80,10 @@ void packet_crypto_set_encrypt_layer(int layer);
 void packet_crypto_set_mode(int mode);
 int  packet_crypto_get_mode(void);
 
-void packet_crypto_set_nonce_size(int size);
-int  packet_crypto_get_nonce_size(void);
+static inline int packet_crypto_get_nonce_size(void)
+{
+    return PACKET_CRYPTO_NONCE_BYTES;
+}
 
 void packet_crypto_set_aes_bits(int bits);
 int  packet_crypto_get_aes_bits(void);
@@ -108,6 +112,8 @@ void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
                           int nonce_size, uint8_t policy_id);
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag);
+
+void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len);
 
 uint16_t crypto_calc_ip_checksum(const uint8_t *ip_hdr, int hdr_len);
 

@@ -28,6 +28,7 @@
 #define MAX_PROFILE_INTERFACES 16
 #define MAX_CRYPTO_POLICIES 128
 #define POLICY_PROTO_ANY 0
+#define POLICY_PROTO_TCP_UDP 254
 
 #ifndef CRYPTO_POLICY_MATCH_IP_ONLY
 #define CRYPTO_POLICY_MATCH_IP_ONLY 0
@@ -60,7 +61,6 @@ struct crypto_policy {
     uint32_t dst_mask;
     int crypto_mode;
     int aes_bits;
-    int nonce_size;
     uint8_t key[AES_KEY_LEN];
 };
 
@@ -135,7 +135,6 @@ struct app_config {
     uint16_t fake_ethertype_ipv4;
     uint8_t fake_protocol;
     int crypto_mode;
-    int nonce_size;
     int aes_bits;
     struct profile_config profiles[MAX_PROFILES];
     int profile_count;

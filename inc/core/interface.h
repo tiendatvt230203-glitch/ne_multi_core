@@ -9,14 +9,10 @@
 #define NE_RING        8192u
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
-#define NE_BATCH_SIZE    128u
-#define NE_IO_IDLE_SPIN  4096u
-#define NE_CPU_LOC          0u
-#define NE_CPU_CRYPTO0      2u
-#define NE_CPU_CRYPTO1      3u
-#define NE_CPU_WAN          11u
-#define NE_CRYPTO_WORKERS      2u
-#define NE_CRYPTO_CORE_MASK    (NE_CRYPTO_WORKERS - 1u) /* workers must be power of 2 */
+#define NE_BATCH_SIZE  64u
+#define NE_CPU_LOC     0u
+#define NE_CPU_MID     3u
+#define NE_CPU_WAN     11u
 
 struct bpf_object;
 
@@ -67,21 +63,12 @@ enum ne_packet_dir {
     NE_DIR_WAN = 1,
 };
 
-enum ne_packet_op {
-    NE_OP_NONE = 0,
-    NE_OP_ENCRYPT_LOCAL = 1,
-    NE_OP_DECRYPT_WAN = 2,
-};
-
 struct ne_packet {
     uint64_t addr;
     uint32_t len;
     uint8_t dir;
     uint8_t wan_idx;
     uint8_t local_idx;
-    uint8_t crypto_core;
-    uint8_t policy_pi;
-    uint8_t op;
 };
 
 struct ne_ring {
@@ -142,8 +129,6 @@ struct ne_pair {
 int ne_ring_init(struct ne_ring *r, uint32_t cap);
 void ne_ring_destroy(struct ne_ring *r);
 int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt);
-int ne_ring_try_push_burst(struct ne_ring *r, const struct ne_packet *pkts,
-                           uint32_t n, uint32_t *pushed_out);
 int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt);
 uint32_t ne_ring_count(const struct ne_ring *r);
 

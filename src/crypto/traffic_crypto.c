@@ -177,15 +177,15 @@ int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len,
     scrypt_CipherSetTagSize(ctx, TAG_SIZE_GCM);
 
     // Optional AAD - Must be 64-byte aligned for hardware acceleration to process it
-    if (aad && aad_len > 0) {
-        byte aligned_aad[256] __attribute__((aligned(64)));
-        if (aad_len > (int)sizeof(aligned_aad)) goto err;
-        memcpy(aligned_aad, aad, aad_len);
-        if ((ret = scrypt_CipherUpdateAAD(ctx, aligned_aad, (word32)aad_len)) != 0) {
-            fprintf(stderr, "[GCM-ENC] AAD Update failed: %d\n", ret);
-            goto err;
-        }
-    }
+    // if (aad && aad_len > 0) {
+    //     byte aligned_aad[256] __attribute__((aligned(64)));
+    //     if (aad_len > (int)sizeof(aligned_aad)) goto err;
+    //     memcpy(aligned_aad, aad, aad_len);
+    //     if ((ret = scrypt_CipherUpdateAAD(ctx, aligned_aad, (word32)aad_len)) != 0) {
+    //         fprintf(stderr, "[GCM-ENC] AAD Update failed: %d\n", ret);
+    //         goto err;
+    //     }
+    // }
 
     word32 outLen = 0, finalLen = 0;
     if ((ret = scrypt_CipherUpdate(ctx, data, len, data, &outLen)) != 0) {
@@ -242,12 +242,12 @@ int trf_decrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len,
     if (scrypt_CipherSetTag(ctx, tag, TAG_SIZE_GCM) != 0) goto err;
 
     // 1. Process AAD (Network Header) - Align to 64-byte for hardware acceleration
-    if (aad && aad_len > 0) {
-        byte aligned_aad[256] __attribute__((aligned(64)));
-        if (aad_len > (int)sizeof(aligned_aad)) goto err;
-        memcpy(aligned_aad, aad, aad_len);
-        if (scrypt_CipherUpdateAAD(ctx, aligned_aad, (word32)aad_len) != 0) goto err;
-    }
+    // if (aad && aad_len > 0) {
+    //     byte aligned_aad[256] __attribute__((aligned(64)));
+    //     if (aad_len > (int)sizeof(aligned_aad)) goto err;
+    //     memcpy(aligned_aad, aad, aad_len);
+    //     if (scrypt_CipherUpdateAAD(ctx, aligned_aad, (word32)aad_len) != 0) goto err;
+    // }
 
     // 3. Process Ciphertext
     word32 outLen = 0, finalLen = 0;

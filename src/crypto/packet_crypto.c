@@ -8,7 +8,6 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
-#include <openssl/crypto.h>
 #include <stdatomic.h>
 #include "../../inc/crypto/pqc_handshake.h"
 static uint16_t g_fake_ethertype_ipv4 = 0;
@@ -16,12 +15,10 @@ static __thread uint8_t g_fake_protocol = 99;
 static int g_encrypt_layer = 0;
 
 static __thread int g_crypto_mode = 0;
-static __thread int g_nonce_size = 12;
 static __thread int g_aes_bits = 128;
 
 
 static __thread uint8_t g_policy_id = 0;
-static __thread uint8_t g_crypto_core = 0;
 
 static atomic_uint_fast32_t g_nonce_counter = 0;
 
@@ -36,6 +33,8 @@ static __thread int tls_cached_nonce_len = 0;
 static __thread uint8_t tls_dec_cached_key[AES_MAX_KEY_SIZE];
 static __thread int tls_dec_key_cached = 0;
 static __thread int tls_dec_cached_nonce_len = 0;
+static __thread uint8_t tls_ctr_cached_key[AES_MAX_KEY_SIZE];
+static __thread int tls_ctr_key_cached = 0;
 
 const uint8_t g_pqc_test_aad[12] = {
     0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f, 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xd1
@@ -73,7 +72,7 @@ static EVP_CIPHER_CTX *get_gcm_dec_ctx(void) {
 }
 
 int packet_crypto_get_tunnel_hdr_size(void) {
-    return g_nonce_size + 2;
+    return PACKET_CRYPTO_NONCE_BYTES + 2;
 }
 
 void crypto_write_l3_tunnel_header(uint8_t *buf, const uint8_t *nonce,
@@ -104,19 +103,9 @@ void packet_crypto_set_encrypt_layer(int layer) { g_encrypt_layer = layer; }
 
 void packet_crypto_set_mode(int mode) {
     g_crypto_mode = mode;
-    if (mode == CRYPTO_MODE_PQC)
-        g_nonce_size = CRYPTO_PQC_NONCE_BYTES;
 }
 
 int packet_crypto_get_mode(void) { return g_crypto_mode; }
-
-void packet_crypto_set_nonce_size(int size) {
-    if (g_crypto_mode == CRYPTO_MODE_PQC)
-        g_nonce_size = CRYPTO_PQC_NONCE_BYTES;
-    else
-        g_nonce_size = size > 0 ? size : 12;
-}
-int  packet_crypto_get_nonce_size(void) { return g_nonce_size; }
 
 void packet_crypto_set_aes_bits(int bits) { g_aes_bits = bits; }
 int  packet_crypto_get_aes_bits(void) { return g_aes_bits; }
@@ -131,50 +120,6 @@ static const EVP_CIPHER *get_gcm_cipher(void) {
 
 static int get_key_size(void) {
     return (g_aes_bits == 256) ? 32 : 16;
-}
-
-static int gcm_ctx_prepare(EVP_CIPHER_CTX *evp, int encrypt,
-                           const uint8_t key[AES_MAX_KEY_SIZE], int key_size,
-                           const uint8_t *nonce, int nonce_len,
-                           uint8_t *cached_key, int *key_cached, int *cached_nonce_len) {
-    int key_changed = !*key_cached ||
-                      memcmp(cached_key, key, (size_t)key_size) != 0 ||
-                      *cached_nonce_len != nonce_len;
-
-    if (__builtin_expect(key_changed, 0)) {
-        if (EVP_CIPHER_CTX_reset(evp) != 1)
-            return -1;
-
-        if (encrypt) {
-            if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
-                return -1;
-            if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
-                return -1;
-            if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
-                return -1;
-        } else {
-            if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
-                return -1;
-            if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
-                return -1;
-            if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
-                return -1;
-        }
-
-        memcpy(cached_key, key, (size_t)key_size);
-        *key_cached = 1;
-        *cached_nonce_len = nonce_len;
-        return 0;
-    }
-
-    if (encrypt) {
-        if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
-            return -1;
-    } else {
-        if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
-            return -1;
-    }
-    return 0;
 }
 
 uint32_t packet_crypto_next_counter(void) {
@@ -323,8 +268,10 @@ void packet_crypto_cleanup(struct packet_crypto_ctx *ctx) {
 
     memset(tls_cached_key, 0, sizeof(tls_cached_key));
     memset(tls_dec_cached_key, 0, sizeof(tls_dec_cached_key));
+    memset(tls_ctr_cached_key, 0, sizeof(tls_ctr_cached_key));
     tls_key_cached = 0;
     tls_dec_key_cached = 0;
+    tls_ctr_key_cached = 0;
 }
 
 int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
@@ -336,9 +283,19 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
     if (!evp) return -1;
 
     int out_len;
+    int key_size = get_key_size();
+    int key_changed = !tls_ctr_key_cached ||
+                      memcmp(tls_ctr_cached_key, key, key_size) != 0;
 
-    if (EVP_EncryptInit_ex(evp, get_ctr_cipher(), NULL, key, iv) != 1)
-        return -1;
+    if (key_changed) {
+        if (EVP_EncryptInit_ex(evp, get_ctr_cipher(), NULL, key, iv) != 1)
+            return -1;
+        memcpy(tls_ctr_cached_key, key, key_size);
+        tls_ctr_key_cached = 1;
+    } else {
+        if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, iv) != 1)
+            return -1;
+    }
 
     if (EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1)
         return -1;
@@ -353,28 +310,46 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
-    if (__builtin_expect(len <= 0, 0))
-        return 0;
+    if (__builtin_expect(len <= 0, 0)) return 0;
 
     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
-    if (__builtin_expect(!evp, 0))
-        return -1;
+    if (__builtin_expect(!evp, 0)) return -1;
 
-    const int key_size = get_key_size();
-    if (gcm_ctx_prepare(evp, 1, key, key_size, nonce, nonce_len,
-                        tls_cached_key, &tls_key_cached, &tls_cached_nonce_len) != 0)
-        return -1;
+    int out_len;
+    int key_size = get_key_size();
 
-    int out_len = 0;
+
+    int key_changed = !tls_key_cached ||
+                      memcmp(tls_cached_key, key, key_size) != 0 ||
+                      tls_cached_nonce_len != nonce_len;
+
+    if (__builtin_expect(key_changed, 0)) {
+
+        if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+            return -1;
+
+        if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+            return -1;
+
+        if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
+            return -1;
+
+        memcpy(tls_cached_key, key, key_size);
+        tls_key_cached = 1;
+        tls_cached_nonce_len = nonce_len;
+    } else {
+
+        if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
+            return -1;
+    }
+
     if (__builtin_expect(EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1, 0))
         return -1;
 
-    int final_len = 0;
-    if (__builtin_expect(EVP_EncryptFinal_ex(evp, data + out_len, &final_len) != 1, 0))
+    if (__builtin_expect(EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
         return -1;
 
-    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE,
-                                             tag_out) != 1, 0))
+    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1, 0))
         return -1;
 
     return 0;
@@ -384,19 +359,39 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
-    if (__builtin_expect(len <= 0, 0))
-        return 0;
+    if (__builtin_expect(len <= 0, 0)) return 0;
 
     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
-    if (__builtin_expect(!evp, 0))
-        return -1;
+    if (__builtin_expect(!evp, 0)) return -1;
 
-    const int key_size = get_key_size();
-    if (gcm_ctx_prepare(evp, 0, key, key_size, nonce, nonce_len,
-                        tls_dec_cached_key, &tls_dec_key_cached, &tls_dec_cached_nonce_len) != 0)
-        return -1;
+    int out_len;
+    int key_size = get_key_size();
 
-    int out_len = 0;
+
+    int key_changed = !tls_dec_key_cached ||
+                      memcmp(tls_dec_cached_key, key, key_size) != 0 ||
+                      tls_dec_cached_nonce_len != nonce_len;
+
+    if (__builtin_expect(key_changed, 0)) {
+
+        if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+            return -1;
+
+        if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+            return -1;
+
+        if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
+            return -1;
+
+        memcpy(tls_dec_cached_key, key, key_size);
+        tls_dec_key_cached = 1;
+        tls_dec_cached_nonce_len = nonce_len;
+    } else {
+
+        if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
+            return -1;
+    }
+
     if (__builtin_expect(EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1, 0))
         return -1;
 
@@ -404,12 +399,8 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                                              (void *)tag) != 1, 0))
         return -1;
 
-    int final_len = 0;
-    uint8_t final_buf[16];
-    if (__builtin_expect(EVP_DecryptFinal_ex(evp, final_buf, &final_len) != 1, 0)) {
-        OPENSSL_cleanse(data, (size_t)len);
+    if (__builtin_expect(EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
         return -1;
-    }
 
     return 0;
 }
@@ -420,28 +411,19 @@ static __thread int tls_salt_initialized = 0;
 
 void crypto_generate_nonce(uint32_t counter, uint8_t proto_flag,
                            uint8_t *out_nonce, int *out_nonce_len) {
-    const int ns = g_nonce_size;
-
+    const int ns = PACKET_CRYPTO_NONCE_BYTES;
 
     out_nonce[0] = (proto_flag << 7) | ((counter >> 24) & 0x7F);
     out_nonce[1] = (counter >> 16) & 0xFF;
     out_nonce[2] = (counter >> 8) & 0xFF;
     out_nonce[3] = counter & 0xFF;
 
-
-    if (ns > 4) {
-        if (__builtin_expect(!tls_salt_initialized, 0)) {
-            RAND_bytes(tls_nonce_salt, sizeof(tls_nonce_salt));
-            tls_salt_initialized = 1;
-        }
-        memcpy(out_nonce + 4, tls_nonce_salt, ns - 4);
+    if (__builtin_expect(!tls_salt_initialized, 0)) {
+        RAND_bytes(tls_nonce_salt, sizeof(tls_nonce_salt));
+        tls_salt_initialized = 1;
     }
-
-    if (g_crypto_mode == CRYPTO_MODE_CTR) {
-        *out_nonce_len = 16;
-    } else {
-        *out_nonce_len = ns;
-    }
+    memcpy(out_nonce + 4, tls_nonce_salt, ns - 4);
+    *out_nonce_len = ns;
 }
 
 void crypto_nonce_to_iv(const uint8_t *nonce, int nonce_size,
@@ -457,15 +439,14 @@ void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
     packet[12] = (uint8_t)(fake >> 8);
     packet[13] = (uint8_t)(fake & 0xFF);
     packet[CRYPTO_L2_POLICY_OFF] = policy_id;
-    packet[CRYPTO_L2_CORE_OFF] = packet_crypto_get_crypto_core();
-    memcpy(packet + CRYPTO_L2_NONCE_OFF, nonce, nonce_size);
+    memcpy(packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce, nonce_size);
 }
 
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag) {
     if (policy_id)
         *policy_id = packet[CRYPTO_L2_POLICY_OFF];
-    memcpy(nonce_out, packet + CRYPTO_L2_NONCE_OFF, nonce_size);
+    memcpy(nonce_out, packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce_size);
     if (proto_flag)
         *proto_flag = nonce_out[0] >> 7;
 }
@@ -539,6 +520,28 @@ uint16_t crypto_calc_udp_checksum(const uint8_t *ip_hdr, int ip_hdr_len,
     return (uint16_t)(~sum);
 }
 
+void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len) {
+    (void)pkt_len;
+    packet[12] = 0x08;
+    packet[13] = 0x00;
+}
+
+int packet_encrypt(struct packet_crypto_ctx *ctx,
+                   uint8_t *packet,
+                   size_t pkt_len) {
+    packet_crypto_update_keys(ctx);
+
+    switch (g_encrypt_layer) {
+    case 2:
+        return crypto_layer2_encrypt(ctx, packet, pkt_len);
+    case 3:
+        return crypto_layer3_encrypt(ctx, packet, pkt_len);
+    case 4:
+        return crypto_layer4_encrypt(ctx, packet, pkt_len);
+    default:
+        return -1;
+    }
+}
 
 int packet_decrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,
@@ -562,6 +565,3 @@ uint8_t packet_crypto_get_fake_protocol(void) { return g_fake_protocol; }
 
 void packet_crypto_set_policy_id(uint8_t policy_id) { g_policy_id = policy_id; }
 uint8_t packet_crypto_get_policy_id(void) { return g_policy_id; }
-
-void packet_crypto_set_crypto_core(uint8_t core) { g_crypto_core = core; }
-uint8_t packet_crypto_get_crypto_core(void) { return g_crypto_core; }

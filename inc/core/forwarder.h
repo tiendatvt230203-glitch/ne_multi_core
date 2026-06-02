@@ -16,12 +16,11 @@ struct forwarder {
     struct ne_pair pair;
     struct ne_ring local_to_mid;
     struct ne_ring wan_to_mid;
-    struct ne_ring dispatch_to_crypto[NE_CRYPTO_WORKERS];
     struct ne_ring mid_to_wan[MAX_INTERFACES];
     struct ne_ring mid_to_local[MAX_INTERFACES];
 
     pthread_t local_thread;
-    pthread_t crypto_thread[NE_CRYPTO_WORKERS];
+    pthread_t mid_thread;
     pthread_t wan_thread;
     int threads_started;
 
