@@ -237,8 +237,27 @@ void main_diag_log_db_apply(const struct app_config *cfg, int trigger_profile_id
     fflush(stderr);
 }
 
+void main_diag_log_db_policy_apply(const struct app_config *cfg, int trigger_profile_id,
+                                   const struct app_config *prev_cfg) {
+    if (!cfg)
+        return;
+
+    fprintf(stderr,
+            "\n[DB] profile %d — policy update from Postgres (LAN client MAC is runtime/FDB, not DB)\n",
+            trigger_profile_id);
+    if (prev_cfg) {
+        fprintf(stderr, "  policies %d -> %d (LAN/WAN ifaces unchanged)\n",
+                prev_cfg->policy_count, cfg->policy_count);
+    }
+    fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
+            cfg->profile_count, cfg->policy_count);
+    print_policy_table(cfg);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id,
-                                  int is_reload) {
+                                  int is_reload, int policy_only) {
     if (!cfg)
         return;
 
@@ -251,7 +270,8 @@ void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id
     }
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
-    print_iface_table(cfg);
+    if (!policy_only)
+        print_iface_table(cfg);
     print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);

@@ -1267,31 +1267,15 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     return 0;
 }
 
+/*
+ * Hot reload (same LAN/WAN ifnames): Postgres policies/crypto only.
+ * LAN client MAC is NOT loaded from DB — bridge_mac_watch + fwd->locals stay as-is.
+ */
 static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg)
 {
-    bridge_mac_watch_stop();
-    (void)bridge_mac_prepare(cfg);
     if (forwarder_should_stop())
         return -1;
     fwd->cfg = cfg;
-    fwd->local_count = cfg->local_count;
-    fwd->wan_count = config_count_dataplane_wans(cfg);
-    if (fwd->local_count > MAX_INTERFACES)
-        fwd->local_count = MAX_INTERFACES;
-    if (fwd->wan_count > MAX_INTERFACES)
-        fwd->wan_count = MAX_INTERFACES;
-    for (int di = 0; di < fwd->wan_count; di++) {
-        int ci = config_wan_dp_to_cfg(cfg, di);
-        if (ci < 0) {
-            fprintf(stderr, "[RELOAD] invalid dataplane WAN map slot=%d\n", di);
-            return -1;
-        }
-        fwd->wan_cfg_idx[di] = ci;
-        init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
-                        cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
-    }
-    (void)bridge_mac_install(fwd);
-    bridge_mac_watch_start(fwd);
     if (ensure_profile_runtime_slots(cfg) != 0) {
         fprintf(stderr, "[RELOAD] ensure_profile_runtime_slots failed\n");
         return -1;
@@ -1337,20 +1321,36 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     atomic_store_explicit(&reload_done, 0, memory_order_release);
     atomic_store_explicit(&reload_pending, 1, memory_order_release);
 
+    struct timespec deadline;
+    int have_deadline = 0;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
+        deadline.tv_sec += 60;
+        have_deadline = 1;
+    }
+
     while (!atomic_load_explicit(&reload_done, memory_order_acquire) &&
            !forwarder_should_stop()) {
         struct timespec ts;
-        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        if (have_deadline) {
+            ts = deadline;
+        } else if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
             pthread_cond_wait(&reload_wait_cv, &reload_wait_mtx);
             continue;
-        }
-        ts.tv_nsec += 200000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
+        } else {
+            ts.tv_nsec += 200000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000L;
+            }
         }
         int wr = pthread_cond_timedwait(&reload_wait_cv, &reload_wait_mtx, &ts);
-        (void)wr;
+        if (have_deadline && wr == ETIMEDOUT) {
+            fprintf(stderr,
+                    "[RELOAD] timed out waiting for mid core (60s) — cancel pending reload\n");
+            fflush(stderr);
+            atomic_store_explicit(&reload_pending, 0, memory_order_release);
+            break;
+        }
     }
 
     int rc = reload_rc;
@@ -1360,6 +1360,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     if (!atomic_load_explicit(&reload_done, memory_order_acquire)) {
         fprintf(stderr, "[RELOAD] mid core did not finish reload (timeout/busy)\n");
+        fflush(stderr);
         return -1;
     }
     if (rc != 0)

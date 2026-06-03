@@ -437,6 +437,30 @@ static int config_db_unchanged(const struct app_config *old,
     return 1;
 }
 
+/* LAN/WAN rows from Postgres unchanged (client MAC is not stored in DB). */
+static int lan_wan_db_unchanged(const struct app_config *old,
+                                const struct app_config *new)
+{
+    if (!old || !new)
+        return 0;
+    if (old->local_count != new->local_count ||
+        old->wan_count != new->wan_count)
+        return 0;
+
+    for (int i = 0; i < old->local_count; i++) {
+        const struct local_config *nl =
+            local_by_ifname(new, old->locals[i].ifname);
+        if (!nl || !local_db_equal(&old->locals[i], nl))
+            return 0;
+    }
+    for (int i = 0; i < old->wan_count; i++) {
+        const struct wan_config *nw = wan_by_ifname(new, old->wans[i].ifname);
+        if (!nw || !wan_db_equal(&old->wans[i], nw))
+            return 0;
+    }
+    return 1;
+}
+
 static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                                 int active_id_count, int trigger_id,
                                 int after_delete) {
@@ -492,10 +516,20 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         return 0;
     }
 
-    main_diag_log_db_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
+    int policy_only = lan_wan_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot]);
+    if (policy_only)
+        main_diag_log_db_policy_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
+    else
+        main_diag_log_db_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
 
-    fprintf(stderr, "[RELOAD] profile %d — pushing config to dataplane...\n",
-            trigger_id);
+    if (policy_only) {
+        fprintf(stderr,
+                "[RELOAD] profile %d — policies/crypto only (LAN MAC via FDB, not DB)\n",
+                trigger_id);
+    } else {
+        fprintf(stderr, "[RELOAD] profile %d — pushing config to dataplane...\n",
+                trigger_id);
+    }
     fflush(stderr);
 
     if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
@@ -505,7 +539,8 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         for (int i = 0; i < active_id_count; i++)
             fprintf(stderr, " %d", active_ids[i]);
         fprintf(stderr, "\n");
-        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1);
+        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1,
+                                     policy_only);
         fflush(stderr);
         return 0;
     }
@@ -520,7 +555,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
         return -1;
     fprintf(stderr, "[RELOAD] OK profile %d — applied (full restart)\n", trigger_id);
-    main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1);
+    main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
     fflush(stderr);
     return 0;
 }

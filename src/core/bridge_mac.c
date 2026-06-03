@@ -123,6 +123,10 @@ static int mac_load_once_from_bridge_cmd(struct app_config *cfg, int li) {
     return loaded;
 }
 
+/*
+ * LAN client MAC: learned at runtime from bridge FDB (netlink watch).
+ * Not loaded from Postgres. bridge_mac_prepare() runs once at dataplane init only.
+ */
 static int bridge_mac_prepare_impl(struct app_config *cfg) {
     if (!cfg || cfg->local_count <= 0)
         return 0;
