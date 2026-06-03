@@ -26,6 +26,7 @@ static struct forwarder *g_active_fwd;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static atomic_int reload_pending;
+static atomic_int reload_done;
 static struct forwarder *reload_fwd;
 static struct app_config *reload_cfg;
 static int reload_rc;
@@ -1144,8 +1145,10 @@ static void *middle_core_thread(void *arg)
             pthread_mutex_unlock(&runtime_lock);
             break;
         }
-        if (atomic_exchange_explicit(&reload_pending, 0, memory_order_acq_rel) == 1) {
+        if (atomic_load_explicit(&reload_pending, memory_order_acquire)) {
             reload_rc = forwarder_reload_config_impl(reload_fwd, reload_cfg);
+            atomic_store_explicit(&reload_pending, 0, memory_order_release);
+            atomic_store_explicit(&reload_done, 1, memory_order_release);
             pthread_mutex_lock(&reload_wait_mtx);
             pthread_cond_broadcast(&reload_wait_cv);
             pthread_mutex_unlock(&reload_wait_mtx);
@@ -1293,8 +1296,10 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
         fprintf(stderr, "[RELOAD] ensure_profile_runtime_slots failed\n");
         return -1;
     }
-    if (forwarder_should_stop())
+    if (forwarder_should_stop()) {
+        fprintf(stderr, "[RELOAD] aborted before crypto rebuild (stop requested)\n");
         return -1;
+    }
     snapshot_active_to_prev();
     int rc = rebuild_crypto_runtime(cfg);
     if (rc != 0)
@@ -1329,9 +1334,10 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     reload_fwd = fwd;
     reload_cfg = cfg;
     reload_rc = -1;
+    atomic_store_explicit(&reload_done, 0, memory_order_release);
     atomic_store_explicit(&reload_pending, 1, memory_order_release);
 
-    while (atomic_load_explicit(&reload_pending, memory_order_acquire) &&
+    while (!atomic_load_explicit(&reload_done, memory_order_acquire) &&
            !forwarder_should_stop()) {
         struct timespec ts;
         if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
@@ -1352,8 +1358,8 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
 
     if (forwarder_should_stop())
         return -1;
-    if (atomic_load_explicit(&reload_pending, memory_order_acquire)) {
-        fprintf(stderr, "[RELOAD] mid core did not apply reload (still busy?)\n");
+    if (!atomic_load_explicit(&reload_done, memory_order_acquire)) {
+        fprintf(stderr, "[RELOAD] mid core did not finish reload (timeout/busy)\n");
         return -1;
     }
     if (rc != 0)
@@ -1421,12 +1427,12 @@ void forwarder_stop(void)
 
 void forwarder_shutdown_resources(void)
 {
-    if (atomic_exchange_explicit(&reload_pending, 0, memory_order_acq_rel) == 1) {
-        pthread_mutex_lock(&reload_wait_mtx);
-        reload_rc = -1;
-        pthread_cond_broadcast(&reload_wait_cv);
-        pthread_mutex_unlock(&reload_wait_mtx);
-    }
+    atomic_store_explicit(&reload_pending, 0, memory_order_release);
+    atomic_store_explicit(&reload_done, 1, memory_order_release);
+    pthread_mutex_lock(&reload_wait_mtx);
+    reload_rc = -1;
+    pthread_cond_broadcast(&reload_wait_cv);
+    pthread_mutex_unlock(&reload_wait_mtx);
     bridge_mac_watch_stop();
     if (g_active_fwd && g_active_fwd->cfg)
         interface_xdp_detach_all_from_config(g_active_fwd->cfg);
