@@ -201,7 +201,6 @@ static void *forwarder_thread_main(void *arg) {
         rt->running = 0;
         return NULL;
     }
-    main_diag_log_dataplane_ready(&rt->cfg_slots[rt->active_slot]);
     if (forwarder_should_stop()) {
         forwarder_cleanup(&rt->fwd);
         rt->running = 0;
@@ -263,7 +262,8 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1);
         return 0;
     }
-    fprintf(stderr, "[RELOAD] in-place reload failed, restarting dataplane with new topology/config\n");
+    fprintf(stderr,
+            "[RELOAD] hot reload failed (see lines above); full dataplane restart\n");
     if (runtime_stop_forwarder(rt) != 0)
         return -1;
     if (g_stop_requested)

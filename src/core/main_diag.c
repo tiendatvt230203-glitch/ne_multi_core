@@ -4,7 +4,9 @@
 
 #include "../../inc/core/config.h"
 
-#define DIAG_TBL_N  12
+#define DIAG_TBL_N     12
+/* "!" + "255.255.255.255/32" + NUL */
+#define DIAG_CIDR_LEN  24
 
 static void fmt_mac(char *out, size_t outsz, const uint8_t mac[6]) {
     int zero = !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]);
@@ -64,10 +66,19 @@ static int ipv4_netmask_to_prefix(uint32_t mask_be) {
 static void ipv4_format_cidr(char *out, size_t outsz, uint32_t net_be, uint32_t mask_be) {
     char ip[INET_ADDRSTRLEN];
     struct in_addr a = { .s_addr = net_be };
-    if (!inet_ntop(AF_INET, &a, ip, sizeof(ip)))
+    int prefix = ipv4_netmask_to_prefix(mask_be);
+
+    if (prefix < 0)
+        prefix = 0;
+    else if (prefix > 32)
+        prefix = 32;
+
+    if (!inet_ntop(AF_INET, &a, ip, sizeof(ip))) {
         snprintf(out, outsz, "?");
-    else
-        snprintf(out, outsz, "%s/%d", ip, ipv4_netmask_to_prefix(mask_be));
+        return;
+    }
+    snprintf(out, outsz, "%.*s/%d",
+             outsz > 5 ? (int)outsz - 5 : 0, ip, prefix);
 }
 
 static void policy_port_str(char *out, size_t outsz, int from, int to) {
@@ -85,12 +96,12 @@ static void policy_cidr_field(char *out, size_t outsz, int any, int negate,
         snprintf(out, outsz, "*");
         return;
     }
-    char cidr[48];
+    char cidr[DIAG_CIDR_LEN];
     ipv4_format_cidr(cidr, sizeof(cidr), net_be, mask_be);
     if (negate)
-        snprintf(out, outsz, "!%s", cidr);
+        snprintf(out, outsz, "!%.*s", (int)(outsz > 2 ? outsz - 2 : 0), cidr);
     else
-        snprintf(out, outsz, "%s", cidr);
+        snprintf(out, outsz, "%.*s", (int)(outsz > 1 ? outsz - 1 : 0), cidr);
 }
 
 static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_t outsz) {
@@ -165,8 +176,8 @@ static void print_policy_table(const struct app_config *cfg) {
                 continue;
             const struct crypto_policy *cp = &cfg->policies[pix];
             char c0[8], c1[8], c2[8], c3[12], c4[8], c5[12];
-            char c6[20], c7[20], c8[12], c9[12];
-            char src_c[48], dst_c[48];
+            char c8[12], c9[12];
+            char src_c[DIAG_CIDR_LEN], dst_c[DIAG_CIDR_LEN];
 
             snprintf(c0, sizeof(c0), "%d", cp->db_id);
             snprintf(c1, sizeof(c1), "%d", cp->id);
@@ -178,13 +189,11 @@ static void print_policy_table(const struct app_config *cfg) {
                               cp->src_net, cp->src_mask);
             policy_cidr_field(dst_c, sizeof(dst_c), cp->dst_any, cp->dst_negate,
                               cp->dst_net, cp->dst_mask);
-            snprintf(c6, sizeof(c6), "%s", src_c);
-            snprintf(c7, sizeof(c7), "%s", dst_c);
             policy_port_str(c8, sizeof(c8), cp->src_port_from, cp->src_port_to);
             policy_port_str(c9, sizeof(c9), cp->dst_port_from, cp->dst_port_to);
 
             const char *row[DIAG_TBL_N] = {
-                c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, "", ""
+                c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, "", ""
             };
             tbl_row(w, 10, row);
         }

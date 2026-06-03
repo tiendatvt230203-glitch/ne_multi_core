@@ -1,6 +1,7 @@
 #include "../../inc/core/forwarder.h"
 
 #include "../../inc/core/bridge_mac.h"
+#include "../../inc/core/main_diag.h"
 #include "../../inc/core/fragment.h"
 #include "../../inc/crypto/crypto_dispatch.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -32,6 +33,19 @@ static pthread_mutex_t reload_wait_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t reload_wait_cv = PTHREAD_COND_INITIALIZER;
 
 static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg);
+
+static int wait_dataplane_workers(struct forwarder *fwd)
+{
+    for (int i = 0; i < 500; i++) {
+        if (fwd && fwd->threads_started)
+            return 0;
+        if (forwarder_should_stop())
+            return -1;
+        usleep(10000);
+    }
+    fprintf(stderr, "[RELOAD] dataplane workers not ready yet (still starting)\n");
+    return -1;
+}
 
 static struct packet_crypto_ctx base_crypto_ctx;
 static struct packet_crypto_ctx policy_crypto_ctx[MAX_CRYPTO_POLICIES];
@@ -1265,20 +1279,26 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
         fwd->wan_count = MAX_INTERFACES;
     for (int di = 0; di < fwd->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
-        if (ci < 0)
+        if (ci < 0) {
+            fprintf(stderr, "[RELOAD] invalid dataplane WAN map slot=%d\n", di);
             return -1;
+        }
         fwd->wan_cfg_idx[di] = ci;
         init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
                         cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
     }
     (void)bridge_mac_install(fwd);
     bridge_mac_watch_start(fwd);
-    if (ensure_profile_runtime_slots(cfg) != 0)
+    if (ensure_profile_runtime_slots(cfg) != 0) {
+        fprintf(stderr, "[RELOAD] ensure_profile_runtime_slots failed\n");
         return -1;
+    }
     if (forwarder_should_stop())
         return -1;
     snapshot_active_to_prev();
     int rc = rebuild_crypto_runtime(cfg);
+    if (rc != 0)
+        fprintf(stderr, "[RELOAD] rebuild_crypto_runtime failed\n");
     if (forwarder_should_stop())
         return -1;
     if (rc == 0) {
@@ -1298,9 +1318,12 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     if (forwarder_should_stop())
         return -1;
     if (!same_topology(fwd->cfg, cfg)) {
-        fprintf(stderr, "[RELOAD] topology changed; restart required\n");
+        fprintf(stderr,
+                "[RELOAD] LAN/WAN set changed (add/remove interface) — hot reload not possible\n");
         return -1;
     }
+    if (wait_dataplane_workers(fwd) != 0)
+        return -1;
 
     pthread_mutex_lock(&reload_wait_mtx);
     reload_fwd = fwd;
@@ -1329,6 +1352,12 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
 
     if (forwarder_should_stop())
         return -1;
+    if (atomic_load_explicit(&reload_pending, memory_order_acquire)) {
+        fprintf(stderr, "[RELOAD] mid core did not apply reload (still busy?)\n");
+        return -1;
+    }
+    if (rc != 0)
+        fprintf(stderr, "[RELOAD] apply on mid core failed (rc=%d)\n", rc);
     return rc;
 }
 
@@ -1375,6 +1404,8 @@ void forwarder_run(struct forwarder *fwd)
     }
 
     fwd->threads_started = 1;
+    if (fwd->cfg)
+        main_diag_log_dataplane_ready(fwd->cfg);
     pthread_join(fwd->local_thread, NULL);
     pthread_join(fwd->mid_thread, NULL);
     pthread_join(fwd->wan_thread, NULL);
