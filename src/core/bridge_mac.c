@@ -116,7 +116,6 @@ static int mac_load_once_from_bridge_cmd(struct app_config *cfg, int li) {
             continue;
 
         memcpy(loc->dst_mac, mac, MAC_LEN);
-        main_diag_log_lan_client_mac(loc->ifname, mac, "loaded");
         loaded = 1;
         break;
     }
@@ -308,7 +307,7 @@ static void nl_phase1_dump_fdb(int nl_fd, struct forwarder *fwd) {
                 break;
             }
             if (nlh->nlmsg_type == RTM_NEWNEIGH)
-                parse_fdb_message(nlh, fwd, 1);
+                parse_fdb_message(nlh, fwd, 0);
             nlh = NLMSG_NEXT(nlh, status);
         }
     }

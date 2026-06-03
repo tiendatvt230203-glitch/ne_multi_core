@@ -17,10 +17,21 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <errno.h>
 #include <time.h>
 
-static volatile int running = 1;
+static atomic_int running = 1;
+static struct forwarder *g_active_fwd;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static atomic_int reload_pending;
+static struct forwarder *reload_fwd;
+static struct app_config *reload_cfg;
+static int reload_rc;
+static pthread_mutex_t reload_wait_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reload_wait_cv = PTHREAD_COND_INITIALIZER;
+
+static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg);
 
 static struct packet_crypto_ctx base_crypto_ctx;
 static struct packet_crypto_ctx policy_crypto_ctx[MAX_CRYPTO_POLICIES];
@@ -1036,7 +1047,7 @@ static void *local_core_thread(void *arg)
     struct ne_packet batch[NE_BATCH_SIZE];
     pin_cpu(NE_CPU_LOC);
 
-    while (running) {
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
         for (int li = 0; li < fwd->local_count; li++)
@@ -1063,7 +1074,7 @@ static void *wan_core_thread(void *arg)
     struct ne_packet batch[NE_BATCH_SIZE];
     pin_cpu(NE_CPU_WAN);
 
-    while (running) {
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
@@ -1106,10 +1117,27 @@ static void *middle_core_thread(void *arg)
     uint32_t gc_tick = 0;
     pin_cpu(NE_CPU_MID);
 
-    while (running) {
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
 
-        pthread_mutex_lock(&runtime_lock);
+        if (pthread_mutex_trylock(&runtime_lock) != 0) {
+            if (!atomic_load_explicit(&running, memory_order_acquire))
+                break;
+            sched_yield();
+            continue;
+        }
+        if (!atomic_load_explicit(&running, memory_order_acquire)) {
+            pthread_mutex_unlock(&runtime_lock);
+            break;
+        }
+        if (atomic_exchange_explicit(&reload_pending, 0, memory_order_acq_rel) == 1) {
+            reload_rc = forwarder_reload_config_impl(reload_fwd, reload_cfg);
+            pthread_mutex_lock(&reload_wait_mtx);
+            pthread_cond_broadcast(&reload_wait_cv);
+            pthread_mutex_unlock(&reload_wait_mtx);
+            pthread_mutex_unlock(&runtime_lock);
+            continue;
+        }
         maybe_expire_prev_grace();
         cleanup_stale_profile_slots(fwd->cfg);
         if (ne_ring_try_pop(&fwd->wan_to_mid, &job) == 0) {
@@ -1142,6 +1170,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
     if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
         return -1;
+    if (forwarder_should_stop())
+        return -1;
 
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
@@ -1169,8 +1199,12 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     if (bridge_mac_prepare(cfg) != 0)
         return -1;
+    if (forwarder_should_stop())
+        return -1;
 
     if (rebuild_crypto_runtime(cfg) != 0)
+        return -1;
+    if (forwarder_should_stop())
         return -1;
 
     pqc_runtime_setup_profiles(cfg);
@@ -1187,6 +1221,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     memset(prev_policy_index_by_action_id, -1, sizeof(prev_policy_index_by_action_id));
     memset(prev_active_policies, 0, sizeof(prev_active_policies));
     if (ne_pair_open(&fwd->pair, cfg) != 0)
+        return -1;
+    if (forwarder_should_stop())
         return -1;
 
     if (ne_ring_init(&fwd->local_to_mid, NE_RING) != 0 ||
@@ -1210,22 +1246,16 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     (void)bridge_mac_install(fwd);
     bridge_mac_watch_start(fwd);
 
-    running = 1;
+    atomic_store_explicit(&running, 1, memory_order_release);
     return 0;
 }
 
-int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
+static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg)
 {
-    if (!fwd || !cfg)
-        return -1;
-    if (!same_topology(fwd->cfg, cfg)) {
-        fprintf(stderr, "[RELOAD] topology changed; restart required\n");
-        return -1;
-    }
-
-    pthread_mutex_lock(&runtime_lock);
     bridge_mac_watch_stop();
     (void)bridge_mac_prepare(cfg);
+    if (forwarder_should_stop())
+        return -1;
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
     fwd->wan_count = config_count_dataplane_wans(cfg);
@@ -1235,22 +1265,22 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
         fwd->wan_count = MAX_INTERFACES;
     for (int di = 0; di < fwd->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
-        if (ci < 0) {
-            pthread_mutex_unlock(&runtime_lock);
+        if (ci < 0)
             return -1;
-        }
         fwd->wan_cfg_idx[di] = ci;
         init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
                         cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
     }
     (void)bridge_mac_install(fwd);
     bridge_mac_watch_start(fwd);
-    if (ensure_profile_runtime_slots(cfg) != 0) {
-        pthread_mutex_unlock(&runtime_lock);
+    if (ensure_profile_runtime_slots(cfg) != 0)
         return -1;
-    }
+    if (forwarder_should_stop())
+        return -1;
     snapshot_active_to_prev();
     int rc = rebuild_crypto_runtime(cfg);
+    if (forwarder_should_stop())
+        return -1;
     if (rc == 0) {
         pqc_runtime_setup_profiles(cfg);
         pqc_handshake_start_all_profiles(cfg);
@@ -1258,7 +1288,47 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     if (rc != 0)
         prev_grace_active = 0;
     cleanup_stale_profile_slots(cfg);
-    pthread_mutex_unlock(&runtime_lock);
+    return forwarder_should_stop() ? -1 : rc;
+}
+
+int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
+{
+    if (!fwd || !cfg)
+        return -1;
+    if (forwarder_should_stop())
+        return -1;
+    if (!same_topology(fwd->cfg, cfg)) {
+        fprintf(stderr, "[RELOAD] topology changed; restart required\n");
+        return -1;
+    }
+
+    pthread_mutex_lock(&reload_wait_mtx);
+    reload_fwd = fwd;
+    reload_cfg = cfg;
+    reload_rc = -1;
+    atomic_store_explicit(&reload_pending, 1, memory_order_release);
+
+    while (atomic_load_explicit(&reload_pending, memory_order_acquire) &&
+           !forwarder_should_stop()) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+            pthread_cond_wait(&reload_wait_cv, &reload_wait_mtx);
+            continue;
+        }
+        ts.tv_nsec += 200000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        int wr = pthread_cond_timedwait(&reload_wait_cv, &reload_wait_mtx, &ts);
+        (void)wr;
+    }
+
+    int rc = reload_rc;
+    pthread_mutex_unlock(&reload_wait_mtx);
+
+    if (forwarder_should_stop())
+        return -1;
     return rc;
 }
 
@@ -1288,15 +1358,17 @@ void forwarder_run(struct forwarder *fwd)
     if (!fwd || forwarder_should_stop())
         return;
 
+    g_active_fwd = fwd;
+
     if (pthread_create(&fwd->local_thread, NULL, local_core_thread, fwd) != 0)
         return;
     if (pthread_create(&fwd->mid_thread, NULL, middle_core_thread, fwd) != 0) {
-        running = 0;
+        atomic_store_explicit(&running, 0, memory_order_release);
         pthread_join(fwd->local_thread, NULL);
         return;
     }
     if (pthread_create(&fwd->wan_thread, NULL, wan_core_thread, fwd) != 0) {
-        running = 0;
+        atomic_store_explicit(&running, 0, memory_order_release);
         pthread_join(fwd->local_thread, NULL);
         pthread_join(fwd->mid_thread, NULL);
         return;
@@ -1307,14 +1379,29 @@ void forwarder_run(struct forwarder *fwd)
     pthread_join(fwd->mid_thread, NULL);
     pthread_join(fwd->wan_thread, NULL);
     fwd->threads_started = 0;
+    if (g_active_fwd == fwd)
+        g_active_fwd = NULL;
 }
 
 void forwarder_stop(void)
 {
-    running = 0;
+    atomic_store_explicit(&running, 0, memory_order_release);
+}
+
+void forwarder_shutdown_resources(void)
+{
+    if (atomic_exchange_explicit(&reload_pending, 0, memory_order_acq_rel) == 1) {
+        pthread_mutex_lock(&reload_wait_mtx);
+        reload_rc = -1;
+        pthread_cond_broadcast(&reload_wait_cv);
+        pthread_mutex_unlock(&reload_wait_mtx);
+    }
+    bridge_mac_watch_stop();
+    if (g_active_fwd && g_active_fwd->cfg)
+        interface_xdp_detach_all_from_config(g_active_fwd->cfg);
 }
 
 int forwarder_should_stop(void)
 {
-    return !running;
+    return atomic_load_explicit(&running, memory_order_acquire) == 0;
 }

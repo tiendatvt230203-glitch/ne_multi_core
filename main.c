@@ -24,14 +24,20 @@
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_stop_logged = 0;
+static volatile sig_atomic_t g_stop_signal_count = 0;
 
 static void on_stop_signal(int sig) {
     (void)sig;
+    g_stop_signal_count++;
     g_stop_requested = 1;
     forwarder_stop();
     if (!g_stop_logged) {
         g_stop_logged = 1;
         fprintf(stderr, "\n[STOP] shutting down (Ctrl+C / SIGTERM)\n");
+    }
+    if (g_stop_signal_count >= 2) {
+        fprintf(stderr, "[STOP] forced exit\n");
+        _exit(130);
     }
 }
 
@@ -195,7 +201,7 @@ static void *forwarder_thread_main(void *arg) {
         rt->running = 0;
         return NULL;
     }
-    main_diag_log_link_macs(&rt->cfg_slots[rt->active_slot]);
+    main_diag_log_dataplane_ready(&rt->cfg_slots[rt->active_slot]);
     if (forwarder_should_stop()) {
         forwarder_cleanup(&rt->fwd);
         rt->running = 0;
@@ -203,7 +209,6 @@ static void *forwarder_thread_main(void *arg) {
     }
     rt->running = 1;
     forwarder_run(&rt->fwd);
-    forwarder_cleanup(&rt->fwd);
     rt->running = 0;
     return NULL;
 }
@@ -235,16 +240,12 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         return -1;
     }
 
-    if (after_delete)
-        fprintf(stderr, "[LOAD] active after delete:");
-    else
-        fprintf(stderr, "[LOAD] notify profile %d | active:", trigger_id);
-    for (int i = 0; i < active_id_count; i++)
-        fprintf(stderr, " %d", active_ids[i]);
-    fprintf(stderr, "\n");
-    main_diag_log_loaded_config(merged_cfg, trigger_id);
-
     if (!rt->has_thread) {
+        fprintf(stderr, "[LOAD] active:");
+        for (int i = 0; i < active_id_count; i++)
+            fprintf(stderr, " %d", active_ids[i]);
+        fprintf(stderr, "\n");
+        main_diag_log_config_summary(merged_cfg, trigger_id, 0);
         int rc = runtime_start(rt, merged_cfg);
         free(merged_cfg);
         return rc != 0 ? -1 : 0;
@@ -255,12 +256,17 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     free(merged_cfg);
     if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
         rt->active_slot = next_slot;
-        main_diag_log_reload_ok(&rt->cfg_slots[rt->active_slot], trigger_id);
-        main_diag_log_link_macs(&rt->cfg_slots[rt->active_slot]);
+        fprintf(stderr, "[RELOAD] active:");
+        for (int i = 0; i < active_id_count; i++)
+            fprintf(stderr, " %d", active_ids[i]);
+        fprintf(stderr, "\n");
+        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1);
         return 0;
     }
     fprintf(stderr, "[RELOAD] in-place reload failed, restarting dataplane with new topology/config\n");
     if (runtime_stop_forwarder(rt) != 0)
+        return -1;
+    if (g_stop_requested)
         return -1;
     rt->active_slot = next_slot;
     if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
@@ -289,8 +295,10 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
         return 0;
 
     forwarder_stop();
-    pthread_join(rt->thread, NULL);
+    forwarder_shutdown_resources();
     runtime_detach_xdp_from_config(rt);
+    pthread_join(rt->thread, NULL);
+    forwarder_cleanup(&rt->fwd);
     rt->has_thread = 0;
     rt->running = 0;
     return 0;
@@ -320,6 +328,9 @@ static int handle_profile_notify(struct runtime_state *rt,
                                  int *active_ids,
                                  int *active_id_count,
                                  int profile_id) {
+    if (g_stop_requested)
+        return 0;
+
     if (ne_profile_id_exists(profile_id) == 0) {
         int lr = load_profile_and_run(rt, active_ids, active_id_count, profile_id);
         if (lr != 0) {
@@ -446,11 +457,15 @@ int main(int argc, char **argv) {
         FD_ZERO(&rfds);
         FD_SET(pq_fd, &rfds);
 
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        struct timeval tv = { .tv_sec = g_stop_requested ? 0 : 1,
+                              .tv_usec = g_stop_requested ? 200000 : 0 };
         int sr = select(pq_fd + 1, &rfds, NULL, NULL, &tv);
         if (sr < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
+                if (g_stop_requested)
+                    break;
                 continue;
+            }
             usleep(200000);
             continue;
         }
