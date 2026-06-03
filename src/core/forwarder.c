@@ -1208,6 +1208,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     }
 
     (void)bridge_mac_install(fwd);
+    bridge_mac_watch_start(fwd);
 
     running = 1;
     return 0;
@@ -1223,6 +1224,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     }
 
     pthread_mutex_lock(&runtime_lock);
+    bridge_mac_watch_stop();
     (void)bridge_mac_prepare(cfg);
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
@@ -1242,6 +1244,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
                         cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
     }
     (void)bridge_mac_install(fwd);
+    bridge_mac_watch_start(fwd);
     if (ensure_profile_runtime_slots(cfg) != 0) {
         pthread_mutex_unlock(&runtime_lock);
         return -1;
@@ -1263,6 +1266,7 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
+    bridge_mac_watch_stop();
     ne_ring_destroy(&fwd->local_to_mid);
     ne_ring_destroy(&fwd->wan_to_mid);
     for (int i = 0; i < MAX_INTERFACES; i++)
@@ -1313,9 +1317,4 @@ void forwarder_stop(void)
 int forwarder_should_stop(void)
 {
     return !running;
-}
-
-void forwarder_print_stats(struct forwarder *fwd)
-{
-    (void)fwd;
 }

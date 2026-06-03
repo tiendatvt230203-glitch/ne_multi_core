@@ -86,17 +86,13 @@ int interface_set_queue_count(const char *ifname, int desired_count)
     snprintf(cmd, sizeof(cmd), "ethtool -L %s combined %d >/dev/null 2>&1",
              ifname, desired_count);
     if (system(cmd) == 0) {
-        fprintf(stderr, "[QUEUE] %s combined=%d\n", ifname, desired_count);
         return 0;
     }
 
     snprintf(cmd, sizeof(cmd), "ethtool -L %s rx %d tx %d >/dev/null 2>&1",
              ifname, desired_count, desired_count);
-    if (system(cmd) == 0) {
-        fprintf(stderr, "[QUEUE] %s rx=%d tx=%d\n",
-                ifname, desired_count, desired_count);
+    if (system(cmd) == 0)
         return 0;
-    }
 
     fprintf(stderr, "[QUEUE] %s unable to force queue_count=%d\n",
             ifname, desired_count);
@@ -111,7 +107,6 @@ static int interface_set_promisc(const char *ifname)
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "ip link set dev %s promisc on >/dev/null 2>&1", ifname);
     if (system(cmd) == 0) {
-        fprintf(stderr, "[PROMISC] %s on\n", ifname);
         return 0;
     }
 
@@ -352,8 +347,6 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
             fprintf(stderr, "[XSK] create %s queue=%d failed: %d\n", ifname, q, ret);
             return -1;
         }
-        fprintf(stderr, "[TRACE XSK] opened if=%s q=%d ifindex=%d rx=%u tx=%u mode=copy\n",
-                iface->ifname, q, iface->ifindex, NE_RING, NE_RING);
     }
     return 0;
 }
@@ -493,8 +486,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(bpf_xdp_attach(p->locals[i].ifindex, bpf_program__fd(local_prog), p->xdp_flags, NULL));
         p->xdp_local_on[i] = 1;
         NE_TRY(update_xsk_map_iface(&p->locals[i], bpf_map__fd(local_map)));
-        fprintf(stderr, "[TRACE XDP] local[%d] if=%s attached xskmap queues=%d (core %u polls all)\n",
-                i, p->locals[i].ifname, p->locals[i].queue_count, (unsigned)NE_CPU_LOC);
     }
 
     for (int di = 0; di < p->wan_count; di++) {
@@ -506,8 +497,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(bpf_xdp_attach(p->wans[di].ifindex, bpf_program__fd(wan_prog), p->xdp_flags, NULL));
         p->xdp_wan_on[di] = 1;
         NE_TRY(update_xsk_map_iface(&p->wans[di], bpf_map__fd(wan_map)));
-        fprintf(stderr, "[TRACE XDP] wan[%d] if=%s attached xskmap queues=%d (core %u polls all)\n",
-                di, p->wans[di].ifname, p->wans[di].queue_count, (unsigned)NE_CPU_WAN);
     }
 
     uint32_t prefill = NE_RING - 1;
@@ -518,13 +507,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     for (int i = 0; i < p->wan_count; i++)
         prefill_iface(p, &p->wans[i], prefill);
 
-    int total_queues = p->local_queue_total + p->wan_queue_total;
-    fprintf(stderr,
-            "[TRACE UMEM] frames=%u frame_size=%u mb=%zu prefill_per_queue=%u "
-            "local_if=%d local_queues=%d wan_if=%d wan_queues=%d total_xsk_queues=%d\n",
-            p->n_frames, p->frame_size, p->bufsize / (1024 * 1024), prefill,
-            p->local_count, p->local_queue_total, p->wan_count, p->wan_queue_total,
-            total_queues);
     return 0;
 
 fail:

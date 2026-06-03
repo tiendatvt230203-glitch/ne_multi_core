@@ -38,16 +38,10 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx,
 
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx);
 
-void packet_crypto_log_pqc_policy_key(const struct packet_crypto_ctx *ctx, const char *when);
-
 uint32_t packet_crypto_next_counter(void);
 void packet_crypto_reset_counter(void);
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot);
-
-int packet_encrypt(struct packet_crypto_ctx *ctx,
-                   uint8_t *packet,
-                   size_t pkt_len);
 
 int packet_decrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,

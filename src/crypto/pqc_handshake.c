@@ -119,11 +119,7 @@ static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t
 }
 
 static void pqc_log_master_key_ready(int profile_id, const uint8_t master[PQC_TRAFFIC_KEY_SZ]) {
-    const uint8_t *tail = master + PQC_TRAFFIC_KEY_SZ - 10;
-    fprintf(stderr,
-            "[PQC-KEY] HS-SUCCESS profile=%d master_tail20=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-            profile_id, tail[0], tail[1], tail[2], tail[3], tail[4],
-            tail[5], tail[6], tail[7], tail[8], tail[9]);
+    (void)master;
     forwarder_pre_diversify_pqc_keys(profile_id);
 }
 
@@ -134,7 +130,6 @@ static uint64_t get_time_ms_hs(void) {
 }
 
 static void* pqc_l2_handshake_thread_run(void) {
-    fprintf(stderr, "[PQC-HS-L2] Pure L2 Bridge Mode Handshake Thread started on interface %s\n", g_hs_cfg.wan_ifname);
 
     char *my_priv = NULL;
     char *my_pub = NULL;
@@ -159,7 +154,6 @@ static void* pqc_l2_handshake_thread_run(void) {
     // 2. Initialize L2 Peer
     struct pqc_l2_peer peer;
     if (pqc_l2_init_peer(&peer, g_hs_cfg.wan_ifname) < 0) {
-        fprintf(stderr, "[PQC-HS-L2] Failed to initialize L2 peer on interface %s\n", g_hs_cfg.wan_ifname);
         return NULL;
     }
 
@@ -170,7 +164,6 @@ static void* pqc_l2_handshake_thread_run(void) {
     if (g_hs_cfg.is_initiator) {
         // --- INITIATOR FLOW ---
         // A. Discover peer MAC
-        fprintf(stderr, "[PQC-HS-L2] Initiating peer MAC discovery...\n");
         while (!g_key_ready) {
             if (pqc_l2_discover_peer_mac(&peer, 5) == 0) {
                 break;
@@ -201,7 +194,6 @@ static void* pqc_l2_handshake_thread_run(void) {
         int retry_cnt = 0;
 
         while (!g_key_ready && retry_cnt < 10) {
-            fprintf(stderr, "[PQC-HS-L2] Initiator sending HELLO fragments (msg_id: %u, try: %d)...\n", msg_id, retry_cnt + 1);
             pqc_l2_send_payload_fragmented(&peer, msg_id, buffer, payload_tot_sz);
 
             uint64_t start_rx = get_time_ms_hs();
@@ -234,7 +226,6 @@ static void* pqc_l2_handshake_thread_run(void) {
                                     }
                                 }
                                 pthread_mutex_unlock(&g_key_mutex);
-                                fprintf(stderr, "[PQC-HS-L2] Handshake SUCCESS!\n");
                                 pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
                                 free(rx_payload);
                                 break;
@@ -249,7 +240,6 @@ static void* pqc_l2_handshake_thread_run(void) {
         }
     } else {
         // --- RESPONDER FLOW ---
-        fprintf(stderr, "[PQC-HS-L2] Responder listening for HELLO fragments...\n");
         while (!g_key_ready) {
             uint8_t *rx_payload = NULL;
             uint32_t rx_msg_id = 0;
@@ -264,7 +254,6 @@ static void* pqc_l2_handshake_thread_run(void) {
                     pthread_mutex_unlock(&g_key_mutex);
 
                     if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                        fprintf(stderr, "[PQC-HS-L2] Responder HELLO signature verified! Encapsulating...\n");
                         if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
                             struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                             resp->magic = PQC_HS_MAGIC;
@@ -283,7 +272,6 @@ static void* pqc_l2_handshake_thread_run(void) {
                             pthread_mutex_unlock(&g_key_mutex);
 
                             // Reply back over segmented L2 frames
-                            fprintf(stderr, "[PQC-HS-L2] Responder sending RESP fragments (msg_id: %u)...\n", rx_msg_id);
                             pqc_l2_send_payload_fragmented(&peer, rx_msg_id, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz);
 
                             uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
@@ -300,7 +288,6 @@ static void* pqc_l2_handshake_thread_run(void) {
                                 }
                             }
                             pthread_mutex_unlock(&g_key_mutex);
-                            fprintf(stderr, "[PQC-HS-L2] Responder Handshake SUCCESS!\n");
                             pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
                         }
                     }
@@ -316,6 +303,7 @@ static void* pqc_l2_handshake_thread_run(void) {
 }
 
 static void* pqc_handshake_thread(void* arg) {
+    (void)arg;
     pthread_mutex_lock(&g_key_mutex);
     char current_peer_ip[64];
     strncpy(current_peer_ip, g_hs_cfg.peer_ip, 63);
@@ -362,10 +350,6 @@ static void* pqc_handshake_thread(void* arg) {
     tv.tv_sec = 5;
     tv.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    fprintf(stderr, "[PQC-HS] ROLE SETTLED FROM DB CONFIG: Role: %s, Peer IP: %s\n",
-            g_hs_cfg.is_initiator ? "INITIATOR" : "RESPONDER", current_peer_ip);
-    fflush(stdout);
 
     // ----- STAGE 2: MAIN ML-KEM/ML-DSA HANDSHAKE -----
     while (!g_key_ready) {
@@ -428,8 +412,6 @@ static void* pqc_handshake_thread(void* arg) {
                 if (n > 0) {
                     struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                     if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
-                        int expected_sz = sizeof(struct pqc_hs_msg) + resp->data_len + resp->sig_len;
-                        fprintf(stderr, "[PQC-HS] Initiator received RESP. Total bytes rcvd (n) = %d, expected = %d\n", n, expected_sz);
                         pthread_mutex_lock(&g_key_mutex);
                         size_t raw_pub_sz = 0;
                         uint8_t raw_pub[8192];
@@ -447,45 +429,19 @@ static void* pqc_handshake_thread(void* arg) {
 
                                 for (int b_idx = 0; b_idx < g_profile_bindings_count; b_idx++) {
                                     if (g_profile_bindings[b_idx].profile_id == g_hs_cfg.profile_id) {
-                                        memcpy(g_profile_bindings[b_idx].master_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                        fprintf(stderr, "[PQC-HS-DEBUG] BEFORE write: b_idx=%d, key_ready=%d\n", b_idx, (int)g_profile_bindings[b_idx].key_ready);
-                                         
+                                        memcpy(g_profile_bindings[b_idx].master_traffic_key,
+                                               derived_master, PQC_TRAFFIC_KEY_SZ);
                                         g_profile_bindings[b_idx].key_ready = true;
-                                        fprintf(stderr, "[PQC-HS-DEBUG] AFTER standard write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
-                                         
-                                        g_profile_bindings[b_idx].key_ready = 1;
-                                        fprintf(stderr, "[PQC-HS-DEBUG] AFTER integer 1 write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
-                                         
-                                        volatile bool *v_ptr = &g_profile_bindings[b_idx].key_ready;
-                                        *v_ptr = true;
-                                        fprintf(stderr, "[PQC-HS-DEBUG] AFTER volatile write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
-                                         
-                                        fprintf(stderr, "[PQC-HS-DEBUG] b_idx=%d, key_ready address=%p, size=%zu, raw_value=%d\n",
-                                                b_idx, (void*)&g_profile_bindings[b_idx].key_ready, sizeof(g_profile_bindings[b_idx].key_ready),
-                                                (int)g_profile_bindings[b_idx].key_ready);
-                                        fprintf(stderr, "[PQC-HS-DEBUG] SET READY (Initiator): profile_id=%d, b_idx=%d, array_addr=%p\n",
-                                                g_hs_cfg.profile_id, b_idx, (void*)g_profile_bindings);
-                                        for (int i = 0; i < g_profile_bindings_count; i++) {
-                                            fprintf(stderr, "[PQC-HS-DEBUG]   -> Binding[%d]: profile_id=%d, key_ready=%d\n",
-                                                    i, g_profile_bindings[i].profile_id,
-                                                    (int)g_profile_bindings[i].key_ready);
-                                        }
-                                        fprintf(stderr, "[PQC-HS] Master key bound to profile %d successfully!\n", g_hs_cfg.profile_id);
-                                        fprintf(stderr, "[PQC-HS]   -> Master Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
-                                                derived_master[0], derived_master[1], derived_master[2], derived_master[3],
-                                                derived_master[4], derived_master[5], derived_master[6], derived_master[7]);
                                         break;
                                     }
                                 }
                                 pthread_mutex_unlock(&g_key_mutex);
-                                fprintf(stderr, "[PQC-HS] Handshake SUCCESS!\n");
                                 pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
                                 break;
                             }
                         }
                     }
                 }
-                fprintf(stderr, "[PQC-HS] Initiator retrying HELLO...\n");
             }
         } else {
             // --- RESPONDER FLOW ---
@@ -498,8 +454,6 @@ static void* pqc_handshake_thread(void* arg) {
             if (n > 0) {
                 struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
                 if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
-                    int expected_sz = sizeof(struct pqc_hs_msg) + msg->data_len + msg->sig_len;
-                    fprintf(stderr, "[PQC-HS] Responder received HELLO. Total bytes rcvd (n) = %d, expected = %d\n", n, expected_sz);
                     pthread_mutex_lock(&g_key_mutex);
                     size_t raw_pub_sz = 0;
                     uint8_t raw_pub[8192];
@@ -507,9 +461,7 @@ static void* pqc_handshake_thread(void* arg) {
                     pthread_mutex_unlock(&g_key_mutex);
 
                     if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                        fprintf(stderr, "[PQC-HS] Responder HELLO signature verified! Encapsulating...\n");
                         if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
-                            fprintf(stderr, "[PQC-HS] Responder KEM encapsulation successful.\n");
                             struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                             resp->msg_type = PQC_HS_MSG_RESP;
                             resp->data_len = (uint16_t)ct_sz;
@@ -537,50 +489,17 @@ static void* pqc_handshake_thread(void* arg) {
 
                             for (int b_idx = 0; b_idx < g_profile_bindings_count; b_idx++) {
                                 if (g_profile_bindings[b_idx].profile_id == g_hs_cfg.profile_id) {
-                                    memcpy(g_profile_bindings[b_idx].master_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                    fprintf(stderr, "[PQC-HS-DEBUG] BEFORE write: b_idx=%d, key_ready=%d\n", b_idx, (int)g_profile_bindings[b_idx].key_ready);
-                                    
+                                    memcpy(g_profile_bindings[b_idx].master_traffic_key,
+                                           derived_master, PQC_TRAFFIC_KEY_SZ);
                                     g_profile_bindings[b_idx].key_ready = true;
-                                    fprintf(stderr, "[PQC-HS-DEBUG] AFTER standard write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
-                                    
-                                    g_profile_bindings[b_idx].key_ready = 1;
-                                    fprintf(stderr, "[PQC-HS-DEBUG] AFTER integer 1 write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
-                                    
-                                    volatile bool *v_ptr = &g_profile_bindings[b_idx].key_ready;
-                                    *v_ptr = true;
-                                    fprintf(stderr, "[PQC-HS-DEBUG] AFTER volatile write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
-                                    
-                                    fprintf(stderr, "[PQC-HS-DEBUG] b_idx=%d, key_ready address=%p, size=%zu, raw_value=%d\n",
-                                            b_idx, (void*)&g_profile_bindings[b_idx].key_ready, sizeof(g_profile_bindings[b_idx].key_ready),
-                                            (int)g_profile_bindings[b_idx].key_ready);
-                                    fprintf(stderr, "[PQC-HS-DEBUG] SET READY (Responder): profile_id=%d, b_idx=%d, array_addr=%p\n",
-                                            g_hs_cfg.profile_id, b_idx, (void*)g_profile_bindings);
-                                    for (int i = 0; i < g_profile_bindings_count; i++) {
-                                        fprintf(stderr, "[PQC-HS-DEBUG]   -> Binding[%d]: profile_id=%d, key_ready=%d\n",
-                                                i, g_profile_bindings[i].profile_id,
-                                                (int)g_profile_bindings[i].key_ready);
-                                    }
-                                    fprintf(stderr, "[PQC-HS] Master key bound to profile %d successfully!\n", g_hs_cfg.profile_id);
-                                    fprintf(stderr, "[PQC-HS]   -> Master Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
-                                            derived_master[0], derived_master[1], derived_master[2], derived_master[3],
-                                            derived_master[4], derived_master[5], derived_master[6], derived_master[7]);
                                     break;
                                 }
                             }
                             pthread_mutex_unlock(&g_key_mutex);
-                            fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS!\n");
                             pqc_log_master_key_ready(g_hs_cfg.profile_id, derived_master);
-                        } else {
-                            fprintf(stderr, "[PQC-HS] ERROR: Responder KEM encapsulation failed!\n");
                         }
-                    } else {
-                        fprintf(stderr, "[PQC-HS] ERROR: Responder signature verification FAILED!\n");
                     }
-                } else {
-                    fprintf(stderr, "[PQC-HS] Responder received unknown packet (len=%d, magic=0x%X)\n", n, msg->magic);
                 }
-            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                fprintf(stderr, "[PQC-HS] Responder recvfrom error: %s\n", strerror(errno));
             }
         }
     }
@@ -605,8 +524,6 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
         if (peer_ip)
             strncpy(g_hs_cfg.peer_ip, peer_ip, 63);
         pthread_mutex_unlock(&g_key_mutex);
-        fprintf(stderr, "[PQC-HS] profile %d: handshake thread already running (waiting for peer/HELLO)\n",
-                profile_id);
         return 0;
     }
     g_hs_started = true;
@@ -749,7 +666,6 @@ int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key
 void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const char *pub) {
     pthread_mutex_lock(&g_key_mutex);
     if (g_registry_count >= MAX_IDENTITY_REGISTRY) {
-        fprintf(stderr, "[PQC-REG] Registry full!\n");
         pthread_mutex_unlock(&g_key_mutex);
         return;
     }
@@ -770,8 +686,6 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     strncpy(entry->fingerprint, fingerprint, 15);
     entry->priv_key = strdup(priv);
     entry->pub_key = strdup(pub);
-    
-    fprintf(stderr, "[PQC-REG] Added identity fingerprint: %s to RAM Registry.\n", fingerprint);
     pthread_mutex_unlock(&g_key_mutex);
 }
 
@@ -808,8 +722,6 @@ static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fing
         char *plain_b64_pub = malloc(8192);
         memset(plain_b64_pub, 0, 8192);
         trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-        
-        fprintf(stderr, "[PQC-HS] De-obfuscated peer pub key using DB fingerprint [%s].\n", peer_fingerprint);
         return plain_b64_pub;
     }
 
@@ -846,8 +758,6 @@ static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fing
                             char *plain_b64_pub = malloc(8192);
                             memset(plain_b64_pub, 0, 8192);
                             trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-                            
-                            fprintf(stderr, "[PQC-HS] Found matching peer pub key file on disk. De-obfuscated peer pub key using fingerprint [%s].\n", fingerprint);
                             return plain_b64_pub;
                         }
                     }
@@ -869,13 +779,11 @@ static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fing
         trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
 
         if (strcmp(plain_b64_pub, g_identity_registry[i].pub_key) == 0) {
-            fprintf(stderr, "[PQC-HS] Found matching peer pub key in RAM Registry. De-obfuscated peer pub key using fingerprint [%s].\n", g_identity_registry[i].fingerprint);
             return strdup(plain_b64_pub);
         }
     }
 
     // Fallback: If we couldn't de-obfuscate it, return the original string
-    fprintf(stderr, "[PQC-HS] Warning: Could not find matching fingerprint for peer public key. Using original string.\n");
     return strdup(obf_pub_str);
 }
 
@@ -887,7 +795,6 @@ void sig_pqc_set_peer_identity(const char *pub, const char *peer_fingerprint) {
     g_peer_id_pub = deobf;
     pthread_mutex_unlock(&g_key_mutex);
 
-    if (g_peer_id_pub) fprintf(stderr, "[PQC-HS] Peer identity key loaded and de-obfuscated. Ready for Handshake.\n");
 }
 
 bool sig_pqc_has_identity(const char *fingerprint) {
@@ -929,7 +836,6 @@ void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const cha
         b->local_priv = local_priv ? strdup(local_priv) : NULL;
         b->local_pub = local_pub ? strdup(local_pub) : NULL;
         b->peer_pub = deobf_peer;
-        fprintf(stderr, "[PQC-BIND] Profile %d bound to Local/Peer keys in RAM.\n", profile_id);
     }
     
     pthread_mutex_unlock(&g_key_mutex);
@@ -1019,19 +925,8 @@ void sig_pqc_load_keys_from_disk(void) {
             trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
 
             sig_pqc_add_to_registry(fingerprint, plain_b64_priv, plain_b64_pub);
-            fprintf(stderr, "[PQC-LOAD] Loaded Local Identity Fingerprint [%s] from secure RAM-disk (/dev/shm) into RAM.\n", fingerprint);
         }
     }
     closedir(dir);
 
-    pthread_mutex_lock(&g_key_mutex);
-    int nreg = g_registry_count;
-    int nbind = g_profile_bindings_count;
-    bool peer_ok = (g_peer_id_pub != NULL);
-    pthread_mutex_unlock(&g_key_mutex);
-
-    fprintf(stderr, "[PQC-LOAD] registry=%d binding_slots=%d peer_pub=%s\n",
-            nreg, nbind, peer_ok ? "loaded" : "MISSING");
-    if (nreg == 0)
-        fprintf(stderr, "[PQC-LOAD] WARN: no identity under /dev/shm/.enc_config — HS cannot start\n");
 }

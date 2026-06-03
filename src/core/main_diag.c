@@ -36,15 +36,12 @@ static const char *policy_proto_str(uint8_t proto) {
 }
 
 static const char *crypto_mode_str(int mode) {
-    if (mode == CRYPTO_MODE_GCM) {
+    if (mode == CRYPTO_MODE_GCM)
         return "gcm";
-    }
-    if (mode == CRYPTO_MODE_CTR) {
+    if (mode == CRYPTO_MODE_CTR)
         return "ctr";
-    }
-    if (mode == CRYPTO_MODE_PQC) {
+    if (mode == CRYPTO_MODE_PQC)
         return "pqc-gcm";
-    }
     return "?";
 }
 
@@ -90,7 +87,7 @@ static void policy_cidr_field(char *out, size_t outsz, int any, int negate,
         snprintf(out, outsz, "%s", cidr);
 }
 
-static void fmt_mac(char *out, size_t outsz, const uint8_t mac[MAC_LEN]) {
+static void fmt_mac(char *out, size_t outsz, const uint8_t mac[6]) {
     int zero = !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]);
     if (zero)
         snprintf(out, outsz, "(none)");
@@ -99,8 +96,8 @@ static void fmt_mac(char *out, size_t outsz, const uint8_t mac[MAC_LEN]) {
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-static void log_interface_names(const struct app_config *cfg) {
-    fprintf(stderr, "[WAN dataplane] ");
+static void log_wan_interfaces(const struct app_config *cfg) {
+    fprintf(stderr, "[WAN] ");
     int first = 1;
     for (int i = 0; i < cfg->wan_count; i++) {
         if (!cfg->wans[i].dataplane)
@@ -108,8 +105,9 @@ static void log_interface_names(const struct app_config *cfg) {
         fprintf(stderr, "%s%s", first ? "" : ", ", cfg->wans[i].ifname);
         first = 0;
     }
-    fprintf(stderr, "\n");
-    fprintf(stderr, "[WAN handshake] ");
+    fprintf(stderr, "%s\n", first ? "(none)" : "");
+
+    fprintf(stderr, "[WAN-HS] ");
     first = 1;
     for (int i = 0; i < cfg->wan_count; i++) {
         if (cfg->wans[i].dataplane)
@@ -117,12 +115,16 @@ static void log_interface_names(const struct app_config *cfg) {
         fprintf(stderr, "%s%s", first ? "" : ", ", cfg->wans[i].ifname);
         first = 0;
     }
-    fprintf(stderr, "\n");
+    fprintf(stderr, "%s\n", first ? "(none)" : "");
+}
 
-    fprintf(stderr, "[LAN] ");
-    for (int i = 0; i < cfg->local_count; i++)
-        fprintf(stderr, "%s%s", i ? ", " : "", cfg->locals[i].ifname);
-    fprintf(stderr, "\n");
+static void log_lan_interfaces(const struct app_config *cfg) {
+    for (int i = 0; i < cfg->local_count; i++) {
+        const struct local_config *l = &cfg->locals[i];
+        char client[32];
+        fmt_mac(client, sizeof(client), l->dst_mac);
+        fprintf(stderr, "[LAN] %s client_mac=%s\n", l->ifname, client);
+    }
 }
 
 static void log_wan_dst_macs(const struct app_config *cfg) {
@@ -131,15 +133,6 @@ static void log_wan_dst_macs(const struct app_config *cfg) {
         char dst_mac[32];
         fmt_mac(dst_mac, sizeof(dst_mac), w->dst_mac);
         fprintf(stderr, "[WAN] %s dst_mac=%s\n", w->ifname, dst_mac);
-    }
-}
-
-static void log_local_dst_macs(const struct app_config *cfg) {
-    for (int i = 0; i < cfg->local_count; i++) {
-        const struct local_config *l = &cfg->locals[i];
-        char dst_mac[32];
-        fmt_mac(dst_mac, sizeof(dst_mac), l->dst_mac);
-        fprintf(stderr, "[LAN] %s dst_mac=%s\n", l->ifname, dst_mac);
     }
 }
 
@@ -164,13 +157,8 @@ static void log_profile_policies(const struct app_config *cfg) {
             if (cp->action == POLICY_ACTION_BYPASS) {
                 fprintf(stderr,
                         "  policy db_id=%d prio=%d bypass  %s  src=%s dst=%s  sport=%s dport=%s\n",
-                        cp->db_id,
-                        cp->priority,
-                        policy_proto_str(cp->protocol),
-                        src_c,
-                        dst_c,
-                        sp,
-                        dp);
+                        cp->db_id, cp->priority, policy_proto_str(cp->protocol),
+                        src_c, dst_c, sp, dp);
                 continue;
             }
             if (cp->crypto_mode == CRYPTO_MODE_PQC) {
@@ -181,32 +169,51 @@ static void log_profile_policies(const struct app_config *cfg) {
                         policy_action_name(cp->action),
                         crypto_mode_str(cp->crypto_mode),
                         policy_proto_str(cp->protocol), src_c, dst_c, sp, dp);
-            }
-            else {
-                    fprintf(stderr,  
-                    "  policy db_id=%d wire_id=%d prio=%d %s  %s-%u\n"
-                    "    match: %s  src=%s dst=%s  sport=%s dport=%s\n",
-                    cp->db_id,
-                    cp->id,
-                    cp->priority,
-                    policy_action_name(cp->action),
-                    crypto_mode_str(cp->crypto_mode),
-                    (unsigned)cp->aes_bits,
-                    policy_proto_str(cp->protocol),
-                    src_c,
-                    dst_c,
-                    sp,
-                    dp);
+            } else {
+                fprintf(stderr,
+                        "  policy db_id=%d wire_id=%d prio=%d %s  %s-%u\n"
+                        "    match: %s  src=%s dst=%s  sport=%s dport=%s\n",
+                        cp->db_id, cp->id, cp->priority,
+                        policy_action_name(cp->action),
+                        crypto_mode_str(cp->crypto_mode),
+                        (unsigned)cp->aes_bits,
+                        policy_proto_str(cp->protocol),
+                        src_c, dst_c, sp, dp);
             }
         }
     }
+}
+
+void main_diag_log_lan_client_mac(const char *ifname,
+                                  const uint8_t client_mac[6],
+                                  const char *event) {
+    char client[32];
+    fmt_mac(client, sizeof(client), client_mac);
+    fprintf(stderr, "[LAN-FDB] %s client_mac=%s (%s)\n",
+            ifname ? ifname : "?",
+            client,
+            event && event[0] ? event : "change");
+    fflush(stderr);
+}
+
+void main_diag_log_reload_ok(struct app_config *cfg, int trigger_profile_id) {
+    if (!cfg)
+        return;
+    fprintf(stderr,
+            "[RELOAD] OK trigger_profile=%d profiles=%d policies=%d "
+            "(dataplane up; decrypt grace 3s for in-flight flows)\n",
+            trigger_profile_id,
+            cfg->profile_count,
+            cfg->policy_count);
+    fflush(stderr);
 }
 
 void main_diag_log_loaded_config(struct app_config *cfg, int config_id) {
     (void)config_id;
     if (!cfg)
         return;
-    log_interface_names(cfg);
+    log_wan_interfaces(cfg);
+    log_lan_interfaces(cfg);
     log_profile_policies(cfg);
 }
 
@@ -214,5 +221,5 @@ void main_diag_log_link_macs(struct app_config *cfg) {
     if (!cfg)
         return;
     log_wan_dst_macs(cfg);
-    log_local_dst_macs(cfg);
+    log_lan_interfaces(cfg);
 }

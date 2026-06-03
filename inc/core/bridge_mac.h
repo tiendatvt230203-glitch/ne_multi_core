@@ -12,4 +12,7 @@ int bridge_mac_install(struct forwarder *fwd);
 int bridge_mac_local_for_dmac(struct forwarder *fwd,
                               const uint8_t *pkt, uint32_t pkt_len);
 
+void bridge_mac_watch_start(struct forwarder *fwd);
+void bridge_mac_watch_stop(void);
+
 #endif

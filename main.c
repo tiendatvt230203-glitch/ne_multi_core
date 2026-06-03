@@ -203,7 +203,6 @@ static void *forwarder_thread_main(void *arg) {
     }
     rt->running = 1;
     forwarder_run(&rt->fwd);
-    forwarder_print_stats(&rt->fwd);
     forwarder_cleanup(&rt->fwd);
     rt->running = 0;
     return NULL;
@@ -256,6 +255,8 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     free(merged_cfg);
     if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
         rt->active_slot = next_slot;
+        main_diag_log_reload_ok(&rt->cfg_slots[rt->active_slot], trigger_id);
+        main_diag_log_link_macs(&rt->cfg_slots[rt->active_slot]);
         return 0;
     }
     fprintf(stderr, "[RELOAD] in-place reload failed, restarting dataplane with new topology/config\n");

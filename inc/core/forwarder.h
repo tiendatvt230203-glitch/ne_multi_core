@@ -35,6 +35,5 @@ void forwarder_cleanup(struct forwarder *fwd);
 void forwarder_run(struct forwarder *fwd);
 void forwarder_stop(void);
 int forwarder_should_stop(void);
-void forwarder_print_stats(struct forwarder *fwd);
 
 #endif

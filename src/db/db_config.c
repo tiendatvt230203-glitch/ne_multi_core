@@ -323,12 +323,8 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
         const char *ifname = PQgetvalue(res, r, ifn_col);
         int wi = find_wan_index_by_ifname(cfg, ifname);
         int weight = 1;
-        if (wi >= 0 && wan_is_handshake_only(&cfg->wans[wi])) {
-            fprintf(stderr,
-                    "[DB] profile \"%s\": %s has peer IP — handshake only, not in traffic WAN pool\n",
-                    p->name, ifname);
+        if (wi >= 0 && wan_is_handshake_only(&cfg->wans[wi]))
             continue;
-        }
         if (wi >= 0) {
             if (wcol >= 0 && !PQgetisnull(res, r, wcol)) {
                 const char *wstr = PQgetvalue(res, r, wcol);
@@ -667,16 +663,6 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
         }
 
         wan->dataplane = wan->dst_ip == 0 ? 1 : 0;
-        if (!wan->dataplane) {
-            struct in_addr peer;
-            peer.s_addr = wan->dst_ip;
-            char peer_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &peer, peer_str, sizeof(peer_str));
-            fprintf(stderr,
-                    "[DB WAN] %s handshake-only (peer %s) — no TX, excluded from multi-queue dataplane\n",
-                    wan->ifname, peer_str);
-        }
-
         cfg->wan_count++;
     }
     return 0;

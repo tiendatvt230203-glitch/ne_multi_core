@@ -148,23 +148,6 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE],
     memcpy(out_key, hmac_out, key_size);
 }
 
-void packet_crypto_log_pqc_policy_key(const struct packet_crypto_ctx *ctx, const char *when)
-{
-    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC)
-        return;
-
-    const uint8_t *key = ctx->keys[KEY_SLOT_CURRENT];
-    if (!key_has_nonzero(key, PQC_TRAFFIC_KEY_SZ))
-        return;
-
-    const uint8_t *tail = key + PQC_TRAFFIC_KEY_SZ - 10;
-    fprintf(stderr,
-            "[PQC-KEY] %s profile=%d policy=%d tail20=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-            when ? when : "?", ctx->profile_id, ctx->policy_id,
-            tail[0], tail[1], tail[2], tail[3], tail[4],
-            tail[5], tail[6], tail[7], tail[8], tail[9]);
-}
-
 static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
     uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
 
@@ -178,9 +161,6 @@ static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
     memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
-    fprintf(stderr, "[PQC-DATA] Policy %d key diversified (profile %d)\n",
-            ctx->policy_id, ctx->profile_id);
-    packet_crypto_log_pqc_policy_key(ctx, "diversify");
 }
 
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
@@ -216,7 +196,6 @@ const uint8_t *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx) 
             memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
             memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
             memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
-            packet_crypto_log_pqc_policy_key(ctx, "sync-hs");
             return packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
         }
     }
@@ -524,23 +503,6 @@ void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len) {
     (void)pkt_len;
     packet[12] = 0x08;
     packet[13] = 0x00;
-}
-
-int packet_encrypt(struct packet_crypto_ctx *ctx,
-                   uint8_t *packet,
-                   size_t pkt_len) {
-    packet_crypto_update_keys(ctx);
-
-    switch (g_encrypt_layer) {
-    case 2:
-        return crypto_layer2_encrypt(ctx, packet, pkt_len);
-    case 3:
-        return crypto_layer3_encrypt(ctx, packet, pkt_len);
-    case 4:
-        return crypto_layer4_encrypt(ctx, packet, pkt_len);
-    default:
-        return -1;
-    }
 }
 
 int packet_decrypt(struct packet_crypto_ctx *ctx,
