@@ -201,6 +201,42 @@ static void print_policy_table(const struct app_config *cfg) {
     tbl_hline(w, 10);
 }
 
+void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cfg) {
+    if (!cfg)
+        return;
+
+    fprintf(stderr,
+            "\n[DB] profile %d — no update (DB same as running, reload skipped)\n",
+            trigger_profile_id);
+    fprintf(stderr, "  unchanged: LAN=%d WAN=%d policies=%d\n",
+            cfg->local_count, cfg->wan_count, cfg->policy_count);
+    print_iface_table(cfg);
+    print_policy_table(cfg);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+void main_diag_log_db_apply(const struct app_config *cfg, int trigger_profile_id,
+                            const struct app_config *prev_cfg) {
+    if (!cfg)
+        return;
+
+    fprintf(stderr, "\n[DB] profile %d — loaded from Postgres", trigger_profile_id);
+    if (prev_cfg) {
+        fprintf(stderr, " | delta LAN %d->%d WAN %d->%d policies %d->%d",
+                prev_cfg->local_count, cfg->local_count,
+                prev_cfg->wan_count, cfg->wan_count,
+                prev_cfg->policy_count, cfg->policy_count);
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
+            cfg->profile_count, cfg->policy_count);
+    print_iface_table(cfg);
+    print_policy_table(cfg);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id,
                                   int is_reload) {
     if (!cfg)
