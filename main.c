@@ -381,6 +381,14 @@ static int profile_db_unchanged(const struct profile_config *old,
         if (!found)
             return 0;
     }
+
+    if (old->wan_count != new->wan_count)
+        return 0;
+    for (int i = 0; i < old->wan_count; i++) {
+        if (old->wan_indices[i] != new->wan_indices[i] ||
+            old->wan_bandwidth_weight[i] != new->wan_bandwidth_weight[i])
+            return 0;
+    }
     return 1;
 }
 
@@ -517,19 +525,71 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     }
 
     int policy_only = lan_wan_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot]);
+    int topo_ok = forwarder_same_topology(prev_cfg, &rt->cfg_slots[next_slot]);
+
     if (policy_only)
         main_diag_log_db_policy_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
     else
         main_diag_log_db_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
 
-    if (policy_only) {
-        fprintf(stderr,
-                "[RELOAD] profile %d — policies/crypto only (LAN MAC via FDB, not DB)\n",
-                trigger_id);
-    } else {
-        fprintf(stderr, "[RELOAD] profile %d — pushing config to dataplane...\n",
-                trigger_id);
+    if (!topo_ok) {
+        if (forwarder_is_wan_only_removal(prev_cfg, &rt->cfg_slots[next_slot])) {
+            fprintf(stderr,
+                    "[RELOAD] profile %d — WAN removed, drain %.1fs then detach (no hard cut)\n",
+                    trigger_id, (double)FORWARDER_WAN_DRAIN_SEC);
+            fflush(stderr);
+            if (forwarder_reload_wan_removal(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
+                rt->active_slot = next_slot;
+                fprintf(stderr, "[RELOAD] OK profile %d — applied (WAN drain reload)\n",
+                        trigger_id);
+                main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id,
+                                             1, 0);
+                fflush(stderr);
+                return 0;
+            }
+            fprintf(stderr,
+                    "[RELOAD] WAN drain reload failed; full dataplane restart\n");
+            fflush(stderr);
+        } else {
+            fprintf(stderr,
+                    "[RELOAD] profile %d — LAN/WAN topology changed (add/remove interface) — full dataplane restart\n",
+                    trigger_id);
+            fflush(stderr);
+        }
+        rt->active_slot = next_slot;
+        if (runtime_stop_forwarder(rt) != 0)
+            return -1;
+        if (g_stop_requested)
+            return -1;
+        if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
+            return -1;
+        fprintf(stderr, "[RELOAD] OK profile %d — applied (full restart)\n", trigger_id);
+        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
+        fflush(stderr);
+        return 0;
     }
+
+    if (!policy_only) {
+        fprintf(stderr,
+                "[RELOAD] profile %d — LAN/WAN settings changed — full dataplane restart\n",
+                trigger_id);
+        fflush(stderr);
+        rt->active_slot = next_slot;
+        if (runtime_stop_forwarder(rt) != 0)
+            return -1;
+        if (g_stop_requested)
+            return -1;
+        if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
+            return -1;
+        fprintf(stderr, "[RELOAD] OK profile %d — applied (full restart)\n", trigger_id);
+        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
+        fflush(stderr);
+        return 0;
+    }
+
+    fprintf(stderr,
+            "[RELOAD] profile %d — policies/crypto only (LAN MAC via FDB, not DB)\n",
+            trigger_id);
     fflush(stderr);
 
     if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
@@ -539,8 +599,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         for (int i = 0; i < active_id_count; i++)
             fprintf(stderr, " %d", active_ids[i]);
         fprintf(stderr, "\n");
-        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1,
-                                     policy_only);
+        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 1);
         fflush(stderr);
         return 0;
     }
@@ -673,12 +732,18 @@ int main(int argc, char **argv) {
         int exists = (ne_profile_id_exists(profile_id) == 0);
         if (notify_profile_load(profile_id) != 0)
             return 1;
-        if (exists)
+        if (exists) {
             fprintf(stderr,
-                    "[NOTIFY] sent profile %d — check daemon terminal for reload result\n",
-                    profile_id);
-        else
+                    "[NOTIFY] sent profile %d to channel %s (OK — not an error)\n",
+                    profile_id, NOTIFY_CHANNEL);
+            fprintf(stderr,
+                    "  Reload logs print on the **daemon** terminal (%s with no -id), not here.\n",
+                    argv[0]);
+            fprintf(stderr,
+                    "  If daemon shows nothing: start daemon, or DB unchanged / daemon hung on reload.\n");
+        } else {
             fprintf(stderr, "[DELETE] notify profile %d (not in DB)\n", profile_id);
+        }
         return 0;
     }
 

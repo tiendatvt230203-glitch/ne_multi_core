@@ -156,14 +156,16 @@ static void print_iface_table(const struct app_config *cfg) {
 
 static void print_policy_table(const struct app_config *cfg) {
     static const int w[DIAG_TBL_N] = {
-        6, 5, 6, 10, 5, 8, 18, 18, 7, 7, 0, 0
+        6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 0, 0
     };
     static const char *hdr[DIAG_TBL_N] = {
-        "db_id", "wire", "layer", "crypto", "prio", "proto",
+        "db_id", "priority", "pkt_tag", "layer", "crypto", "proto",
         "src", "dst", "sport", "dport", "", ""
     };
 
     fprintf(stderr, "\n  [policies] count=%d\n", cfg->policy_count);
+    fprintf(stderr,
+            "  priority = match order (lower first); pkt_tag = ID in encrypted packet (not DB id)\n");
     tbl_hline(w, 10);
     tbl_row(w, 10, hdr);
     tbl_hline(w, 10);
@@ -180,10 +182,10 @@ static void print_policy_table(const struct app_config *cfg) {
             char src_c[DIAG_CIDR_LEN], dst_c[DIAG_CIDR_LEN];
 
             snprintf(c0, sizeof(c0), "%d", cp->db_id);
-            snprintf(c1, sizeof(c1), "%d", cp->id);
-            snprintf(c2, sizeof(c2), "%s", policy_action_name(cp->action));
-            policy_crypto_label(cp, c3, sizeof(c3));
-            snprintf(c4, sizeof(c4), "%d", cp->priority);
+            snprintf(c1, sizeof(c1), "%d", cp->priority);
+            snprintf(c2, sizeof(c2), "%d", cp->id);
+            snprintf(c3, sizeof(c3), "%s", policy_action_name(cp->action));
+            policy_crypto_label(cp, c4, sizeof(c4));
             snprintf(c5, sizeof(c5), "%s", policy_proto_str(cp->protocol));
             policy_cidr_field(src_c, sizeof(src_c), cp->src_any, cp->src_negate,
                               cp->src_net, cp->src_mask);

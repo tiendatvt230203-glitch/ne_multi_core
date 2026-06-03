@@ -154,6 +154,7 @@ void ne_frame_free(struct ne_pair *p, uint64_t addr);
 void interface_reset_redirect_maps(void);
 int interface_push_encrypt_filters(const struct app_config *cfg);
 void interface_xdp_detach_all_from_config(const struct app_config *cfg);
+void interface_xdp_detach_ifname(const char *ifname);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
 

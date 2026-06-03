@@ -51,6 +51,15 @@ static void xdp_try_detach(int ifindex, const char *ifname)
     }
 }
 
+void interface_xdp_detach_ifname(const char *ifname)
+{
+    if (!ifname || !ifname[0])
+        return;
+    unsigned int ix = if_nametoindex(ifname);
+    if (ix > 0)
+        xdp_try_detach((int)ix, ifname);
+}
+
 void interface_xdp_detach_all_from_config(const struct app_config *cfg)
 {
     if (!cfg)
