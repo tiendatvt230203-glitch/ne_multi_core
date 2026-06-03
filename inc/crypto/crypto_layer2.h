@@ -3,10 +3,12 @@
 
 #include "packet_crypto.h"
 
+#define NE_L2_FAKE_ETHERTYPE     0x88B5u
+
 #define CRYPTO_L2_FRAG_TAG_SIZE  4
 #define CRYPTO_L2_FRAG_MAGIC     0x5B
 
-/* Byte 12-13: full fake EtherType (e.g. 0x88B5); byte 14: policy_id; then nonce. */
+/* Byte 12-13: NE_L2_FAKE_ETHERTYPE; byte 14: policy_id; then nonce. */
 #define CRYPTO_L2_POLICY_OFF     ETH_HEADER_SIZE
 #define CRYPTO_L2_POLICY_LEN     1
 

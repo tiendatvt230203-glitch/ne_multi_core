@@ -11,6 +11,8 @@ int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len);
 int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 
+int crypto_layer4_fixup_packet(uint8_t *packet, size_t pkt_len);
+
 int crypto_layer4_get_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto,
                                          size_t remaining);
 

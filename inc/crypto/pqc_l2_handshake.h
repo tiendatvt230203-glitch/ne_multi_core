@@ -3,13 +3,14 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "types.h" // For SCryptCipherCtx, byte, etc.
+#include "types.h"
+#include "crypto_layer2.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define PQC_ETH_TYPE_DISCOVERY 0x88B5
+#define PQC_ETH_TYPE_DISCOVERY NE_L2_FAKE_ETHERTYPE
 #define PQC_ETH_TYPE_HANDSHAKE 0x88B6
 #define PQC_L2_MAGIC           0x5051 // "PQ" in hex
 

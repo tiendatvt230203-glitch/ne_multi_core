@@ -1,5 +1,6 @@
 #include "../../inc/db/db_runtime.h"
 
+#include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/db/db_config.h"
 #include "../../inc/db/db_env.h"
 
@@ -268,7 +269,7 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
     if (merged.crypto_enabled) {
         merged.encrypt_layer = 3;
         merged.fake_protocol = 99;
-        merged.fake_ethertype_ipv4 = 0x88b5;
+        merged.fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
         merged.crypto_mode = merged.policies[0].crypto_mode;
         merged.aes_bits = merged.policies[0].aes_bits;
         memcpy(merged.crypto_key, merged.policies[0].key, sizeof(merged.crypto_key));

@@ -220,7 +220,7 @@ static int rebuild_crypto_runtime(struct app_config *cfg)
         return 0;
 
     if (cfg->fake_ethertype_ipv4 == 0)
-        cfg->fake_ethertype_ipv4 = 0x88b5;
+        cfg->fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
     if (cfg->fake_protocol == 0)
         cfg->fake_protocol = 99;
 
@@ -940,11 +940,15 @@ static int decrypt_wan_packet(struct forwarder *fwd, struct ne_packet *job)
                 return -1;
             memcpy(pkt, reass, reass_len);
             pkt_len = reass_len;
-        } else if (crypto_decrypt_packet_auto_by_action(1, fwd->cfg, &dctx,
-                                                        POLICY_ACTION_ENCRYPT_L3,
-                                                        pkt, &pkt_len,
-                                                        scratch, sizeof(scratch)) != 0) {
-            return -1;
+        } else {
+            uint8_t l3_policy_id = 0;
+            if (crypto_l3_extract_policy_id(fwd->cfg, pkt, pkt_len, &l3_policy_id) == 0 &&
+                crypto_decrypt_packet_auto_by_action(1, fwd->cfg, &dctx,
+                                                    POLICY_ACTION_ENCRYPT_L3,
+                                                    pkt, &pkt_len,
+                                                    scratch, sizeof(scratch)) != 0) {
+                return -1;
+            }
         }
 
         if (frag_is_fragment_l4(fwd->cfg, pkt, pkt_len, &pid, &frag_idx)) {

@@ -1,4 +1,5 @@
 #include "../../inc/db/db_config.h"
+#include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/db/db_env.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -800,7 +801,7 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg) {
         cfg->fake_protocol = 99;
     }
     if (has_l2) {
-        cfg->fake_ethertype_ipv4 = 0x88b5;
+        cfg->fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
     }
 
     return 0;

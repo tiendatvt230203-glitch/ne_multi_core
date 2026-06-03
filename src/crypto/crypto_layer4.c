@@ -108,6 +108,53 @@ static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr
     packet[l3_off + 11] = (uint8_t)(cksum & 0xFF);
 }
 
+#define L4_TCP_CKSUM_OFF  16
+#define L4_UDP_LEN_OFF    4
+#define L4_UDP_CKSUM_OFF  6
+
+int crypto_layer4_fixup_packet(uint8_t *packet, size_t pkt_len) {
+    if (!packet || pkt_len < 14 + 20)
+        return -1;
+
+    int l3_off = crypto_eth_ipv4_offset(packet, pkt_len);
+    if (l3_off < 0)
+        return -1;
+
+    int ip_hdr_len = (packet[l3_off] & 0x0F) * 4;
+    if (ip_hdr_len < 20)
+        return -1;
+    if (pkt_len < (size_t)(l3_off + ip_hdr_len + 8))
+        return -1;
+
+    int transport_off = l3_off + ip_hdr_len;
+    size_t transport_len = pkt_len - (size_t)transport_off;
+    uint8_t ip_proto = packet[l3_off + 9];
+
+    l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len, transport_len);
+
+    if (ip_proto == 17) {
+        uint8_t *udp = packet + transport_off;
+        uint16_t udp_len = (uint16_t)transport_len;
+        udp[L4_UDP_LEN_OFF] = (uint8_t)(udp_len >> 8);
+        udp[L4_UDP_LEN_OFF + 1] = (uint8_t)(udp_len & 0xFF);
+        udp[L4_UDP_CKSUM_OFF] = 0;
+        udp[L4_UDP_CKSUM_OFF + 1] = 0;
+        uint16_t udp_cksum = crypto_calc_udp_checksum(packet + l3_off, ip_hdr_len,
+                                                      udp, (int)transport_len);
+        udp[L4_UDP_CKSUM_OFF] = (uint8_t)(udp_cksum >> 8);
+        udp[L4_UDP_CKSUM_OFF + 1] = (uint8_t)(udp_cksum & 0xFF);
+    } else if (ip_proto == 6 && transport_len >= 20) {
+        uint8_t *tcp = packet + transport_off;
+        tcp[L4_TCP_CKSUM_OFF] = 0;
+        tcp[L4_TCP_CKSUM_OFF + 1] = 0;
+        uint16_t tcp_cksum = crypto_calc_tcp_checksum(packet + l3_off, ip_hdr_len,
+                                                      tcp, (int)transport_len);
+        tcp[L4_TCP_CKSUM_OFF] = (uint8_t)(tcp_cksum >> 8);
+        tcp[L4_TCP_CKSUM_OFF + 1] = (uint8_t)(tcp_cksum & 0xFF);
+    }
+    return 0;
+}
+
 int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
     if (!ctx || !ctx->initialized || !packet)
         return -1;
@@ -244,9 +291,12 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
             return -1;
 
         memmove(packet + transport_off + L4_WIRE_PORT_LEN, packet + enc_off, (size_t)dec_len);
-        l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len,
-                                     L4_WIRE_PORT_LEN + (size_t)dec_len);
-        return (int)(transport_off + L4_WIRE_PORT_LEN + dec_len);
+        {
+            int new_len = (int)(transport_off + L4_WIRE_PORT_LEN + (size_t)dec_len);
+            if (crypto_layer4_fixup_packet(packet, (size_t)new_len) != 0)
+                return -1;
+            return new_len;
+        }
     }
 
     uint8_t nonce[16];
@@ -295,8 +345,12 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         }
 
         memmove(packet + transport_off + L4_WIRE_PORT_LEN, work_ptr, enc_len);
-        l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len, L4_WIRE_PORT_LEN + enc_len);
-        return (int)(transport_off + L4_WIRE_PORT_LEN + enc_len);
+        {
+            int new_len = (int)(transport_off + L4_WIRE_PORT_LEN + enc_len);
+            if (crypto_layer4_fixup_packet(packet, (size_t)new_len) != 0)
+                return -1;
+            return new_len;
+        }
     }
     return -1;
 }
