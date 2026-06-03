@@ -261,6 +261,16 @@ static const struct crypto_policy *policy_by_db_id(const struct app_config *cfg,
     return NULL;
 }
 
+static void log_policy_db_ids(const char *tag, const struct app_config *cfg)
+{
+    if (!cfg)
+        return;
+    fprintf(stderr, "%s policy db_ids(%d):", tag, cfg->policy_count);
+    for (int i = 0; i < cfg->policy_count; i++)
+        fprintf(stderr, " %d", cfg->policies[i].db_id);
+    fprintf(stderr, "\n");
+}
+
 static int policies_db_unchanged(const struct app_config *old,
                                  const struct app_config *new)
 {
@@ -270,6 +280,12 @@ static int policies_db_unchanged(const struct app_config *old,
         int db_id = old->policies[i].db_id;
         const struct crypto_policy *np = policy_by_db_id(new, db_id);
         if (!np || !policy_fields_equal(&old->policies[i], np))
+            return 0;
+    }
+    for (int i = 0; i < new->policy_count; i++) {
+        int db_id = new->policies[i].db_id;
+        const struct crypto_policy *op = policy_by_db_id(old, db_id);
+        if (!op || !policy_fields_equal(op, &new->policies[i]))
             return 0;
     }
     return 1;
@@ -340,11 +356,29 @@ static int profile_db_unchanged(const struct profile_config *old,
         return 0;
 
     for (int i = 0; i < old->policy_count; i++) {
-        int opi = old->policy_indices[i];
-        int npi = new->policy_indices[i];
-        if (opi < 0 || npi < 0 || opi >= ocfg->policy_count || npi >= ncfg->policy_count)
+        int odb = ocfg->policies[old->policy_indices[i]].db_id;
+        int found = 0;
+        for (int j = 0; j < new->policy_count; j++) {
+            int ndb = ncfg->policies[new->policy_indices[j]].db_id;
+            if (odb == ndb) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
             return 0;
-        if (ocfg->policies[opi].db_id != ncfg->policies[npi].db_id)
+    }
+    for (int j = 0; j < new->policy_count; j++) {
+        int ndb = ncfg->policies[new->policy_indices[j]].db_id;
+        int found = 0;
+        for (int i = 0; i < old->policy_count; i++) {
+            int odb = ocfg->policies[old->policy_indices[i]].db_id;
+            if (odb == ndb) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
             return 0;
     }
     return 1;
@@ -412,6 +446,9 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         return -1;
     }
     if (build_merged_config(merged_cfg, active_ids, active_id_count, NULL) != 0) {
+        fprintf(stderr,
+                "[ERR] profile %d: failed to load config from Postgres (see [DB] lines above)\n",
+                trigger_id);
         free(merged_cfg);
         return -1;
     }
@@ -434,6 +471,23 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     free(merged_cfg);
 
     if (config_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot])) {
+        fprintf(stderr,
+                "[DB] profile %d — no change on first read (Postgres may not have committed yet), retry...\n",
+                trigger_id);
+        fflush(stderr);
+        usleep(500000);
+        if (build_merged_config(&rt->cfg_slots[next_slot], active_ids,
+                                active_id_count, NULL) != 0) {
+            fprintf(stderr,
+                    "[ERR] profile %d: DB reload retry failed (see [DB] lines above)\n",
+                    trigger_id);
+            return -1;
+        }
+    }
+
+    if (config_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot])) {
+        log_policy_db_ids("[DB] Postgres", &rt->cfg_slots[next_slot]);
+        log_policy_db_ids("[DB] running", prev_cfg);
         main_diag_log_no_update(trigger_id, prev_cfg);
         return 0;
     }
