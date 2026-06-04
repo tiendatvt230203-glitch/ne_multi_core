@@ -107,8 +107,6 @@ void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag);
 
-void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len);
-
 uint16_t crypto_calc_ip_checksum(const uint8_t *ip_hdr, int hdr_len);
 
 uint16_t crypto_calc_tcp_checksum(const uint8_t *ip_hdr, int ip_hdr_len,

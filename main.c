@@ -503,8 +503,7 @@ static int runtime_tuning_only_change(const struct app_config *old,
 }
 
 static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
-                                int active_id_count, int trigger_id,
-                                int after_delete) {
+                                int active_id_count, int trigger_id) {
     struct app_config *merged_cfg = calloc(1, sizeof(*merged_cfg));
     if (!merged_cfg) {
         fprintf(stderr, "[FATAL] out of memory building merged config\n");
@@ -714,7 +713,7 @@ static int load_profile_and_run(struct runtime_state *rt,
     if (added < 0)
         return -1;
     /* Even if profile is already active, force rebuild to apply DB updates. */
-    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id, 0) != 0) {
+    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
         if (added == 1)
             active_ids_remove(active_ids, active_id_count, profile_id);
         return -1;
@@ -748,7 +747,7 @@ static int handle_profile_notify(struct runtime_state *rt,
     if (*active_id_count == 0)
         return runtime_stop_forwarder(rt);
 
-    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id, 1) != 0) {
+    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
         fprintf(stderr, "[ERR] profile %d: unload reload failed\n", profile_id);
         return -1;
     }

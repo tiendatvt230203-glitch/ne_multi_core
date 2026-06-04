@@ -4,13 +4,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-
 #define TAG_SIZE_GCM 16
-#define HKDF_SALT "network_encryptor_xdp_salt_v1"
-#define HKDF_INFO "session_key_expansion"
 
 // External declaration for the underlying symbol is no longer needed
 static int g_pqc_initialized = 0;
@@ -140,23 +134,8 @@ void trf_base64_decode_obfuscated(const char *src, const char *seed, unsigned ch
     }
 }
 
-int trf_save_key_to_file(const char *filename, const char *data, int mode) {
-    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    if (fd < 0) return -1;
-    ssize_t written = write(fd, data, strlen(data));
-    if (write(fd, "\n", 1) < 0) {
-        return -1;
-    }
-    close(fd);
-    return (written > 0) ? 0 : -1;
-}
-
 // =========================================================
-// DATA PLANE: ENCRYPTION
-// =========================================================
-
-// =========================================================
-// DATA PLANE: ENCRYPTION (AES-GCM / AES-CBC)
+// DATA PLANE: ENCRYPTION (AES-GCM)
 // =========================================================
 
 int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
@@ -268,48 +247,6 @@ err:
     scrypt_CipherCtxFree(ctx);
     return TRF_PQC_ERR_CRYPTO;
 }
-
-int trf_encrypt_payload_cbc(const byte* key, const byte* iv, int iv_len, byte* data, int len) {
-    if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
-    
-    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
-    if (!ctx) return TRF_PQC_ERR_CRYPTO;
-
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_ENCRYPTION) != 0) goto err;
-
-    word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
-
-    scrypt_CipherCtxFree(ctx);
-    return TRF_PQC_OK;
-err:
-    scrypt_CipherCtxFree(ctx);
-    return TRF_PQC_ERR_CRYPTO;
-}
-
-int trf_decrypt_payload_cbc(const byte* key, const byte* iv, int iv_len, byte* data, int len) {
-    if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
-    
-    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
-    if (!ctx) return TRF_PQC_ERR_CRYPTO;
-
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_DECRYPTION) != 0) goto err;
-
-    word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
-
-    scrypt_CipherCtxFree(ctx);
-    return TRF_PQC_OK;
-err:
-    scrypt_CipherCtxFree(ctx);
-    return TRF_PQC_ERR_CRYPTO;
-}
-
-// =========================================================
-// HASHING & MAC (SHA2 / SHA3 / HMAC)
-// =========================================================
 
 int trf_calculate_digest(SCryptDigestType type, const byte* data, int len, byte* digest_out) {
     SCryptDigestCtx* ctx = (SCryptDigestCtx*)get_aligned_library_obj(
@@ -444,24 +381,6 @@ int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz,
     return TRF_PQC_OK;
 }
 
-int trf_derive_session_keys(const byte* shared_secret, int ss_len, 
-                            byte* tx_key_out, byte* rx_key_out) {
-    byte key_material[64] __attribute__((aligned(64)));
-    
-    int ret = scrypt_HKDF(DIGEST_TYPE_SHA512, shared_secret, ss_len, 
-                          (const byte*)HKDF_SALT, strlen(HKDF_SALT), 
-                          (const byte*)HKDF_INFO, strlen(HKDF_INFO), 
-                          key_material, 64);
-                          
-    if (ret != 0) return TRF_PQC_ERR_CRYPTO;
-
-    memcpy(tx_key_out, key_material, 32);
-    memcpy(rx_key_out, key_material + 32, 32);
-    
-    memset(key_material, 0, sizeof(key_material));
-    return TRF_PQC_OK;
-}
-
 // =========================================================
 // CONTROL PLANE: PQC DIGITAL SIGNATURES (ML-DSA LEVEL 5)
 // =========================================================
@@ -548,56 +467,4 @@ int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz,
     int ret = scrypt_MlDsaVerify(key_obj, data, len, sig_in, sig_sz);
     scrypt_MlDsaKeyFree(key_obj);
     return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;
-}
-// =========================================================
-// COMPOSITE PQC LOGIC (HANDSHAKE + DERIVATION)
-// =========================================================
-
-int trf_pqc_setup_session(const byte* local_priv_dsa, int local_priv_dsa_sz,
-                         const byte* remote_pub_dsa, int remote_pub_dsa_sz,
-                         const byte* remote_pub_kem, int remote_pub_kem_sz,
-                         trf_pqc_session* session_out) {
-    
-    if (!g_pqc_initialized || !session_out) return TRF_PQC_ERR_INIT;
-
-    byte shared_secret[64];
-    byte capsule[2048]; 
-    int capsule_sz = 0;
-    int ss_sz = 64;
-    int ret;
-
-    // 1. ML-KEM: Encapsulate to get shared secret and capsule
-    ret = trf_kem_encapsulate(remote_pub_kem, remote_pub_kem_sz, capsule, &capsule_sz, shared_secret);
-    if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-KEM] Encapsulation failed: %s\n", scrypt_ErrorString(ret));
-        return TRF_PQC_ERR_CRYPTO;
-    }
-
-    // 2. ML-DSA: Sign the capsule to ensure authenticity
-    byte signature[5000]; 
-    int sig_sz = 0;
-    ret = trf_dsa_sign_payload(local_priv_dsa, local_priv_dsa_sz, capsule, capsule_sz, signature, &sig_sz);
-    if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-DSA] Signing failed: %s\n", scrypt_ErrorString(ret));
-        return TRF_PQC_ERR_SIG;
-    }
-
-    // 3. Verification: Simulate remote verification
-    ret = trf_dsa_verify_payload(remote_pub_dsa, remote_pub_dsa_sz, capsule, capsule_sz, signature, sig_sz);
-    if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-DSA] Signature verification failed: %s\n", scrypt_ErrorString(ret));
-        return TRF_PQC_ERR_SIG;
-    }
-
-    // 4. HKDF: Expand shared secret into Session Keys
-    ret = trf_derive_session_keys(shared_secret, ss_sz, session_out->tx_key, session_out->rx_key);
-    if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-HKDF] Key derivation failed: %s\n", scrypt_ErrorString(ret));
-        return TRF_PQC_ERR_CRYPTO;
-    }
-
-    session_out->is_active = 1;
-    memset(shared_secret, 0, sizeof(shared_secret));
-    
-    return TRF_PQC_OK;
 }

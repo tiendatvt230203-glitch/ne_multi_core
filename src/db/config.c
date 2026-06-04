@@ -7,10 +7,6 @@
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <netinet/in.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <net/if.h>
 int parse_mac(const char *str, uint8_t *mac) {
     int values[6];
     if (sscanf(str, "%x:%x:%x:%x:%x:%x",
@@ -223,22 +219,6 @@ int config_select_profile_for_local(const struct app_config *cfg, int local_idx)
     return -1;
 }
 
-int config_select_profile_for_wan(const struct app_config *cfg, int wan_idx) {
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return -1;
-
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        if (!p->enabled)
-            continue;
-        for (int i = 0; i < p->wan_count; i++) {
-            if (p->wan_indices[i] == wan_idx)
-                return pi;
-        }
-    }
-    return -1;
-}
-
 static uint32_t flow_hash_u32(uint32_t src_ip, uint32_t dst_ip,
                               uint16_t src_port, uint16_t dst_port, uint8_t protocol) {
     uint32_t h = src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ dst_port ^ protocol;
@@ -374,43 +354,4 @@ int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t
 
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len) {
     return parse_hex_bytes(str, out, expected_len);
-}
-
-int local_config_fill_ipv4_from_iface(struct local_config *loc) {
-    if (!loc || loc->ifname[0] == '\0')
-        return -1;
-
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        fprintf(stderr, "[CONFIG] local %s: socket: %s\n", loc->ifname, strerror(errno));
-        return -1;
-    }
-
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", loc->ifname);
-    ifr.ifr_addr.sa_family = AF_INET;
-
-    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
-    loc->ip = sin->sin_addr.s_addr;
-
-    memset(&ifr, 0, sizeof(ifr));
-    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", loc->ifname);
-    if (ioctl(fd, SIOCGIFNETMASK, &ifr) < 0) {
-        loc->netmask = htonl(0xFFFFFFFFu);
-        loc->network = loc->ip & loc->netmask;
-        close(fd);
-        return 0;
-    }
-
-    struct sockaddr_in *nm = (struct sockaddr_in *)&ifr.ifr_netmask;
-    loc->netmask = nm->sin_addr.s_addr;
-    loc->network = loc->ip & loc->netmask;
-    close(fd);
-    return 0;
 }

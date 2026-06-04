@@ -187,7 +187,6 @@ int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
 int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip);
 int config_validate(struct app_config *cfg);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
-int config_select_profile_for_wan(const struct app_config *cfg, int wan_idx);
 int config_select_wan_for_profile(struct app_config *cfg, int profile_idx,
                                   uint32_t src_ip, uint32_t dst_ip,
                                   uint16_t src_port, uint16_t dst_port,
@@ -196,7 +195,5 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
                                                         uint8_t protocol);
-
-int local_config_fill_ipv4_from_iface(struct local_config *loc);
 
 #endif

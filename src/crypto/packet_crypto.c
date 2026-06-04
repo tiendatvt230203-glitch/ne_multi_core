@@ -499,12 +499,6 @@ uint16_t crypto_calc_udp_checksum(const uint8_t *ip_hdr, int ip_hdr_len,
     return (uint16_t)(~sum);
 }
 
-void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len) {
-    (void)pkt_len;
-    packet[12] = 0x08;
-    packet[13] = 0x00;
-}
-
 int packet_decrypt(struct packet_crypto_ctx *ctx,
                    uint8_t *packet,
                    size_t pkt_len) {

@@ -60,21 +60,6 @@ int crypto_layer4_frag_meta_len(void) {
     return meta;
 }
 
-int crypto_layer4_tunnel_off_ipv4(const uint8_t *pkt, size_t pkt_len, int *transport_off_out) {
-    int l3_off = crypto_eth_ipv4_offset(pkt, pkt_len);
-    if (l3_off < 0)
-        return -1;
-    if (pkt_len < (size_t)l3_off + 20)
-        return -1;
-    int ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20)
-        return -1;
-    int transport_off = l3_off + ip_hdr_len;
-    if (transport_off_out)
-        *transport_off_out = transport_off;
-    return transport_off + L4_WIRE_PORT_LEN;
-}
-
 int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len) {
     if (!pkt || pkt_len < 14)
         return -1;
