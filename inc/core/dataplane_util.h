@@ -13,6 +13,10 @@ int dp_write_l2(uint8_t *pkt, uint32_t len,
                 const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN],
                 int allow_empty_src);
 
+/* LAN→WAN: match legacy set_wan_l2 — skip rewrite if either MAC unset, never fail. */
+int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
+                    const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN]);
+
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt);
 
 #endif

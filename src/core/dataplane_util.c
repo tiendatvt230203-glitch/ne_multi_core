@@ -67,6 +67,18 @@ int dp_write_l2(uint8_t *pkt, uint32_t len,
     return 0;
 }
 
+int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
+                    const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN])
+{
+    static const uint8_t zero[MAC_LEN];
+
+    if (!pkt || len < sizeof(struct ether_header))
+        return -1;
+    if (memcmp(dst, zero, MAC_LEN) == 0 || memcmp(src, zero, MAC_LEN) == 0)
+        return 0;
+    return dp_write_l2(pkt, len, dst, src, 0);
+}
+
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
 {
     if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(ring, pkt) != 0) {

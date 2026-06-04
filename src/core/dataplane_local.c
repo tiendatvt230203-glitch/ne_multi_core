@@ -85,8 +85,8 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
         return 0;
     }
 
-    if (dp_write_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac, 1) != 0 ||
-        dp_write_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac, 1) != 0)
+    if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
+        dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         return -1;
     return push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) == 0 ? 1 : -1;
 }
@@ -96,6 +96,9 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
                                uint16_t src_port, uint16_t dst_port, uint8_t proto,
                                int *profile_idx, const struct crypto_policy **cp)
 {
+    if (!fwd || !fwd->cfg || !profile_idx || !cp)
+        return -1;
+
     const struct crypto_policy *best = NULL;
     int best_pi = -1, best_pri = 0x7fffffff, best_id = 0x7fffffff;
 
@@ -153,7 +156,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                                     src_port, dst_port, proto, job.len);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
         goto drop;
-    if (dp_write_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac, 1) != 0)
+    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {
