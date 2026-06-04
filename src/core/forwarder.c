@@ -450,6 +450,34 @@ static int ensure_profile_runtime_slots(struct app_config *cfg)
     return 0;
 }
 
+static void sync_flow_table_windows(struct forwarder *fwd)
+{
+    if (!fwd || !fwd->cfg)
+        return;
+
+    for (int s = 0; s < MAX_PROFILES; s++) {
+        const struct profile_config *p = NULL;
+        struct flow_table *ft;
+
+        if (!profile_flow_table_ready[s])
+            continue;
+        ft = &profile_flow_tables[s];
+        for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+            if (fwd->cfg->profiles[pi].id == profile_flow_profile_id[s]) {
+                p = &fwd->cfg->profiles[pi];
+                break;
+            }
+        }
+        if (!p)
+            continue;
+        for (int i = 0; i < p->wan_count; i++) {
+            int wi = p->wan_indices[i];
+            if (wi >= 0 && wi < MAX_INTERFACES)
+                ft->wan_window_sizes[wi] = fwd->cfg->wans[wi].window_size;
+        }
+    }
+}
+
 static void cleanup_stale_profile_slots(const struct app_config *cfg)
 {
     if (!cfg || prev_grace_active)
@@ -1672,6 +1700,7 @@ static int forwarder_reload_wan_removal_impl(struct forwarder *fwd, struct app_c
     } else {
         prev_grace_active = 0;
     }
+    sync_flow_table_windows(fwd);
     cleanup_stale_profile_slots(cfg);
     return forwarder_should_stop() ? -1 : rc;
 }
@@ -1707,6 +1736,7 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
     }
     if (rc != 0)
         prev_grace_active = 0;
+    sync_flow_table_windows(fwd);
     cleanup_stale_profile_slots(cfg);
     return forwarder_should_stop() ? -1 : rc;
 }

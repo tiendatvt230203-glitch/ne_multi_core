@@ -445,6 +445,26 @@ static int config_db_unchanged(const struct app_config *old,
     return 1;
 }
 
+static int profiles_fully_unchanged(const struct app_config *old,
+                                    const struct app_config *new)
+{
+    if (old->profile_count != new->profile_count)
+        return 0;
+    for (int i = 0; i < old->profile_count; i++) {
+        const struct profile_config *op = &old->profiles[i];
+        const struct profile_config *np = NULL;
+        for (int j = 0; j < new->profile_count; j++) {
+            if (new->profiles[j].id == op->id) {
+                np = &new->profiles[j];
+                break;
+            }
+        }
+        if (!np || !profile_db_unchanged(op, np, old, new))
+            return 0;
+    }
+    return 1;
+}
+
 /* LAN/WAN rows from Postgres unchanged (client MAC is not stored in DB). */
 static int lan_wan_db_unchanged(const struct app_config *old,
                                 const struct app_config *new)
@@ -467,6 +487,19 @@ static int lan_wan_db_unchanged(const struct app_config *old,
             return 0;
     }
     return 1;
+}
+
+/* Same ifnames; only LAN/WAN tuning (ring/window/umem) changed — no policy/profile traffic change. */
+static int runtime_tuning_only_change(const struct app_config *old,
+                                      const struct app_config *new)
+{
+    if (!old || !new || lan_wan_db_unchanged(old, new))
+        return 0;
+    if (!forwarder_same_topology(old, new))
+        return 0;
+    if (!policies_db_unchanged(old, new))
+        return 0;
+    return profiles_fully_unchanged(old, new);
 }
 
 static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
@@ -570,10 +603,30 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     }
 
     if (!policy_only) {
-        fprintf(stderr,
-                "[RELOAD] profile %d — LAN/WAN settings changed — full dataplane restart\n",
-                trigger_id);
-        fflush(stderr);
+        if (runtime_tuning_only_change(prev_cfg, &rt->cfg_slots[next_slot])) {
+            fprintf(stderr,
+                    "[RELOAD] profile %d — LAN/WAN tuning only (hot reload, traffic continues)\n",
+                    trigger_id);
+            fflush(stderr);
+            if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
+                rt->active_slot = next_slot;
+                fprintf(stderr,
+                        "[RELOAD] OK profile %d — applied (tuning hot reload)\n",
+                        trigger_id);
+                main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot],
+                                             trigger_id, 1, 0);
+                fflush(stderr);
+                return 0;
+            }
+            fprintf(stderr,
+                    "[RELOAD] tuning hot reload failed; full dataplane restart\n");
+            fflush(stderr);
+        } else {
+            fprintf(stderr,
+                    "[RELOAD] profile %d — LAN/WAN settings changed — full dataplane restart\n",
+                    trigger_id);
+            fflush(stderr);
+        }
         rt->active_slot = next_slot;
         if (runtime_stop_forwarder(rt) != 0)
             return -1;
