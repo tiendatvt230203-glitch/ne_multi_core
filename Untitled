@@ -1,0 +1,10 @@
+gcc -D_GNU_SOURCE -I. -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 -I/usr/include/postgresql -c src/db/db_env.c -o src/db/db_env.o
+gcc -D_GNU_SOURCE -I. -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 -I/usr/include/postgresql -c src/db/db_runtime.c -o src/db/db_runtime.o
+gcc -o bin/network-encryptor main.o src/core/main_diag.o src/core/interface.o src/core/forwarder.o src/core/bridge_mac.o src/crypto/crypto_policy_utils.o src/crypto/crypto_dispatch.o src/crypto/packet_crypto.o src/crypto/traffic_crypto.o src/crypto/crypto_layer2.o src/crypto/crypto_layer3.o src/crypto/crypto_layer4.o src/crypto/pqc_handshake.o src/crypto/pqc_l2_handshake.o src/core/flow_table.o src/core/fragment.o src/db/config.o src/db/db_config.o src/db/db_env.o src/db/db_runtime.o -L./lib -Wl,-rpath,'$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
+/usr/bin/ld: src/core/forwarder.o: in function `middle_core_thread':
+forwarder.c:(.text+0x3690): undefined reference to `interface_xdp_detach_ifname'
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:50: bin/network-encryptor] Error 1
+root@NE1:/home/clover/network-encryptor# make clean
+rm -rf bin src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o bpf/xdp_redirect.o bpf/xdp_wan_redirect.o
+root@NE1:/home/clover/network-encryptor#

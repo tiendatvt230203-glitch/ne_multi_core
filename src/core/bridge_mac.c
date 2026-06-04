@@ -152,9 +152,21 @@ static void bridge_mac_copy_local_macs(struct forwarder *fwd) {
     }
 }
 
+static void sync_local_src_hwaddr(struct forwarder *fwd, int li) {
+    if (!fwd || !fwd->cfg || li < 0 || li >= fwd->cfg->local_count)
+        return;
+    if (read_local_iface_hwaddr(fwd->cfg->locals[li].ifname,
+                                fwd->cfg->locals[li].src_mac) != 0)
+        return;
+    if (li < fwd->local_count)
+        memcpy(fwd->locals[li].src_mac, fwd->cfg->locals[li].src_mac, MAC_LEN);
+}
+
 int bridge_mac_install(struct forwarder *fwd) {
     if (!fwd || !fwd->cfg)
         return -1;
+    for (int i = 0; i < fwd->cfg->local_count; i++)
+        sync_local_src_hwaddr(fwd, i);
     bridge_mac_copy_local_macs(fwd);
     return 0;
 }
@@ -233,6 +245,7 @@ static void apply_fdb_mac_locked(struct forwarder *fwd, int li, const uint8_t ma
     memcpy(fwd->cfg->locals[li].dst_mac, mac, MAC_LEN);
     if (li < fwd->local_count)
         memcpy(fwd->locals[li].dst_mac, mac, MAC_LEN);
+    sync_local_src_hwaddr(fwd, li);
     snprintf(ifname, sizeof(ifname), "%s", fwd->cfg->locals[li].ifname);
     pthread_mutex_unlock(&g_mac_watch.lock);
 

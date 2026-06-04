@@ -2,9 +2,14 @@
 
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
+#include <net/if.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
 
@@ -32,50 +37,45 @@ static int ifname_is_safe(const char *ifname)
     return 1;
 }
 
-static void xdp_try_detach(int ifindex, const char *ifname)
+void interface_ip_xdp_off(const char *ifname)
 {
-    static const int modes[] = {
-        // XDP_FLAGS_SKB_MODE,
-        XDP_FLAGS_DRV_MODE,
-        //XDP_FLAGS_HW_MODE,
-    };
-
-    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
-        int ret = bpf_xdp_detach(ifindex, modes[i], NULL);
-        if (ret < 0) {
-            int err = -ret;
-            if (err != EINVAL && err != EOPNOTSUPP && err != ENODEV && err != ENOENT && ifname)
-                fprintf(stderr, "[XDP] %s: detach flags=0x%x ret=%d (%s)\n",
-                        ifname, (unsigned)modes[i], ret, strerror(err));
-        }
-    }
-}
-
-void interface_xdp_detach_ifname(const char *ifname)
-{
-    if (!ifname || !ifname[0])
+    if (!ifname || !ifname[0] || !ifname_is_safe(ifname))
         return;
-    unsigned int ix = if_nametoindex(ifname);
-    if (ix > 0)
-        xdp_try_detach((int)ix, ifname);
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
+    int st = system(cmd);
+    int ok = (st == 0) || (WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    fprintf(stderr, "[XDP] ip link set dev %s xdp off: %s\n", ifname, ok ? "ok" : "FAILED");
+    fflush(stderr);
 }
 
-void interface_xdp_detach_all_from_config(const struct app_config *cfg)
+void interface_ip_xdp_off_config(const struct app_config *cfg)
 {
     if (!cfg)
         return;
-    for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++) {
-        unsigned ix = if_nametoindex(cfg->locals[i].ifname);
-        if (ix)
-            xdp_try_detach((int)ix, cfg->locals[i].ifname);
-    }
-    for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++) {
-        if (!cfg->wans[i].dataplane)
-            continue;
-        unsigned ix = if_nametoindex(cfg->wans[i].ifname);
-        if (ix)
-            xdp_try_detach((int)ix, cfg->wans[i].ifname);
-    }
+    for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++)
+        interface_ip_xdp_off(cfg->locals[i].ifname);
+    for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++)
+        interface_ip_xdp_off(cfg->wans[i].ifname);
+}
+
+static int interface_set_promisc_off(const char *ifname)
+{
+    if (!ifname_is_safe(ifname))
+        return -1;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ip link set dev %s promisc off >/dev/null 2>&1", ifname);
+    return system(cmd) == 0 ? 0 : -1;
+}
+
+void interface_promisc_off_config(const struct app_config *cfg)
+{
+    if (!cfg)
+        return;
+    for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++)
+        interface_set_promisc_off(cfg->locals[i].ifname);
+    for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++)
+        interface_set_promisc_off(cfg->wans[i].ifname);
 }
 
 void interface_reset_redirect_maps(void) {}
@@ -519,6 +519,10 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     return 0;
 
 fail:
+    for (int i = 0; i < p->local_count && i < MAX_INTERFACES; i++)
+        interface_ip_xdp_off(p->locals[i].ifname);
+    for (int i = 0; i < p->wan_count && i < MAX_INTERFACES; i++)
+        interface_ip_xdp_off(p->wans[i].ifname);
     ne_pair_close(p);
     return -1;
 #undef NE_TRY
@@ -528,14 +532,6 @@ void ne_pair_close(struct ne_pair *p)
 {
     if (!p)
         return;
-    for (int i = 0; i < p->wan_count; i++) {
-        if (p->xdp_wan_on[i])
-            bpf_xdp_detach(p->wans[i].ifindex, p->xdp_flags, NULL);
-    }
-    for (int i = 0; i < p->local_count; i++) {
-        if (p->xdp_local_on[i])
-            bpf_xdp_detach(p->locals[i].ifindex, p->xdp_flags, NULL);
-    }
     for (int i = 0; i < p->local_count; i++) {
         if (p->bpf_locals[i])
             bpf_object__close(p->bpf_locals[i]);

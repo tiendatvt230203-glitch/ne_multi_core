@@ -36,8 +36,7 @@ static void on_stop_signal(int sig) {
         fprintf(stderr, "\n[STOP] shutting down (Ctrl+C / SIGTERM)\n");
     }
     if (g_stop_signal_count >= 2) {
-        fprintf(stderr, "[STOP] forced exit\n");
-        _exit(130);
+        fprintf(stderr, "[STOP] shutdown in progress (do not spam Ctrl+C)\n");
     }
 }
 
@@ -188,6 +187,7 @@ static void *forwarder_thread_main(void *arg) {
     forwarder_pin_cpu();
     struct runtime_state *rt = (struct runtime_state *)arg;
     if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot]) != 0) {
+        forwarder_cleanup(&rt->fwd);
         if (forwarder_should_stop())
             fprintf(stderr, "[STOP] forwarder init aborted\n");
         else
@@ -671,31 +671,32 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     return 0;
 }
 
-static void runtime_detach_xdp_from_config(const struct runtime_state *rt) {
-    if (!rt)
-        return;
-    const struct app_config *cfg = &rt->cfg_slots[rt->active_slot];
-    if (cfg->local_count == 0 && cfg->wan_count == 0)
-        return;
-    interface_xdp_detach_all_from_config(cfg);
-    for (int i = 0; i < cfg->local_count; i++)
-        fprintf(stderr, "[STOP] XDP detached LAN %s\n", cfg->locals[i].ifname);
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (!cfg->wans[i].dataplane)
-            continue;
-        fprintf(stderr, "[STOP] XDP detached WAN %s\n", cfg->wans[i].ifname);
-    }
+static const struct app_config *runtime_active_cfg(struct runtime_state *rt)
+{
+    if (rt->fwd.cfg)
+        return rt->fwd.cfg;
+    return &rt->cfg_slots[rt->active_slot];
 }
 
 static int runtime_stop_forwarder(struct runtime_state *rt) {
     if (!rt->has_thread)
         return 0;
 
+    const struct app_config *cfg = runtime_active_cfg(rt);
+    fprintf(stderr, "[STOP] ip link xdp off (all LAN/WAN)...\n");
+    fflush(stderr);
+    interface_ip_xdp_off_config(cfg);
+
+    fprintf(stderr, "[STOP] stopping dataplane...\n");
+    fflush(stderr);
     forwarder_stop();
     forwarder_shutdown_resources();
-    runtime_detach_xdp_from_config(rt);
     pthread_join(rt->thread, NULL);
     forwarder_cleanup(&rt->fwd);
+    interface_ip_xdp_off_config(cfg);
+    interface_promisc_off_config(cfg);
+    fprintf(stderr, "[STOP] done\n");
+    fflush(stderr);
     rt->has_thread = 0;
     rt->running = 0;
     return 0;

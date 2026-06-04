@@ -227,7 +227,7 @@ static void wan_drain_finish_slot(struct forwarder *fwd, int dp)
         return;
 
     uint32_t dropped = flush_wan_queue(fwd, dp);
-    interface_xdp_detach_ifname(wan_drains[dp].ifname);
+    interface_ip_xdp_off(wan_drains[dp].ifname);
     wan_stopped[dp] = 1;
     wan_drains[dp].active = 0;
     fprintf(stderr,
@@ -834,19 +834,38 @@ static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
     memcpy(iface->dst_mac, dst_mac, MAC_LEN);
 }
 
-static int set_wan_l2(struct forwarder *fwd, int wan_idx, uint8_t *pkt)
+static int mac_addrs_usable(const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN])
 {
-    (void)fwd;
-    (void)wan_idx;
-    (void)pkt;
+    static const uint8_t zero[MAC_LEN];
+    return memcmp(dst, zero, MAC_LEN) != 0 && memcmp(src, zero, MAC_LEN) != 0;
+}
+
+/* Apply learned client MAC + LAN NIC MAC to frame before TX to local XSK. */
+static int set_local_l2(struct forwarder *fwd, int local_idx, uint8_t *pkt, uint32_t pkt_len)
+{
+    if (!fwd || !pkt || pkt_len < sizeof(struct ether_header) ||
+        local_idx < 0 || local_idx >= fwd->local_count)
+        return -1;
+    const uint8_t *dst = fwd->locals[local_idx].dst_mac;
+    const uint8_t *src = fwd->locals[local_idx].src_mac;
+    if (!mac_addrs_usable(dst, src))
+        return -1;
+    memcpy(pkt, dst, MAC_LEN);
+    memcpy(pkt + MAC_LEN, src, MAC_LEN);
     return 0;
 }
 
-static int set_local_l2(struct forwarder *fwd, int local_idx, uint8_t *pkt)
+static int set_wan_l2(struct forwarder *fwd, int wan_idx, uint8_t *pkt, uint32_t pkt_len)
 {
-    (void)fwd;
-    (void)local_idx;
-    (void)pkt;
+    if (!fwd || !pkt || pkt_len < sizeof(struct ether_header) ||
+        wan_idx < 0 || wan_idx >= fwd->wan_count)
+        return -1;
+    const uint8_t *dst = fwd->wans[wan_idx].dst_mac;
+    const uint8_t *src = fwd->wans[wan_idx].src_mac;
+    if (!mac_addrs_usable(dst, src))
+        return 0;
+    memcpy(pkt, dst, MAC_LEN);
+    memcpy(pkt + MAC_LEN, src, MAC_LEN);
     return 0;
 }
 
@@ -967,7 +986,7 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
                                       pkt, pkt_len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, wan_idx, pkt) != 0 || set_wan_l2(fwd, wan_idx, f2) != 0)
+        if (set_wan_l2(fwd, wan_idx, pkt, l1) != 0 || set_wan_l2(fwd, wan_idx, f2, l2) != 0)
             return -1;
         if (emit_split_pair_to_wan(fwd, job, l1, f2, l2, wan_idx) != 0)
             return -1;
@@ -979,7 +998,7 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
                                    pkt, pkt_len, fwd->pair.frame_size, &l1,
                                    f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, wan_idx, pkt) != 0 || set_wan_l2(fwd, wan_idx, f2) != 0)
+        if (set_wan_l2(fwd, wan_idx, pkt, l1) != 0 || set_wan_l2(fwd, wan_idx, f2, l2) != 0)
             return -1;
         if (emit_split_pair_to_wan(fwd, job, l1, f2, l2, wan_idx) != 0)
             return -1;
@@ -991,7 +1010,7 @@ static int encrypt_split_or_single(struct forwarder *fwd, struct ne_packet *job,
                                       pkt, pkt_len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
-        if (set_wan_l2(fwd, wan_idx, pkt) != 0 || set_wan_l2(fwd, wan_idx, f2) != 0)
+        if (set_wan_l2(fwd, wan_idx, pkt, l1) != 0 || set_wan_l2(fwd, wan_idx, f2, l2) != 0)
             return -1;
         if (emit_split_pair_to_wan(fwd, job, l1, f2, l2, wan_idx) != 0)
             return -1;
@@ -1210,7 +1229,7 @@ static void process_local_packet(struct forwarder *fwd, struct ne_packet job)
     if (!wan_has_tx_room(fwd, wan_idx))
         goto drop;
 
-    if (set_wan_l2(fwd, wan_idx, pkt) != 0)
+    if (set_wan_l2(fwd, wan_idx, pkt, job.len) != 0)
         goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {
@@ -1400,7 +1419,7 @@ static void process_wan_packet(struct forwarder *fwd, struct ne_packet job)
     int local_idx = pick_local_for_packet(fwd, pkt, job.len);
     if (local_idx < 0 || local_idx >= fwd->local_count)
         goto drop;
-    if (set_local_l2(fwd, local_idx, pkt) != 0)
+    if (set_local_l2(fwd, local_idx, pkt, job.len) != 0)
         goto drop;
 
     job.dir = NE_DIR_LOCAL;
@@ -1579,7 +1598,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
                         cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
     }
 
-    interface_xdp_detach_all_from_config(cfg);
+    interface_ip_xdp_off_config(cfg);
     interface_reset_redirect_maps();
 
     if (bridge_mac_prepare(cfg) != 0)
@@ -1607,8 +1626,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     memset(prev_active_policies, 0, sizeof(prev_active_policies));
     if (ne_pair_open(&fwd->pair, cfg) != 0)
         return -1;
-    if (forwarder_should_stop())
+    if (forwarder_should_stop()) {
+        forwarder_cleanup(fwd);
         return -1;
+    }
 
     if (ne_ring_init(&fwd->local_to_mid, NE_RING) != 0 ||
         ne_ring_init(&fwd->wan_to_mid, NE_RING) != 0) {
@@ -1897,8 +1918,6 @@ void forwarder_shutdown_resources(void)
     pthread_cond_broadcast(&reload_wait_cv);
     pthread_mutex_unlock(&reload_wait_mtx);
     bridge_mac_watch_stop();
-    if (g_active_fwd && g_active_fwd->cfg)
-        interface_xdp_detach_all_from_config(g_active_fwd->cfg);
 }
 
 int forwarder_should_stop(void)
