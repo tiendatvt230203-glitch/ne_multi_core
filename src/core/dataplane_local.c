@@ -164,9 +164,13 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     pi = (int)(cp - fwd->cfg->policies);
+    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
+        goto drop;
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx)
         goto drop;
+    pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
+    pctx->policy_id = cp->id;
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx);
     if (enc < 0)

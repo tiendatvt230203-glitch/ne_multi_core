@@ -8,8 +8,6 @@
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 
-#include "../../inc/core/ne_pqc_bridge.h"
-
 #include <net/if.h>
 #include <pthread.h>
 #include <sched.h>
@@ -213,13 +211,11 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (forwarder_should_stop())
         return -1;
 
-    ne_pqc_runtime_setup_profiles(cfg);
-    ne_pqc_start_handshakes(cfg);
-
     fwd_crypto_reset_on_init();
     if (fwd_crypto_ensure_profile_slots(cfg) != 0)
         return -1;
 
+    /* PQC wire path uses HARDCODED_KEY in crypto_pqc_layer.h; HS optional for later. */
     if (ne_pair_open(&fwd->pair, cfg) != 0)
         return -1;
     if (forwarder_should_stop()) {

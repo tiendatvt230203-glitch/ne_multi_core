@@ -2,7 +2,6 @@
 
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
-#include "../../inc/core/ne_pqc_bridge.h"
 #include "../../inc/crypto/traffic_crypto.h"
 
 #include <sched.h>
@@ -245,11 +244,11 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             policy_index_by_action_id[cp->action][(uint8_t)cp->id] = i;
 
         int reused = 0;
-        if (cp->id >= 0 && cp->id <= 255) {
+        if (cp->crypto_mode != CRYPTO_MODE_PQC && cp->id >= 0 && cp->id <= 255) {
             int old_i = old_policy_index_by_action_id[cp->action][(uint8_t)cp->id];
             if (old_i >= 0 && old_i < old_active_policy_count && old_policy_crypto_ready[old_i]) {
                 const struct crypto_policy *old_cp = &old_active_policies[old_i];
-                if (                    old_cp->crypto_mode == cp->crypto_mode &&
+                if (old_cp->crypto_mode == cp->crypto_mode &&
                     old_cp->aes_bits == cp->aes_bits &&
                     memcmp(old_cp->key, cp->key, AES_KEY_LEN) == 0) {
                     policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
@@ -289,17 +288,14 @@ int fwd_crypto_rebuild(struct app_config *cfg)
                 int old_pid = policy_profile_id_by_action_id[cp->action][(uint8_t)cp->id];
                 if (old_pid > 0 && old_pid != p->id) {
                     fprintf(stderr,
-                            "[RELOAD] policy id collision action=%d id=%d profile=%d conflicts with profile=%d\n",
+                            "[RELOAD] policy id collision action=%d id=%d profile=%d conflicts with profile=%d (warn)\n",
                             cp->action, cp->id, p->id, old_pid);
-                    return -1;
                 }
                 policy_profile_id_by_action_id[cp->action][(uint8_t)cp->id] = p->id;
             }
             if (cp->crypto_mode == CRYPTO_MODE_PQC && policy_crypto_ready[pi]) {
                 policy_crypto_ctx[pi].profile_id = p->id;
                 policy_crypto_ctx[pi].policy_id = cp->id;
-                if (ne_pqc_profile_binding_key_ready(p->id))
-                    packet_crypto_update_keys(&policy_crypto_ctx[pi]);
             }
         }
     }
