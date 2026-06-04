@@ -8,8 +8,7 @@
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 
-#include "../../inc/crypto/pqc_handshake.h"
-#include "../../inc/crypto/pqc_l2_handshake.h"
+#include "../../inc/core/ne_pqc_bridge.h"
 
 #include <net/if.h>
 #include <pthread.h>
@@ -214,8 +213,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (forwarder_should_stop())
         return -1;
 
-    pqc_runtime_setup_profiles(cfg);
-    pqc_handshake_start_all_profiles(cfg);
+    ne_pqc_runtime_setup_profiles(cfg);
+    ne_pqc_start_handshakes(cfg);
 
     fwd_crypto_reset_on_init();
     if (fwd_crypto_ensure_profile_slots(cfg) != 0)

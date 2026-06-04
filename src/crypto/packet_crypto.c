@@ -9,7 +9,7 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdatomic.h>
-#include "../../inc/crypto/pqc_handshake.h"
+#include "pqc_handshake.h"
 static uint16_t g_fake_ethertype_ipv4 = 0;
 static __thread uint8_t g_fake_protocol = 99;
 static int g_encrypt_layer = 0;

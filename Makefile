@@ -1,7 +1,7 @@
 CC     = gcc
 CLANG  = clang
 
-CFLAGS = -D_GNU_SOURCE -I. -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
+CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
 LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
@@ -21,6 +21,7 @@ APP_SRC = main.c \
           src/core/dataplane_local.c \
           src/core/dataplane_wan.c \
           src/core/bridge_mac.c \
+          src/core/ne_pqc_bridge.c \
           src/crypto/crypto_policy_utils.c \
           src/crypto/crypto_dispatch.c \
           src/crypto/packet_crypto.c \

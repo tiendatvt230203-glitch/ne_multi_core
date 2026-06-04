@@ -50,11 +50,6 @@ bool sig_pqc_is_key_ready(void);
 int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]);
 
 /**
- * Sets the global identity for this system (RAM-only).
- */
-void sig_pqc_set_global_identity(const char *priv, const char *pub);
-
-/**
  * Sets the peer's identity public key (loaded from global DB).
  */
 void sig_pqc_set_peer_identity(const char *pub, const char *peer_fingerprint);
@@ -75,10 +70,6 @@ void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const cha
 int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);
-
-int sig_pqc_ensure_profile_binding(int profile_id);
-bool sig_pqc_profile_binding_key_ready(int profile_id);
-int sig_pqc_default_local_fingerprint(char out_fp[16]);
 
 void sig_pqc_feed_rx_packet(const uint8_t *udp_payload, int payload_len);
 

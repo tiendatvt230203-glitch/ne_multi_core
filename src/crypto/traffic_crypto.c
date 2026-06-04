@@ -1,20 +1,44 @@
-#include "../inc/crypto/traffic_crypto.h"
-#include "../inc/crypto/scrypt.h"
+#include "../inc/traffic_crypto.h"
+#include "../inc/scrypt.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
 #define TAG_SIZE_GCM 16
+#define HKDF_SALT "network_encryptor_xdp_salt_v1"
+#define HKDF_INFO "session_key_expansion"
 
 // External declaration for the underlying symbol is no longer needed
 static int g_pqc_initialized = 0;
+
+static __thread uint8_t tls_pqc_salt[8];
+static __thread uint32_t tls_pqc_counter = 0;
+static __thread int tls_salt_initalized = 0;
 
 static void* get_aligned_library_obj(void* (*new_func)(), void (*free_func)(void*));
 
 int trf_pqc_generate_nonce(byte* out_nonce) {
     if (!out_nonce) return TRF_PQC_ERR_INIT;
-    // Use the library's random generator as recommended by tutorial
-    return scrypt_RandomBytes(out_nonce, 12);
+    
+    if (__builtin_expect(!tls_salt_initalized, 0)) {
+        int ret = scrypt_RandomBytes(tls_pqc_salt, 8);
+        if (ret != 0) {
+            fprintf(stderr, "[PQC-GENNONCE] Failed when generate nonce for packet!\n");
+            return TRF_PQC_ERR_CRYPTO;
+        }
+        tls_salt_initalized = 1;
+    }
+
+    uint32_t cnt = ++tls_pqc_counter;
+
+    memcpy(out_nonce, tls_pqc_salt, 8);
+    memcpy(out_nonce + 8, &cnt, 4);
+
+    return 0;
 }
 
 const char* trf_pqc_error_string(int err) {
@@ -134,24 +158,31 @@ void trf_base64_decode_obfuscated(const char *src, const char *seed, unsigned ch
     }
 }
 
+int trf_save_key_to_file(const char *filename, const char *data, int mode) {
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return -1;
+    ssize_t written = write(fd, data, strlen(data));
+    write(fd, "\n", 1);
+    close(fd);
+    return (written > 0) ? 0 : -1;
+}
+
 // =========================================================
-// DATA PLANE: ENCRYPTION (AES-GCM)
+// DATA PLANE: ENCRYPTION
 // =========================================================
 
-int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
+// =========================================================
+// DATA PLANE: ENCRYPTION (AES-GCM / AES-CBC)
+// =========================================================
+
+int trf_encrypt_payload_gcm(SCryptCipherCtx* ctx, const byte* key, const byte* nonce, int nonce_len, 
                             const byte* aad, int aad_len,
                             byte* data, int len, int* new_len_out) {
-    (void)aad;
-    (void)aad_len;
-    if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
-
-    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
-    if (!ctx) return TRF_PQC_ERR_CRYPTO;
+    if (!g_pqc_initialized || !data || len == 0 || !ctx) return TRF_PQC_ERR_CRYPTO;
 
     int ret;
     if ((ret = scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION)) != 0) {
-        fprintf(stderr, "[GCM-ENC] Init failed: %d\n", ret);
-        goto err;
+        return TRF_PQC_ERR_CRYPTO;
     }
 
     // Explicitly set tag size for GCM
@@ -160,61 +191,46 @@ int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len,
     // Optional AAD - Must be 64-byte aligned for hardware acceleration to process it
     // if (aad && aad_len > 0) {
     //     byte aligned_aad[256] __attribute__((aligned(64)));
-    //     if (aad_len > (int)sizeof(aligned_aad)) goto err;
+    //     if (aad_len > (int)sizeof(aligned_aad)) return TRF_PQC_ERR_CRYPTO;
     //     memcpy(aligned_aad, aad, aad_len);
     //     if ((ret = scrypt_CipherUpdateAAD(ctx, aligned_aad, (word32)aad_len)) != 0) {
-    //         fprintf(stderr, "[GCM-ENC] AAD Update failed: %d\n", ret);
-    //         goto err;
+    //         return TRF_PQC_ERR_CRYPTO;
     //     }
     // }
 
     word32 outLen = 0, finalLen = 0;
     if ((ret = scrypt_CipherUpdate(ctx, data, len, data, &outLen)) != 0) {
-        fprintf(stderr, "[GCM-ENC] Update failed: %d\n", ret);
-        goto err;
+        return TRF_PQC_ERR_CRYPTO;
     }
     
     // GCM Final usually handles authentication tag generation
     if ((ret = scrypt_CipherFinal(ctx, data + outLen, &finalLen)) != 0) {
-        fprintf(stderr, "[GCM-ENC] Final failed: %d\n", ret);
-        goto err;
+        return TRF_PQC_ERR_CRYPTO;
     }
 
     byte tag[TAG_SIZE_GCM];
     word32 tagLen = TAG_SIZE_GCM;
     if ((ret = scrypt_CipherGetTag(ctx, tag, &tagLen)) != 0) {
-        fprintf(stderr, "[GCM-ENC] GetTag failed: %d\n", ret);
-        goto err;
+        return TRF_PQC_ERR_CRYPTO;
     }
 
     memcpy(data + outLen + finalLen, tag, TAG_SIZE_GCM);
     *new_len_out = outLen + finalLen + TAG_SIZE_GCM;
 
-    scrypt_CipherCtxFree(ctx);
     return TRF_PQC_OK;
-err:
-    scrypt_CipherCtxFree(ctx);
-    return TRF_PQC_ERR_CRYPTO;
 }
 
-int trf_decrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
+int trf_decrypt_payload_gcm(SCryptCipherCtx* ctx, const byte* key, const byte* nonce, int nonce_len, 
                             const byte* aad, int aad_len,
                             byte* data, int len, int* orig_len_out) {
-    (void)aad;
-    (void)aad_len;
-    if (!g_pqc_initialized || !data || len <= TAG_SIZE_GCM) return TRF_PQC_ERR_CRYPTO;
-
-    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
-    if (!ctx) return TRF_PQC_ERR_CRYPTO;
+    if (!g_pqc_initialized || !data || len <= TAG_SIZE_GCM || !ctx) return TRF_PQC_ERR_CRYPTO;
 
     int ret;
     if ((ret = scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_DECRYPTION)) != 0) {
-        fprintf(stderr, "[GCM-DEC] Init failed: %d\n", ret);
-        goto err;
+        return TRF_PQC_ERR_CRYPTO;
     }
 
     // CRITICAL FIX: Explicitly set the expected tag size for the context
-    // Without this, the library may use a default size (like 0 or 14), causing authentication to fail (-180).
     scrypt_CipherSetTagSize(ctx, TAG_SIZE_GCM);
 
     int payload_len = len - TAG_SIZE_GCM;
@@ -222,31 +238,68 @@ int trf_decrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len,
     memcpy(tag, data + payload_len, TAG_SIZE_GCM);
 
     // 1. Set tag for verification first
-    if (scrypt_CipherSetTag(ctx, tag, TAG_SIZE_GCM) != 0) goto err;
+    if (scrypt_CipherSetTag(ctx, tag, TAG_SIZE_GCM) != 0) return TRF_PQC_ERR_CRYPTO;
 
     // 1. Process AAD (Network Header) - Align to 64-byte for hardware acceleration
     // if (aad && aad_len > 0) {
     //     byte aligned_aad[256] __attribute__((aligned(64)));
-    //     if (aad_len > (int)sizeof(aligned_aad)) goto err;
+    //     if (aad_len > (int)sizeof(aligned_aad)) return TRF_PQC_ERR_CRYPTO;
     //     memcpy(aligned_aad, aad, aad_len);
-    //     if (scrypt_CipherUpdateAAD(ctx, aligned_aad, (word32)aad_len) != 0) goto err;
+    //     if (scrypt_CipherUpdateAAD(ctx, aligned_aad, (word32)aad_len) != 0) return TRF_PQC_ERR_CRYPTO;
     // }
 
     // 3. Process Ciphertext
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, payload_len, data, &outLen) != 0) goto err;
+    if (scrypt_CipherUpdate(ctx, data, payload_len, data, &outLen) != 0) return TRF_PQC_ERR_CRYPTO;
     
     // 4. Finalize and verify integrity (returns non-zero if AAD or Data was tampered)
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) return TRF_PQC_ERR_CRYPTO;
 
     *orig_len_out = outLen + finalLen;
+    return TRF_PQC_OK;
+}
+
+int trf_encrypt_payload_cbc(const byte* key, const byte* iv, int iv_len, byte* data, int len) {
+    if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
+    
+    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
+
+    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_ENCRYPTION) != 0) goto err;
+
+    word32 outLen = 0, finalLen = 0;
+    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
+
     scrypt_CipherCtxFree(ctx);
     return TRF_PQC_OK;
-
 err:
     scrypt_CipherCtxFree(ctx);
     return TRF_PQC_ERR_CRYPTO;
 }
+
+int trf_decrypt_payload_cbc(const byte* key, const byte* iv, int iv_len, byte* data, int len) {
+    if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
+    
+    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
+
+    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_DECRYPTION) != 0) goto err;
+
+    word32 outLen = 0, finalLen = 0;
+    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
+
+    scrypt_CipherCtxFree(ctx);
+    return TRF_PQC_OK;
+err:
+    scrypt_CipherCtxFree(ctx);
+    return TRF_PQC_ERR_CRYPTO;
+}
+
+// =========================================================
+// HASHING & MAC (SHA2 / SHA3 / HMAC)
+// =========================================================
 
 int trf_calculate_digest(SCryptDigestType type, const byte* data, int len, byte* digest_out) {
     SCryptDigestCtx* ctx = (SCryptDigestCtx*)get_aligned_library_obj(
@@ -381,6 +434,24 @@ int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz,
     return TRF_PQC_OK;
 }
 
+int trf_derive_session_keys(const byte* shared_secret, int ss_len, 
+                            byte* tx_key_out, byte* rx_key_out) {
+    byte key_material[64] __attribute__((aligned(64)));
+    
+    int ret = scrypt_HKDF(DIGEST_TYPE_SHA512, shared_secret, ss_len, 
+                          (const byte*)HKDF_SALT, strlen(HKDF_SALT), 
+                          (const byte*)HKDF_INFO, strlen(HKDF_INFO), 
+                          key_material, 64);
+                          
+    if (ret != 0) return TRF_PQC_ERR_CRYPTO;
+
+    memcpy(tx_key_out, key_material, 32);
+    memcpy(rx_key_out, key_material + 32, 32);
+    
+    memset(key_material, 0, sizeof(key_material));
+    return TRF_PQC_OK;
+}
+
 // =========================================================
 // CONTROL PLANE: PQC DIGITAL SIGNATURES (ML-DSA LEVEL 5)
 // =========================================================
@@ -458,13 +529,81 @@ int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz,
     
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
+    fprintf(stderr, "[DEBUG-VERIFY] Entering trf_dsa_verify_payload...\n");
+    fprintf(stderr, "[DEBUG-VERIFY] pub_sz = %d, len = %d, sig_sz = %d\n", pub_sz, len, sig_sz);
+
+    // Calculate fingerprint of incoming public key to verify
+    uint8_t hash[64];
+    trf_calculate_digest(DIGEST_TYPE_SHA256, pub_key_in, pub_sz, hash);
+    char fingerprint[16];
+    for(int i=0; i<4; i++) sprintf(fingerprint + i*2, "%02x", hash[i]);
+    fprintf(stderr, "[DEBUG-VERIFY] Key fingerprint to verify: %s\n", fingerprint);
+
     int import_ret = scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5);
     if (import_ret != 0) {
+        fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaImportPublicKey failed: %d\n", import_ret);
         scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
     int ret = scrypt_MlDsaVerify(key_obj, data, len, sig_in, sig_sz);
+    if (ret != 0) {
+        fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify failed: %d\n", ret);
+    } else {
+        fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify SUCCESS\n");
+    }
     scrypt_MlDsaKeyFree(key_obj);
     return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;
+}
+// =========================================================
+// COMPOSITE PQC LOGIC (HANDSHAKE + DERIVATION)
+// =========================================================
+
+int trf_pqc_setup_session(const byte* local_priv_dsa, int local_priv_dsa_sz,
+                         const byte* remote_pub_dsa, int remote_pub_dsa_sz,
+                         const byte* remote_pub_kem, int remote_pub_kem_sz,
+                         trf_pqc_session* session_out) {
+    
+    if (!g_pqc_initialized || !session_out) return TRF_PQC_ERR_INIT;
+
+    byte shared_secret[64];
+    byte capsule[2048]; 
+    int capsule_sz = 0;
+    int ss_sz = 64;
+    int ret;
+
+    // 1. ML-KEM: Encapsulate to get shared secret and capsule
+    ret = trf_kem_encapsulate(remote_pub_kem, remote_pub_kem_sz, capsule, &capsule_sz, shared_secret);
+    if (ret != TRF_PQC_OK) {
+        fprintf(stderr, "[PQC-KEM] Encapsulation failed: %s\n", scrypt_ErrorString(ret));
+        return TRF_PQC_ERR_CRYPTO;
+    }
+
+    // 2. ML-DSA: Sign the capsule to ensure authenticity
+    byte signature[5000]; 
+    int sig_sz = 0;
+    ret = trf_dsa_sign_payload(local_priv_dsa, local_priv_dsa_sz, capsule, capsule_sz, signature, &sig_sz);
+    if (ret != TRF_PQC_OK) {
+        fprintf(stderr, "[PQC-DSA] Signing failed: %s\n", scrypt_ErrorString(ret));
+        return TRF_PQC_ERR_SIG;
+    }
+
+    // 3. Verification: Simulate remote verification
+    ret = trf_dsa_verify_payload(remote_pub_dsa, remote_pub_dsa_sz, capsule, capsule_sz, signature, sig_sz);
+    if (ret != TRF_PQC_OK) {
+        fprintf(stderr, "[PQC-DSA] Signature verification failed: %s\n", scrypt_ErrorString(ret));
+        return TRF_PQC_ERR_SIG;
+    }
+
+    // 4. HKDF: Expand shared secret into Session Keys
+    ret = trf_derive_session_keys(shared_secret, ss_sz, session_out->tx_key, session_out->rx_key);
+    if (ret != TRF_PQC_OK) {
+        fprintf(stderr, "[PQC-HKDF] Key derivation failed: %s\n", scrypt_ErrorString(ret));
+        return TRF_PQC_ERR_CRYPTO;
+    }
+
+    session_out->is_active = 1;
+    memset(shared_secret, 0, sizeof(shared_secret));
+    
+    return TRF_PQC_OK;
 }

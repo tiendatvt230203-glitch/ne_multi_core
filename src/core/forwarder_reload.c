@@ -3,8 +3,7 @@
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
 
-#include "../../inc/crypto/pqc_handshake.h"
-#include "../../inc/crypto/pqc_l2_handshake.h"
+#include "../../inc/core/ne_pqc_bridge.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -131,8 +130,8 @@ static int forwarder_reload_wan_removal_impl(struct forwarder *fwd, struct app_c
     fwd_crypto_snapshot_active_to_prev();
     int rc = fwd_crypto_rebuild(cfg);
     if (rc == 0) {
-        pqc_runtime_setup_profiles(cfg);
-        pqc_handshake_start_all_profiles(cfg);
+        ne_pqc_runtime_setup_profiles(cfg);
+        ne_pqc_start_handshakes(cfg);
     } else {
         fwd_crypto_clear_grace();
     }
@@ -167,8 +166,8 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
     if (forwarder_should_stop())
         return -1;
     if (rc == 0) {
-        pqc_runtime_setup_profiles(cfg);
-        pqc_handshake_start_all_profiles(cfg);
+        ne_pqc_runtime_setup_profiles(cfg);
+        ne_pqc_start_handshakes(cfg);
     }
     if (rc != 0)
         fwd_crypto_clear_grace();

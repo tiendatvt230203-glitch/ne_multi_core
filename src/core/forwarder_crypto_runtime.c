@@ -2,7 +2,7 @@
 
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
-#include "../../inc/crypto/pqc_handshake.h"
+#include "../../inc/core/ne_pqc_bridge.h"
 #include "../../inc/crypto/traffic_crypto.h"
 
 #include <sched.h>
@@ -298,7 +298,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             if (cp->crypto_mode == CRYPTO_MODE_PQC && policy_crypto_ready[pi]) {
                 policy_crypto_ctx[pi].profile_id = p->id;
                 policy_crypto_ctx[pi].policy_id = cp->id;
-                if (sig_pqc_profile_binding_key_ready(p->id))
+                if (ne_pqc_profile_binding_key_ready(p->id))
                     packet_crypto_update_keys(&policy_crypto_ctx[pi]);
             }
         }
