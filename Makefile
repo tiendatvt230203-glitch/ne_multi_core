@@ -14,6 +14,12 @@ APP_SRC = main.c \
           src/core/main_diag.c \
           src/core/interface.c \
           src/core/forwarder.c \
+          src/core/forwarder_wan.c \
+          src/core/forwarder_reload.c \
+          src/core/forwarder_crypto_runtime.c \
+          src/core/dataplane_util.c \
+          src/core/dataplane_local.c \
+          src/core/dataplane_wan.c \
           src/core/bridge_mac.c \
           src/crypto/crypto_policy_utils.c \
           src/crypto/crypto_dispatch.c \
