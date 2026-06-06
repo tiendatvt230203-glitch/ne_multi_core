@@ -17,6 +17,12 @@ void lan_neigh_learn(int local_idx, uint32_t ip, const uint8_t mac[MAC_LEN],
 
 int lan_neigh_lookup(int local_idx, uint32_t ip, uint8_t mac_out[MAC_LEN]);
 
+int lan_neigh_lookup_by_ip(uint32_t ip, int *local_idx_out, uint8_t mac_out[MAC_LEN]);
+
+/* WAN->LAN: find (local port, MAC); ARP probe on miss. Logs via main_diag. */
+int lan_neigh_resolve(struct forwarder *fwd, uint32_t ip,
+                      int *local_idx_out, uint8_t mac_out[MAC_LEN]);
+
 int lan_neigh_is_own_src(const struct forwarder *fwd, int local_idx,
                          const uint8_t *pkt, uint32_t pkt_len);
 

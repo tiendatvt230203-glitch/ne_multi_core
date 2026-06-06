@@ -229,7 +229,9 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
 }
 
 static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
-                             const char *ifname, int queue_count)
+                             const char *ifname, int queue_count,
+                             struct xsk_ring_prod *shared_fq,
+                             struct xsk_ring_cons *shared_cq)
 {
     struct xsk_socket_config cfg = {
         .rx_size = NE_RING,
@@ -252,7 +254,7 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
         struct ne_xsk_queue *slot = &iface->queues[q];
         int ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
                                             &slot->rx, &slot->tx,
-                                            &slot->fq, &slot->cq, &cfg);
+                                            shared_fq, shared_cq, &cfg);
         if (ret) {
             fprintf(stderr, "[XSK] create %s queue=%d failed: %d\n", ifname, q, ret);
             return -1;
@@ -308,6 +310,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         return -1;
 
     memset(p, 0, sizeof(*p));
+    if (pthread_mutex_init(&p->umem_fq_lock, NULL) != 0)
+        return -1;
     p->local_count = cfg->local_count;
     if (p->local_count > MAX_INTERFACES)
         p->local_count = MAX_INTERFACES;
@@ -376,16 +380,20 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize,
                             &p->locals[0].queues[0].fq,
                             &p->locals[0].queues[0].cq, &ucfg));
+    {
+        struct xsk_ring_prod *shared_fq = &p->locals[0].queues[0].fq;
+        struct xsk_ring_cons *shared_cq = &p->locals[0].queues[0].cq;
 
-    for (int i = 0; i < p->local_count; i++)
-        NE_TRY(open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
-                                 p->locals[i].queue_count));
-    for (int di = 0; di < p->wan_count; di++) {
-        int ci = config_wan_dp_to_cfg(cfg, di);
-        if (ci < 0)
-            goto fail;
-        NE_TRY(open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
-                                 p->wans[di].queue_count));
+        for (int i = 0; i < p->local_count; i++)
+            NE_TRY(open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
+                                     p->locals[i].queue_count, shared_fq, shared_cq));
+        for (int di = 0; di < p->wan_count; di++) {
+            int ci = config_wan_dp_to_cfg(cfg, di);
+            if (ci < 0)
+                goto fail;
+            NE_TRY(open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
+                                     p->wans[di].queue_count, shared_fq, shared_cq));
+        }
     }
 
     for (int i = 0; i < p->local_count; i++) {
@@ -409,13 +417,12 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(update_xsk_map_iface(&p->wans[di], bpf_map__fd(wan_map)));
     }
 
-    uint32_t prefill = NE_RING - 1;
-    if (prefill == 0)
-        prefill = 1;
-    for (int i = 0; i < p->local_count; i++)
-        prefill_iface(p, &p->locals[i], prefill);
-    for (int i = 0; i < p->wan_count; i++)
-        prefill_iface(p, &p->wans[i], prefill);
+    {
+        uint32_t prefill = NE_RING - 1;
+        if (prefill == 0)
+            prefill = 1;
+        prefill_queue(p, &p->locals[0].queues[0], prefill);
+    }
 
     return 0;
 
@@ -453,6 +460,7 @@ void ne_pair_close(struct ne_pair *p)
                 xsk_socket__delete(p->locals[i].queues[q].xsk);
         }
     }
+    pthread_mutex_destroy(&p->umem_fq_lock);
     if (p->umem)
         xsk_umem__delete(p->umem);
     ne_pool_destroy(&p->pool);

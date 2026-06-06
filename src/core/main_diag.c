@@ -354,3 +354,30 @@ void main_diag_log_lan_neigh_event(const char *ifname, uint32_t client_ip,
     tbl_hline(w, 5);
     fflush(stderr);
 }
+
+void main_diag_log_lan_neigh_resolve(const char *ifname, uint32_t client_ip,
+                                     const uint8_t client_mac[6],
+                                     const char *via)
+{
+    static const int w[DIAG_TBL_N] = { 10, 12, 16, 20, 12, 0, 0, 0 };
+    static const char *hdr[DIAG_TBL_N] = {
+        "event", "interface", "client_ip", "client_mac", "via", "", "", ""
+    };
+    char c0[16], c1[16], c2[20], c3[24], c4[16];
+
+    snprintf(c0, sizeof(c0), "%s",
+             via && strcmp(via, "miss") == 0 ? "miss" : "resolve");
+    snprintf(c1, sizeof(c1), "%s", ifname ? ifname : "?");
+    fmt_ip4(c2, sizeof(c2), client_ip);
+    fmt_mac(c3, sizeof(c3), client_mac);
+    snprintf(c4, sizeof(c4), "%s", via && via[0] ? via : "?");
+
+    fprintf(stderr, "\n  [LAN-NEIGH]\n");
+    tbl_hline(w, 5);
+    tbl_row(w, 5, hdr);
+    tbl_hline(w, 5);
+    const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, c4, "", "", "" };
+    tbl_row(w, 5, row);
+    tbl_hline(w, 5);
+    fflush(stderr);
+}

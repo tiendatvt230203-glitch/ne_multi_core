@@ -20,4 +20,8 @@ void main_diag_log_lan_neigh_event(const char *ifname, uint32_t client_ip,
                                    const uint8_t new_mac[6],
                                    const char *event);
 
+void main_diag_log_lan_neigh_resolve(const char *ifname, uint32_t client_ip,
+                                     const uint8_t client_mac[6],
+                                     const char *via);
+
 #endif

@@ -207,11 +207,6 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     return 0;
 }
 
-static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
-{
-    return config_find_local_for_ip(fwd->cfg, dp_dest_ipv4(pkt, len));
-}
-
 void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -229,13 +224,13 @@ void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
-    li = pick_local(fwd, pkt, job.len);
-    if (li < 0 || li >= fwd->local_count)
-        goto drop;
     {
         uint8_t client_mac[MAC_LEN];
         uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
-        if (dest_ip == 0 || lan_neigh_lookup(li, dest_ip, client_mac) != 0)
+
+        if (dest_ip == 0 || lan_neigh_resolve(fwd, dest_ip, &li, client_mac) != 0)
+            goto drop;
+        if (li < 0 || li >= fwd->local_count)
             goto drop;
         if (dp_write_l2(pkt, job.len, client_mac, fwd->locals[li].src_mac, 0) != 0)
             goto drop;

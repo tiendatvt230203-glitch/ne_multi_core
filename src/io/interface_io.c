@@ -237,16 +237,21 @@ static void drain_cq_iface(struct ne_iface *iface, struct ne_pool *pool)
         drain_cq_queue(&iface->queues[q], pool);
 }
 
+static void drain_cq_shared(struct ne_pair *p)
+{
+    pthread_mutex_lock(&p->umem_fq_lock);
+    drain_cq_queue(&p->locals[0].queues[0], &p->pool);
+    pthread_mutex_unlock(&p->umem_fq_lock);
+}
+
 void ne_drain_cq_local(struct ne_pair *p)
 {
-    for (int i = 0; i < p->local_count; i++)
-        drain_cq_iface(&p->locals[i], &p->pool);
+    drain_cq_shared(p);
 }
 
 void ne_drain_cq_wan(struct ne_pair *p)
 {
-    for (int i = 0; i < p->wan_count; i++)
-        drain_cq_iface(&p->wans[i], &p->pool);
+    drain_cq_shared(p);
 }
 
 static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
@@ -275,16 +280,21 @@ static void refill_fq_iface(struct ne_iface *iface, struct ne_pool *pool)
         refill_fq_queue(&iface->queues[q], pool);
 }
 
+static void refill_fq_shared(struct ne_pair *p)
+{
+    pthread_mutex_lock(&p->umem_fq_lock);
+    refill_fq_queue(&p->locals[0].queues[0], &p->pool);
+    pthread_mutex_unlock(&p->umem_fq_lock);
+}
+
 void ne_refill_fq_local(struct ne_pair *p)
 {
-    for (int i = 0; i < p->local_count; i++)
-        refill_fq_iface(&p->locals[i], &p->pool);
+    refill_fq_shared(p);
 }
 
 void ne_refill_fq_wan(struct ne_pair *p)
 {
-    for (int i = 0; i < p->wan_count; i++)
-        refill_fq_iface(&p->wans[i], &p->pool);
+    refill_fq_shared(p);
 }
 
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,

@@ -124,6 +124,7 @@ struct ne_pair {
     uint8_t xdp_local_on[MAX_INTERFACES];
     uint8_t xdp_wan_on[MAX_INTERFACES];
     uint32_t xdp_flags;
+    pthread_mutex_t umem_fq_lock;
 };
 
 int ne_ring_init(struct ne_ring *r, uint32_t cap);
