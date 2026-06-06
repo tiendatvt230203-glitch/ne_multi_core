@@ -77,11 +77,6 @@ int pqc_l2_init_peer(struct pqc_l2_peer *peer, const char *ifname) {
         return -1;
     }
 
-    printf("[PQC-L2] Bound to %s. Local MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-           ifname,
-           peer->local_mac[0], peer->local_mac[1], peer->local_mac[2],
-           peer->local_mac[3], peer->local_mac[4], peer->local_mac[5]);
-    
     return 0;
 }
 
@@ -115,7 +110,6 @@ int pqc_l2_discover_peer_mac(struct pqc_l2_peer *peer, int timeout_sec) {
     sll.sll_halen = 6;
     memset(sll.sll_addr, 0xFF, 6);
 
-    printf("[PQC-L2] Sending broadcast discovery probe on %s...\n", peer->ifname);
     if (sendto(peer->raw_sock_fd, pkt, 14 + sizeof(struct pqc_l2_hdr), 0, 
                (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         perror("[PQC-L2] Broadcast probe send failed");
@@ -149,9 +143,6 @@ int pqc_l2_discover_peer_mac(struct pqc_l2_peer *peer, int timeout_sec) {
             // Extracted learned MAC from incoming Ethernet header source
             memcpy(peer->peer_mac, rx_buf + 6, 6);
             peer->discovered = 1;
-            printf("[PQC-L2] DISCOVERED PEER MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                   peer->peer_mac[0], peer->peer_mac[1], peer->peer_mac[2],
-                   peer->peer_mac[3], peer->peer_mac[4], peer->peer_mac[5]);
             return 0;
         }
     }
@@ -279,9 +270,6 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             // Learn MAC instantly from incoming frame source
             memcpy(peer->peer_mac, rx_buf + 6, 6);
             peer->discovered = 1;
-            printf("[PQC-L2] Discovery probe received from %02X:%02X:%02X:%02X:%02X:%02X. Learning peer MAC.\n",
-                   peer->peer_mac[0], peer->peer_mac[1], peer->peer_mac[2],
-                   peer->peer_mac[3], peer->peer_mac[4], peer->peer_mac[5]);
 
             // Reply immediately with a Unicast ACK frame
             uint8_t reply_pkt[64];
@@ -307,7 +295,6 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             sll.sll_halen = 6;
             memcpy(sll.sll_addr, peer->peer_mac, 6);
 
-            printf("[PQC-L2] Replying with unicast discovery ACK to learned MAC...\n");
             sendto(peer->raw_sock_fd, reply_pkt, 14 + sizeof(struct pqc_l2_hdr), 0,
                    (struct sockaddr *)&sll, sizeof(sll));
         }

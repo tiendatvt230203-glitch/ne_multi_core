@@ -12,12 +12,52 @@
 #include "../../inc/crypto/fragment.h"
 
 #include <net/ethernet.h>
+#include <stdio.h>
 #include <string.h>
+
+enum {
+    EGR_DROP_OWN_MAC = 0,
+    EGR_DROP_POLICY,
+    EGR_DROP_NO_WAN,
+    EGR_DROP_TX_ROOM,
+    EGR_DROP_L2,
+    EGR_DROP_CRYPTO_OFF,
+    EGR_DROP_CRYPTO_NOT_READY,
+    EGR_DROP_ENCRYPT,
+    EGR_DROP_N
+};
+
+static uint64_t g_egr_drop[EGR_DROP_N];
+
+static void egr_drop_count(int reason)
+{
+    if (reason < 0 || reason >= EGR_DROP_N)
+        return;
+    uint64_t n = __sync_add_and_fetch(&g_egr_drop[reason], 1);
+    if ((n & 0x3FFFu) == 1) {
+        fprintf(stderr,
+                "[EGR-DROP] own_mac=%llu policy=%llu no_wan=%llu tx_room=%llu "
+                "l2=%llu crypto_off=%llu not_ready=%llu encrypt=%llu\n",
+                (unsigned long long)g_egr_drop[EGR_DROP_OWN_MAC],
+                (unsigned long long)g_egr_drop[EGR_DROP_POLICY],
+                (unsigned long long)g_egr_drop[EGR_DROP_NO_WAN],
+                (unsigned long long)g_egr_drop[EGR_DROP_TX_ROOM],
+                (unsigned long long)g_egr_drop[EGR_DROP_L2],
+                (unsigned long long)g_egr_drop[EGR_DROP_CRYPTO_OFF],
+                (unsigned long long)g_egr_drop[EGR_DROP_CRYPTO_NOT_READY],
+                (unsigned long long)g_egr_drop[EGR_DROP_ENCRYPT]);
+        fflush(stderr);
+    }
+}
 
 static int is_own_port_src(const struct forwarder *fwd, int li,
                            const uint8_t *pkt, uint32_t pkt_len)
 {
+    static const uint8_t zero[MAC_LEN];
+
     if (!fwd || li < 0 || li >= fwd->local_count || !pkt || pkt_len < ETH_HEADER_SIZE)
+        return 0;
+    if (memcmp(fwd->locals[li].src_mac, zero, MAC_LEN) == 0)
         return 0;
     return memcmp(pkt + MAC_LEN, fwd->locals[li].src_mac, MAC_LEN) == 0;
 }
@@ -110,37 +150,67 @@ void pipeline_egress(struct forwarder *fwd, struct ne_packet job)
     struct packet_crypto_ctx *pctx;
     int enc;
 
-    if (is_own_port_src(fwd, li, pkt, job.len))
+    if (is_own_port_src(fwd, li, pkt, job.len)) {
+        egr_drop_count(EGR_DROP_OWN_MAC);
         goto drop;
+    }
     if (policy_resolve_egress(fwd->cfg, li, flow_ok, src_ip, dst_ip,
-                              src_port, dst_port, proto, &profile_idx, &cp) != 0)
+                              src_port, dst_port, proto, &profile_idx, &cp) != 0) {
+        egr_drop_count(EGR_DROP_POLICY);
         goto drop;
+    }
 
     wan_dp = br_wire_wan_dp_for_local(fwd, li);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
+    if (wan_dp < 0) {
+        egr_drop_count(EGR_DROP_NO_WAN);
         goto drop;
-    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
-        goto drop;
+    }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
+        if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
+            egr_drop_count(EGR_DROP_TX_ROOM);
+            goto drop;
+        }
+        if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac,
+                            fwd->wans[wan_dp].src_mac) != 0) {
+            egr_drop_count(EGR_DROP_L2);
+            goto drop;
+        }
         (void)push_to_wan(fwd, &job, wan_dp);
         return;
     }
-    if (!fwd->cfg->crypto_enabled)
+
+    if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
+        egr_drop_count(EGR_DROP_TX_ROOM);
         goto drop;
+    }
+    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
+        egr_drop_count(EGR_DROP_L2);
+        goto drop;
+    }
+    if (!fwd->cfg->crypto_enabled) {
+        egr_drop_count(EGR_DROP_CRYPTO_OFF);
+        goto drop;
+    }
 
     pi = (int)(cp - fwd->cfg->policies);
-    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
+    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
+        egr_drop_count(EGR_DROP_CRYPTO_NOT_READY);
         goto drop;
+    }
     pctx = fwd_crypto_policy_ctx(pi);
-    if (!pctx)
+    if (!pctx) {
+        egr_drop_count(EGR_DROP_CRYPTO_NOT_READY);
         goto drop;
+    }
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
     pctx->policy_id = cp->id;
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx);
-    if (enc < 0)
+    if (enc < 0) {
+        egr_drop_count(EGR_DROP_ENCRYPT);
         goto drop;
+    }
     if (enc > 0)
         return;
     (void)push_to_wan(fwd, &job, wan_dp);

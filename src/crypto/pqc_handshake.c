@@ -191,7 +191,6 @@ static void* pqc_l2_handshake_thread_run(void) {
     if (g_hs_cfg.is_initiator) {
         // --- INITIATOR FLOW ---
         // A. Discover peer MAC
-        fprintf(stderr, "[PQC-HS-L2] Initiating peer MAC discovery...\n");
         while (!g_key_ready) {
             if (pqc_l2_discover_peer_mac(&peer, 5) == 0) {
                 break;

@@ -171,19 +171,6 @@ int br_wire_install(struct forwarder *fwd)
         return -1;
 
     main_diag_log_br_wire_table(fwd->cfg);
-    for (int dp = 0; dp < fwd->wan_count; dp++) {
-        int li = fwd->wan_dp_to_local[dp];
-        int ci = fwd->wan_cfg_idx[dp];
-        const char *wan = (ci >= 0 && ci < fwd->cfg->wan_count)
-            ? fwd->cfg->wans[ci].ifname : "?";
-        const char *lan = (li >= 0 && li < fwd->cfg->local_count)
-            ? fwd->cfg->locals[li].ifname : "?";
-        fprintf(stderr, "[BR-WIRE] wan_dp=%d %s (br_id=%d) ingress -> lan %s (li=%d)\n",
-                dp, wan,
-                (ci >= 0 && ci < fwd->cfg->wan_count) ? fwd->cfg->wans[ci].br_id : -1,
-                lan, li);
-    }
-    fflush(stderr);
     return 0;
 }
 

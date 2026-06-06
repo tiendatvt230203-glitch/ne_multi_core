@@ -119,6 +119,10 @@ int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx)
 {
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return 0;
+    if (fwd_wan_is_stopped(wan_idx))
+        return 0;
+    if (!fwd_wan_dp_ok_for_new_traffic(wan_idx))
+        return 0;
     if (fwd->wan_tx_cooldown[wan_idx] > 0)
         return 0;
     struct ne_ring *r = &fwd->mid_to_wan[wan_idx];

@@ -417,11 +417,17 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(update_xsk_map_iface(&p->wans[di], bpf_map__fd(wan_map)));
     }
 
-    uint32_t prefill = NE_RING - 1;
-    if (prefill == 0)
-        prefill = 1;
-    if (p->local_count > 0)
-        prefill_queue(p, &p->locals[0].queues[0], prefill);
+    {
+        uint32_t prefill = NE_RING - 1;
+        if (prefill == 0)
+            prefill = 1;
+        /* Shared UMEM: one FQ feeds all sockets — prefill deeper for LAN+WAN TX. */
+        uint32_t want = prefill * (uint32_t)(p->local_count + p->wan_count + 1);
+        if (want > p->n_frames / 4)
+            want = p->n_frames / 4;
+        if (p->local_count > 0)
+            prefill_queue(p, &p->locals[0].queues[0], want);
+    }
 
     return 0;
 

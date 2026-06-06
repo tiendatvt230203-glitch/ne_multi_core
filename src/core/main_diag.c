@@ -8,19 +8,6 @@
 /* "!" + "255.255.255.255/32" + NUL */
 #define DIAG_CIDR_LEN  24
 
-static void fmt_mac(char *out, size_t outsz, const uint8_t mac[6]) {
-    if (!mac) {
-        snprintf(out, outsz, "(none)");
-        return;
-    }
-    int zero = !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]);
-    if (zero)
-        snprintf(out, outsz, "(waiting)");
-    else
-        snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 static void tbl_hline(const int *w, int n) {
     fputc('+', stderr);
     for (int i = 0; i < n; i++) {
@@ -132,39 +119,35 @@ static void fmt_ip4(char *out, size_t outsz, uint32_t ip_be)
 }
 
 static void print_iface_table(const struct app_config *cfg) {
-    static const int w[DIAG_TBL_N] = { 14, 12, 20, 20, 0, 0, 0, 0 };
+    static const int w[DIAG_TBL_N] = { 14, 14, 24, 0, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "port_mac", "note", "", "", "", ""
+        "role", "interface", "note", "", "", "", "", ""
     };
 
     fprintf(stderr, "\n  [interfaces]\n");
-    tbl_hline(w, 4);
-    tbl_row(w, 4, hdr);
-    tbl_hline(w, 4);
+    tbl_hline(w, 3);
+    tbl_row(w, 3, hdr);
+    tbl_hline(w, 3);
 
     for (int i = 0; i < cfg->local_count; i++) {
-        char c0[32], c1[32], c2[32], c3[32];
+        char c0[32], c1[32], c2[32];
         snprintf(c0, sizeof(c0), "lan");
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        fmt_mac(c2, sizeof(c2), cfg->locals[i].src_mac);
-        snprintf(c3, sizeof(c3), "br_id=%d", cfg->locals[i].br_id);
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
-        tbl_row(w, 4, row);
+        snprintf(c2, sizeof(c2), "br_id=%d", cfg->locals[i].br_id);
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
+        tbl_row(w, 3, row);
     }
     for (int i = 0; i < cfg->wan_count; i++) {
         const struct wan_config *wan = &cfg->wans[i];
-        char c0[32], c1[32], c2[32], c3[32];
-        char peer[32];
-        fmt_mac(peer, sizeof(peer), wan->dst_mac);
+        char c0[32], c1[32], c2[32];
         snprintf(c0, sizeof(c0), "%s", wan->dataplane ? "wan-traffic" : "wan-handshake");
         snprintf(c1, sizeof(c1), "%s", wan->ifname);
-        snprintf(c2, sizeof(c2), "%s", peer);
-        snprintf(c3, sizeof(c3), "%s br_id=%d",
+        snprintf(c2, sizeof(c2), "%s br_id=%d",
                  wan->dataplane ? "dataplane" : "PQC only", wan->br_id);
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
-        tbl_row(w, 4, row);
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
+        tbl_row(w, 3, row);
     }
-    tbl_hline(w, 4);
+    tbl_hline(w, 3);
 }
 
 static void print_policy_table(const struct app_config *cfg) {

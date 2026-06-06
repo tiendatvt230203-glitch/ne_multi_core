@@ -29,10 +29,16 @@ int policy_resolve_egress(const struct app_config *cfg, int local_idx, int flow_
         if (!found)
             continue;
 
-        c = flow_ok
-            ? policy_select_in_profile((struct app_config *)cfg, pi,
-                                       src_ip, dst_ip, src_port, dst_port, proto)
-            : NULL;
+        /*
+         * flow_ok=0: still run policy select with zero flow fields so catch-all
+         * bypass (src_any/dst_any) matches — required for L2 wire non-IPv4.
+         */
+        c = policy_select_in_profile((struct app_config *)cfg, pi,
+                                     flow_ok ? src_ip : 0,
+                                     flow_ok ? dst_ip : 0,
+                                     flow_ok ? src_port : 0,
+                                     flow_ok ? dst_port : 0,
+                                     flow_ok ? proto : 0);
         if (!c)
             continue;
 
