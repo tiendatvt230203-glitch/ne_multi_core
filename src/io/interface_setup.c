@@ -7,6 +7,7 @@
 #include <linux/if_xdp.h>
 #include <net/if.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -14,6 +15,12 @@
 #include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
+
+/* BPF objects embedded at link time (see Makefile bpf/embed/). */
+extern char _binary_xdp_redirect_o_start[];
+extern char _binary_xdp_redirect_o_end[];
+extern char _binary_xdp_wan_redirect_o_start[];
+extern char _binary_xdp_wan_redirect_o_end[];
 
 static uint32_t next_pow2_u32(uint32_t v)
 {
@@ -185,9 +192,20 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
                            const char *prog_name, struct bpf_program **prog_out,
                            const char *map_name, struct bpf_map **map_out)
 {
-    struct bpf_object *obj = bpf_object__open_file(path, NULL);
-    if (libbpf_get_error(obj)) {
-        fprintf(stderr, "[XDP] open failed: %s\n", path);
+    struct bpf_object *obj = NULL;
+
+    if (path && strcmp(path, "bpf/xdp_redirect.o") == 0) {
+        size_t size = (size_t)(_binary_xdp_redirect_o_end - _binary_xdp_redirect_o_start);
+        obj = bpf_object__open_mem(_binary_xdp_redirect_o_start, size, NULL);
+    } else if (path && strcmp(path, "bpf/xdp_wan_redirect.o") == 0) {
+        size_t size = (size_t)(_binary_xdp_wan_redirect_o_end - _binary_xdp_wan_redirect_o_start);
+        obj = bpf_object__open_mem(_binary_xdp_wan_redirect_o_start, size, NULL);
+    } else if (path && path[0]) {
+        obj = bpf_object__open_file(path, NULL);
+    }
+
+    if (!obj || libbpf_get_error(obj)) {
+        fprintf(stderr, "[XDP] open failed: %s\n", path ? path : "(null)");
         return -1;
     }
     if (bpf_object__load(obj) != 0) {

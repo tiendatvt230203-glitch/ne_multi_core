@@ -1,11 +1,24 @@
-CC     = gcc
-CLANG  = clang
+CC       = gcc
+CLANG    = clang
+OBJCOPY  = objcopy
 
 CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -Iinc/policy -Iinc/lan_neigh -Iinc/pipeline -Iinc/routing -Iinc/runtime -Iinc/io -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
 LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
+
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),x86_64)
+  EMBED_BFD = elf64-x86-64
+  EMBED_ARCH = i386
+else ifeq ($(UNAME_M),aarch64)
+  EMBED_BFD = elf64-littleaarch64
+  EMBED_ARCH = aarch64
+else
+  EMBED_BFD = elf64-x86-64
+  EMBED_ARCH = i386
+endif
 
 BIN_DIR = bin
 TARGET  = $(BIN_DIR)/network-encryptor
@@ -52,15 +65,19 @@ BPF_SRC = bpf/xdp_redirect.c \
 BPF_OBJ = bpf/xdp_redirect.o \
           bpf/xdp_wan_redirect.o
 
+EMBED_DIR = bpf_embed
+BPF_EMBED_OBJ = $(EMBED_DIR)/xdp_redirect_embed.o \
+                $(EMBED_DIR)/xdp_wan_redirect_embed.o
+
 .PHONY: all clean dirs
 
-all: dirs $(BPF_OBJ) $(TARGET)
+all: dirs $(BPF_OBJ) $(BPF_EMBED_OBJ) $(TARGET)
 
 dirs:
-	@mkdir -p $(BIN_DIR)
+	@mkdir -p $(BIN_DIR) $(EMBED_DIR)
 
-$(TARGET): $(APP_OBJ) $(DB_OBJ)
-	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
+$(TARGET): $(APP_OBJ) $(DB_OBJ) $(BPF_EMBED_OBJ)
+	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(BPF_EMBED_OBJ) $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -68,5 +85,18 @@ $(TARGET): $(APP_OBJ) $(DB_OBJ)
 bpf/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
+# objcopy symbol names follow the *input* basename: _binary_xdp_redirect_o_start, etc.
+$(EMBED_DIR)/xdp_redirect_embed.o: bpf/xdp_redirect.o | dirs
+	@cp $< $(EMBED_DIR)/xdp_redirect.o
+	@cd $(EMBED_DIR) && $(OBJCOPY) -I binary -O $(EMBED_BFD) -B $(EMBED_ARCH) \
+		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
+		xdp_redirect.o xdp_redirect_embed.o && rm -f xdp_redirect.o
+
+$(EMBED_DIR)/xdp_wan_redirect_embed.o: bpf/xdp_wan_redirect.o | dirs
+	@cp $< $(EMBED_DIR)/xdp_wan_redirect.o
+	@cd $(EMBED_DIR) && $(OBJCOPY) -I binary -O $(EMBED_BFD) -B $(EMBED_ARCH) \
+		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
+		xdp_wan_redirect.o xdp_wan_redirect_embed.o && rm -f xdp_wan_redirect.o
+
 clean:
-	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o src/policy/*.o src/lan_neigh/*.o src/io/*.o src/pipeline/*.o src/routing/*.o src/runtime/*.o *.o $(BPF_OBJ)
+	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o src/policy/*.o src/lan_neigh/*.o src/io/*.o src/pipeline/*.o src/routing/*.o src/runtime/*.o *.o $(BPF_OBJ) $(BPF_EMBED_OBJ)
