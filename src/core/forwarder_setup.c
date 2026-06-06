@@ -1,7 +1,7 @@
 #include "../../inc/core/forwarder.h"
 #include "../../inc/routing/wan_pick.h"
 #include "../../inc/crypto/runtime.h"
-#include "../../inc/lan_neigh/lan_neigh.h"
+#include "../../inc/br_wire/br_wire.h"
 #include "../../inc/core/interface.h"
 
 #include <net/if.h>
@@ -57,7 +57,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     interface_ip_xdp_off_config(cfg);
     interface_reset_redirect_maps();
 
-    if (lan_neigh_prepare(cfg) != 0)
+    if (br_wire_prepare(cfg) != 0)
         return -1;
     if (forwarder_should_stop())
         return -1;
@@ -96,7 +96,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         }
     }
 
-    (void)lan_neigh_install(fwd);
+    if (br_wire_install(fwd) != 0) {
+        forwarder_cleanup(fwd);
+        return -1;
+    }
     fwd_wan_reset_on_init(fwd);
 
     atomic_store_explicit(&running, 1, memory_order_release);
@@ -107,7 +110,6 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
-    lan_neigh_reset();
     ne_ring_destroy(&fwd->local_to_mid);
     ne_ring_destroy(&fwd->wan_to_mid);
     for (int i = 0; i < MAX_INTERFACES; i++)

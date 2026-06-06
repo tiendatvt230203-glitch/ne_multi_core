@@ -2,7 +2,7 @@
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/routing/wan_pick.h"
 #include "../../inc/crypto/runtime.h"
-#include "../../inc/lan_neigh/lan_neigh.h"
+#include "../../inc/br_wire/br_wire.h"
 #include "../../inc/policy/policy.h"
 
 #include "../../inc/crypto/crypto_layer2.h"
@@ -13,6 +13,14 @@
 
 #include <net/ethernet.h>
 #include <string.h>
+
+static int is_own_port_src(const struct forwarder *fwd, int li,
+                           const uint8_t *pkt, uint32_t pkt_len)
+{
+    if (!fwd || li < 0 || li >= fwd->local_count || !pkt || pkt_len < ETH_HEADER_SIZE)
+        return 0;
+    return memcmp(pkt + MAC_LEN, fwd->locals[li].src_mac, MAC_LEN) == 0;
+}
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
@@ -102,19 +110,13 @@ void pipeline_egress(struct forwarder *fwd, struct ne_packet job)
     struct packet_crypto_ctx *pctx;
     int enc;
 
-    if (lan_neigh_is_own_src(fwd, li, pkt, job.len))
+    if (is_own_port_src(fwd, li, pkt, job.len))
         goto drop;
     if (policy_resolve_egress(fwd->cfg, li, flow_ok, src_ip, dst_ip,
                               src_port, dst_port, proto, &profile_idx, &cp) != 0)
         goto drop;
 
-    if (flow_ok) {
-        const struct ether_header *eth = (const struct ether_header *)pkt;
-        lan_neigh_learn(li, src_ip, eth->ether_shost, fwd->cfg);
-    }
-
-    wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
-                                    src_port, dst_port, proto, job.len);
+    wan_dp = br_wire_wan_dp_for_local(fwd, li);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
         goto drop;
     if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)

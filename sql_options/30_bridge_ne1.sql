@@ -56,13 +56,13 @@ INSERT INTO ne_policies (
 -- );
 
 
-INSERT INTO ne_lan (interface, profile_id, created_by) VALUES
-    ('enp5s0', 30, 'seed');
+INSERT INTO ne_lan (interface, profile_id, br_id, created_by) VALUES
+    ('enp5s0', 30, 0, 'seed');
 
 
-INSERT INTO ne_wan (interface, profile_id, dst_ip, weight, created_by) VALUES
-    ('enp7s0', 30, NULL, 75, 'seed'),
-    ('enp8s0', 30, NULL, 25, 'seed');
+INSERT INTO ne_wan (interface, profile_id, br_id, dst_ip, weight, created_by) VALUES
+    ('enp7s0', 30, 0, NULL, 75, 'seed'),
+    ('enp8s0', 30, 0, NULL, 25, 'seed');
 
 
 SELECT setval(pg_get_serial_sequence('ne_profiles', 'id')::regclass,

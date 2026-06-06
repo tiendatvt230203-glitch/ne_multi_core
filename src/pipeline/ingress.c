@@ -1,7 +1,8 @@
 #include "../../inc/pipeline/pipeline.h"
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/crypto/runtime.h"
-#include "../../inc/lan_neigh/lan_neigh.h"
+#include "../../inc/br_wire/br_wire.h"
+#include "../../inc/core/main_diag.h"
 
 #include "../../inc/crypto/crypto_dispatch.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -210,6 +211,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
+    int wan_dp = (int)job.wan_idx;
     int li;
     int dec;
 
@@ -224,16 +226,16 @@ void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
-    {
-        uint8_t client_mac[MAC_LEN];
-        uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
+    li = br_wire_local_for_wan_dp(fwd, wan_dp);
+    if (li < 0 || li >= fwd->local_count || job.len < ETH_HEADER_SIZE)
+        goto drop;
 
-        if (dest_ip == 0 || lan_neigh_resolve(fwd, dest_ip, &li, client_mac) != 0)
-            goto drop;
-        if (li < 0 || li >= fwd->local_count)
-            goto drop;
-        if (dp_write_l2(pkt, job.len, client_mac, fwd->locals[li].src_mac, 0) != 0)
-            goto drop;
+    {
+        int br_id = fwd->cfg->locals[li].br_id;
+        int ci = fwd->wan_cfg_idx[wan_dp];
+        const char *wan_name = (ci >= 0 && ci < fwd->cfg->wan_count)
+            ? fwd->cfg->wans[ci].ifname : "?";
+        main_diag_log_br_detach(br_id, wan_name, fwd->cfg->locals[li].ifname);
     }
 
     job.dir = NE_DIR_LOCAL;

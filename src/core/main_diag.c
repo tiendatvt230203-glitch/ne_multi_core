@@ -147,7 +147,7 @@ static void print_iface_table(const struct app_config *cfg) {
         snprintf(c0, sizeof(c0), "lan");
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
         fmt_mac(c2, sizeof(c2), cfg->locals[i].src_mac);
-        snprintf(c3, sizeof(c3), "policy-learn");
+        snprintf(c3, sizeof(c3), "br_id=%d", cfg->locals[i].br_id);
         const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
         tbl_row(w, 4, row);
     }
@@ -159,7 +159,8 @@ static void print_iface_table(const struct app_config *cfg) {
         snprintf(c0, sizeof(c0), "%s", wan->dataplane ? "wan-traffic" : "wan-handshake");
         snprintf(c1, sizeof(c1), "%s", wan->ifname);
         snprintf(c2, sizeof(c2), "%s", peer);
-        snprintf(c3, sizeof(c3), "%s", wan->dataplane ? "dataplane" : "PQC only");
+        snprintf(c3, sizeof(c3), "%s br_id=%d",
+                 wan->dataplane ? "dataplane" : "PQC only", wan->br_id);
         const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
         tbl_row(w, 4, row);
     }
@@ -257,7 +258,7 @@ void main_diag_log_db_policy_apply(const struct app_config *cfg, int trigger_pro
         return;
 
     fprintf(stderr,
-            "\n[DB] profile %d — policy update from Postgres (LAN client MAC via lan_neigh, not DB)\n",
+            "\n[DB] profile %d — policy update from Postgres (br_id wire map unchanged)\n",
             trigger_profile_id);
     if (prev_cfg) {
         fprintf(stderr, "  policies %d -> %d (LAN/WAN ifaces unchanged)\n",
@@ -301,26 +302,36 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
     fflush(stderr);
 }
 
-void main_diag_log_local_port_macs(const struct app_config *cfg)
+void main_diag_log_br_wire_table(const struct app_config *cfg)
 {
-    static const int w[DIAG_TBL_N] = { 12, 12, 20, 20, 0, 0, 0, 0 };
+    static const int w[DIAG_TBL_N] = { 8, 14, 14, 20, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "port_mac", "note", "", "", "", ""
+        "br_id", "lan", "wan", "note", "", "", "", ""
     };
 
     if (!cfg)
         return;
 
-    fprintf(stderr, "\n  [LAN-PORT]\n");
+    fprintf(stderr, "\n  [BR-WIRE]\n");
     tbl_hline(w, 4);
     tbl_row(w, 4, hdr);
     tbl_hline(w, 4);
-    for (int i = 0; i < cfg->local_count; i++) {
-        char c0[16], c1[16], c2[32], c3[24];
-        snprintf(c0, sizeof(c0), "local");
-        snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        fmt_mac(c2, sizeof(c2), cfg->locals[i].src_mac);
-        snprintf(c3, sizeof(c3), "bridge port");
+
+    for (int li = 0; li < cfg->local_count; li++) {
+        int br = cfg->locals[li].br_id;
+        const char *wan_name = "?";
+        char c0[12], c1[20], c2[20], c3[32];
+
+        for (int wi = 0; wi < cfg->wan_count; wi++) {
+            if (cfg->wans[wi].dataplane && cfg->wans[wi].br_id == br) {
+                wan_name = cfg->wans[wi].ifname;
+                break;
+            }
+        }
+        snprintf(c0, sizeof(c0), "%d", br);
+        snprintf(c1, sizeof(c1), "%s", cfg->locals[li].ifname);
+        snprintf(c2, sizeof(c2), "%s", wan_name);
+        snprintf(c3, sizeof(c3), "lan<->wan pair");
         const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
         tbl_row(w, 4, row);
     }
@@ -328,56 +339,25 @@ void main_diag_log_local_port_macs(const struct app_config *cfg)
     fflush(stderr);
 }
 
-void main_diag_log_lan_neigh_event(const char *ifname, uint32_t client_ip,
-                                   const uint8_t old_mac[6],
-                                   const uint8_t new_mac[6],
-                                   const char *event)
+void main_diag_log_br_detach(int br_id, const char *wan_ifname, const char *lan_ifname)
 {
-    static const int w[DIAG_TBL_N] = { 10, 12, 16, 20, 20, 0, 0, 0 };
+    static const int w[DIAG_TBL_N] = { 10, 8, 14, 14, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "event", "interface", "client_ip", "old_mac", "new_mac", "", "", ""
+        "event", "br_id", "wan_in", "lan_out", "", "", "", ""
     };
-    char c0[16], c1[16], c2[20], c3[24], c4[24];
+    char c0[12], c1[12], c2[20], c3[20];
 
-    snprintf(c0, sizeof(c0), "%s", event && event[0] ? event : "change");
-    snprintf(c1, sizeof(c1), "%s", ifname ? ifname : "?");
-    fmt_ip4(c2, sizeof(c2), client_ip);
-    fmt_mac(c3, sizeof(c3), old_mac);
-    fmt_mac(c4, sizeof(c4), new_mac);
+    snprintf(c0, sizeof(c0), "detach");
+    snprintf(c1, sizeof(c1), "%d", br_id);
+    snprintf(c2, sizeof(c2), "%s", wan_ifname ? wan_ifname : "?");
+    snprintf(c3, sizeof(c3), "%s", lan_ifname ? lan_ifname : "?");
 
-    fprintf(stderr, "\n  [LAN-NEIGH]\n");
-    tbl_hline(w, 5);
-    tbl_row(w, 5, hdr);
-    tbl_hline(w, 5);
-    const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, c4, "", "", "" };
-    tbl_row(w, 5, row);
-    tbl_hline(w, 5);
-    fflush(stderr);
-}
-
-void main_diag_log_lan_neigh_resolve(const char *ifname, uint32_t client_ip,
-                                     const uint8_t client_mac[6],
-                                     const char *via)
-{
-    static const int w[DIAG_TBL_N] = { 10, 12, 16, 20, 12, 0, 0, 0 };
-    static const char *hdr[DIAG_TBL_N] = {
-        "event", "interface", "client_ip", "client_mac", "via", "", "", ""
-    };
-    char c0[16], c1[16], c2[20], c3[24], c4[16];
-
-    snprintf(c0, sizeof(c0), "%s",
-             via && strcmp(via, "miss") == 0 ? "miss" : "resolve");
-    snprintf(c1, sizeof(c1), "%s", ifname ? ifname : "?");
-    fmt_ip4(c2, sizeof(c2), client_ip);
-    fmt_mac(c3, sizeof(c3), client_mac);
-    snprintf(c4, sizeof(c4), "%s", via && via[0] ? via : "?");
-
-    fprintf(stderr, "\n  [LAN-NEIGH]\n");
-    tbl_hline(w, 5);
-    tbl_row(w, 5, hdr);
-    tbl_hline(w, 5);
-    const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, c4, "", "", "" };
-    tbl_row(w, 5, row);
-    tbl_hline(w, 5);
+    fprintf(stderr, "\n  [BR-WIRE]\n");
+    tbl_hline(w, 4);
+    tbl_row(w, 4, hdr);
+    tbl_hline(w, 4);
+    const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
+    tbl_row(w, 4, row);
+    tbl_hline(w, 4);
     fflush(stderr);
 }

@@ -136,7 +136,7 @@ static int forwarder_reload_wan_removal_impl(struct forwarder *fwd, struct app_c
 
 /*
  * Hot reload (same LAN/WAN ifnames): Postgres policies/crypto only.
- * LAN client MAC table is runtime-only (lan_neigh); not loaded from DB on reload.
+ * br_id LAN↔WAN wire map comes from DB; policy/crypto hot-reload does not remap wires.
  */
 static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg)
 {

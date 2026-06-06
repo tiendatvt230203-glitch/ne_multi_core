@@ -183,7 +183,7 @@ int config_validate(struct app_config *cfg) {
         }
     }
 
-    return 0;
+    return config_br_validate(cfg);
 }
 
 int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip) {

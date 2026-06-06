@@ -4,7 +4,6 @@
 #include "../../inc/crypto/runtime.h"
 #include "../../inc/pipeline/pipeline.h"
 
-#include "../../inc/lan_neigh/lan_neigh.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 
@@ -144,7 +143,6 @@ static void *middle_core_thread(void *arg)
         }
         if (++gc_tick >= 8192) {
             fwd_crypto_frag_gc_tick();
-            lan_neigh_gc_tick();
             gc_tick = 0;
         }
         pthread_mutex_unlock(&runtime_lock);
@@ -195,7 +193,6 @@ void forwarder_stop(void)
 void forwarder_shutdown_resources(void)
 {
     fwd_reload_shutdown();
-    lan_neigh_reset();
 }
 
 int forwarder_should_stop(void)

@@ -503,6 +503,11 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
             return -1;
         }
         strncpy(loc->ifname, v, IF_NAMESIZE - 1);
+        {
+            int br_col = PQfnumber(res, "br_id");
+            const char *bv = br_col >= 0 ? PQgetvalue(res, row, br_col) : NULL;
+            loc->br_id = (bv && bv[0] != '\0') ? atoi(bv) : row;
+        }
         loc->ip = 0;
         loc->netmask = 0;
         loc->network = 0;
@@ -540,6 +545,12 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
             return -1;
         }
         strncpy(wan->ifname, v, IF_NAMESIZE - 1);
+
+        {
+            int br_col = PQfnumber(res, "br_id");
+            const char *bv = br_col >= 0 ? PQgetvalue(res, row, br_col) : NULL;
+            wan->br_id = (bv && bv[0] != '\0') ? atoi(bv) : row;
+        }
 
         v = PQgetvalue(res, row, PQfnumber(res, "dst_ip"));
         if (v && v[0] != '\0')
@@ -597,7 +608,7 @@ static int db_load_lan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
+        "SELECT interface AS ifname, br_id FROM ne_lan WHERE profile_id = $1 ORDER BY br_id, created_at",
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -620,7 +631,8 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, dst_ip::text AS dst_ip FROM ne_wan WHERE profile_id = $1 ORDER BY created_at",
+        "SELECT interface AS ifname, br_id, dst_ip::text AS dst_ip FROM ne_wan "
+        "WHERE profile_id = $1 ORDER BY br_id, created_at",
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {

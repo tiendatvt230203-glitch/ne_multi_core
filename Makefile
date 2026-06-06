@@ -2,7 +2,7 @@ CC       = gcc
 CLANG    = clang
 OBJCOPY  = objcopy
 
-CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -Iinc/policy -Iinc/lan_neigh -Iinc/pipeline -Iinc/routing -Iinc/runtime -Iinc/io -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
+CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -Iinc/policy -Iinc/br_wire -Iinc/pipeline -Iinc/routing -Iinc/runtime -Iinc/io -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
 LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
@@ -34,7 +34,7 @@ APP_SRC = main.c \
           src/core/dataplane_util.c \
           src/pipeline/egress.c \
           src/pipeline/ingress.c \
-          src/lan_neigh/lan_neigh.c \
+          src/br_wire/br_wire.c \
           src/policy/policy_match.c \
           src/policy/policy_select.c \
           src/policy/policy_resolve.c \
@@ -99,4 +99,4 @@ $(EMBED_DIR)/xdp_wan_redirect_embed.o: bpf/xdp_wan_redirect.o | dirs
 		xdp_wan_redirect.o xdp_wan_redirect_embed.o && rm -f xdp_wan_redirect.o
 
 clean:
-	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o src/policy/*.o src/lan_neigh/*.o src/io/*.o src/pipeline/*.o src/routing/*.o src/runtime/*.o *.o $(BPF_OBJ) $(BPF_EMBED_OBJ)
+	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o src/policy/*.o src/br_wire/*.o src/io/*.o src/pipeline/*.o src/routing/*.o src/runtime/*.o *.o $(BPF_OBJ) $(BPF_EMBED_OBJ)
