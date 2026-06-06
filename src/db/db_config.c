@@ -505,6 +505,8 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
         strncpy(loc->ifname, v, IF_NAMESIZE - 1);
         {
             int br_col = PQfnumber(res, "br_id");
+            if (br_col < 0 && row == 0)
+                fprintf(stderr, "[DB] ne_lan: column br_id missing — using row index; run ALTER TABLE ne_lan ADD br_id INT NOT NULL DEFAULT 0\n");
             const char *bv = br_col >= 0 ? PQgetvalue(res, row, br_col) : NULL;
             loc->br_id = (bv && bv[0] != '\0') ? atoi(bv) : row;
         }
@@ -548,6 +550,8 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
 
         {
             int br_col = PQfnumber(res, "br_id");
+            if (br_col < 0 && row == 0)
+                fprintf(stderr, "[DB] ne_wan: column br_id missing — using row index; run ALTER TABLE ne_wan ADD br_id INT NOT NULL DEFAULT 0\n");
             const char *bv = br_col >= 0 ? PQgetvalue(res, row, br_col) : NULL;
             wan->br_id = (bv && bv[0] != '\0') ? atoi(bv) : row;
         }

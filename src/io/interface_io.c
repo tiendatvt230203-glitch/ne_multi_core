@@ -245,16 +245,13 @@ static void drain_cq_umem(struct ne_pair *p)
 
 void ne_drain_cq_local(struct ne_pair *p)
 {
+    /* Single UMEM completion ring shared by all AF_XDP sockets. */
     drain_cq_umem(p);
-    for (int i = 0; i < p->local_count; i++)
-        drain_cq_iface(&p->locals[i], &p->pool);
 }
 
 void ne_drain_cq_wan(struct ne_pair *p)
 {
     drain_cq_umem(p);
-    for (int i = 0; i < p->wan_count; i++)
-        drain_cq_iface(&p->wans[i], &p->pool);
 }
 
 static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
@@ -285,14 +282,14 @@ static void refill_fq_iface(struct ne_iface *iface, struct ne_pool *pool)
 
 void ne_refill_fq_local(struct ne_pair *p)
 {
-    for (int i = 0; i < p->local_count; i++)
-        refill_fq_iface(&p->locals[i], &p->pool);
+    if (p->local_count > 0)
+        refill_fq_queue(&p->locals[0].queues[0], &p->pool);
 }
 
 void ne_refill_fq_wan(struct ne_pair *p)
 {
-    for (int i = 0; i < p->wan_count; i++)
-        refill_fq_iface(&p->wans[i], &p->pool);
+    if (p->local_count > 0)
+        refill_fq_queue(&p->locals[0].queues[0], &p->pool);
 }
 
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,

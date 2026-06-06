@@ -248,11 +248,19 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
     iface->queue_count = queue_count;
 
+    /*
+     * Shared UMEM: every socket must use the same FILL/COMPLETION rings that
+     * xsk_umem__create() registered. Per-socket fq/cq breaks buffer recycle
+     * and kills LAN TX under high WAN RX (mid_to_local starved).
+     */
+    struct xsk_ring_prod *umem_fq = &p->locals[0].queues[0].fq;
+    struct xsk_ring_cons *umem_cq = &p->locals[0].queues[0].cq;
+
     for (int q = 0; q < queue_count; q++) {
         struct ne_xsk_queue *slot = &iface->queues[q];
         int ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
                                             &slot->rx, &slot->tx,
-                                            &slot->fq, &slot->cq, &cfg);
+                                            umem_fq, umem_cq, &cfg);
         if (ret) {
             fprintf(stderr, "[XSK] create %s queue=%d failed: %d\n", ifname, q, ret);
             return -1;
@@ -412,10 +420,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     uint32_t prefill = NE_RING - 1;
     if (prefill == 0)
         prefill = 1;
-    for (int i = 0; i < p->local_count; i++)
-        prefill_iface(p, &p->locals[i], prefill);
-    for (int i = 0; i < p->wan_count; i++)
-        prefill_iface(p, &p->wans[i], prefill);
+    if (p->local_count > 0)
+        prefill_queue(p, &p->locals[0].queues[0], prefill);
 
     return 0;
 

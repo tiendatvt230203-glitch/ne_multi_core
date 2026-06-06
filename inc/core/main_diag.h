@@ -14,6 +14,5 @@ void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id
                                   int is_reload, int policy_only);
 void main_diag_log_dataplane_ready(struct app_config *cfg);
 void main_diag_log_br_wire_table(const struct app_config *cfg);
-void main_diag_log_br_detach(int br_id, const char *wan_ifname, const char *lan_ifname);
 
 #endif

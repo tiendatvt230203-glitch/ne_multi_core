@@ -2,7 +2,6 @@
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/crypto/runtime.h"
 #include "../../inc/br_wire/br_wire.h"
-#include "../../inc/core/main_diag.h"
 
 #include "../../inc/crypto/crypto_dispatch.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -229,14 +228,6 @@ void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
     li = br_wire_local_for_wan_dp(fwd, wan_dp);
     if (li < 0 || li >= fwd->local_count || job.len < ETH_HEADER_SIZE)
         goto drop;
-
-    {
-        int br_id = fwd->cfg->locals[li].br_id;
-        int ci = fwd->wan_cfg_idx[wan_dp];
-        const char *wan_name = (ci >= 0 && ci < fwd->cfg->wan_count)
-            ? fwd->cfg->wans[ci].ifname : "?";
-        main_diag_log_br_detach(br_id, wan_name, fwd->cfg->locals[li].ifname);
-    }
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;

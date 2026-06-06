@@ -339,25 +339,3 @@ void main_diag_log_br_wire_table(const struct app_config *cfg)
     fflush(stderr);
 }
 
-void main_diag_log_br_detach(int br_id, const char *wan_ifname, const char *lan_ifname)
-{
-    static const int w[DIAG_TBL_N] = { 10, 8, 14, 14, 0, 0, 0, 0 };
-    static const char *hdr[DIAG_TBL_N] = {
-        "event", "br_id", "wan_in", "lan_out", "", "", "", ""
-    };
-    char c0[12], c1[12], c2[20], c3[20];
-
-    snprintf(c0, sizeof(c0), "detach");
-    snprintf(c1, sizeof(c1), "%d", br_id);
-    snprintf(c2, sizeof(c2), "%s", wan_ifname ? wan_ifname : "?");
-    snprintf(c3, sizeof(c3), "%s", lan_ifname ? lan_ifname : "?");
-
-    fprintf(stderr, "\n  [BR-WIRE]\n");
-    tbl_hline(w, 4);
-    tbl_row(w, 4, hdr);
-    tbl_hline(w, 4);
-    const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
-    tbl_row(w, 4, row);
-    tbl_hline(w, 4);
-    fflush(stderr);
-}

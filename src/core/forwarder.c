@@ -39,8 +39,10 @@ static void *local_core_thread(void *arg)
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
-        for (int li = 0; li < fwd->local_count; li++)
-            (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
+        for (int pass = 0; pass < 4; pass++) {
+            for (int li = 0; li < fwd->local_count; li++)
+                (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
+        }
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
