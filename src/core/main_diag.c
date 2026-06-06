@@ -9,6 +9,10 @@
 #define DIAG_CIDR_LEN  24
 
 static void fmt_mac(char *out, size_t outsz, const uint8_t mac[6]) {
+    if (!mac) {
+        snprintf(out, outsz, "(none)");
+        return;
+    }
     int zero = !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]);
     if (zero)
         snprintf(out, outsz, "(waiting)");
@@ -50,6 +54,8 @@ static const char *policy_proto_str(uint8_t proto) {
     if (proto == POLICY_PROTO_TCP_UDP) return "tcp/udp";
     if (proto == 6) return "tcp";
     if (proto == 17) return "udp";
+    if (proto == 1) return "icmp";
+    if (proto == 89) return "ospf";
     return "?";
 }
 
@@ -118,10 +124,17 @@ static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_
              (unsigned)cp->aes_bits);
 }
 
+static void fmt_ip4(char *out, size_t outsz, uint32_t ip_be)
+{
+    struct in_addr a = { .s_addr = ip_be };
+    if (!inet_ntop(AF_INET, &a, out, (socklen_t)outsz))
+        snprintf(out, outsz, "?");
+}
+
 static void print_iface_table(const struct app_config *cfg) {
     static const int w[DIAG_TBL_N] = { 14, 12, 20, 20, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "client_mac", "note", "", "", "", ""
+        "role", "interface", "port_mac", "note", "", "", "", ""
     };
 
     fprintf(stderr, "\n  [interfaces]\n");
@@ -130,12 +143,11 @@ static void print_iface_table(const struct app_config *cfg) {
     tbl_hline(w, 4);
 
     for (int i = 0; i < cfg->local_count; i++) {
-        char client[32], c0[32], c1[32], c2[32], c3[32];
-        fmt_mac(client, sizeof(client), cfg->locals[i].dst_mac);
+        char c0[32], c1[32], c2[32], c3[32];
         snprintf(c0, sizeof(c0), "lan");
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        snprintf(c2, sizeof(c2), "%s", client);
-        snprintf(c3, sizeof(c3), "bridge FDB");
+        fmt_mac(c2, sizeof(c2), cfg->locals[i].src_mac);
+        snprintf(c3, sizeof(c3), "policy-learn");
         const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
         tbl_row(w, 4, row);
     }
@@ -245,7 +257,7 @@ void main_diag_log_db_policy_apply(const struct app_config *cfg, int trigger_pro
         return;
 
     fprintf(stderr,
-            "\n[DB] profile %d — policy update from Postgres (LAN client MAC is runtime/FDB, not DB)\n",
+            "\n[DB] profile %d — policy update from Postgres (LAN client MAC via lan_neigh, not DB)\n",
             trigger_profile_id);
     if (prev_cfg) {
         fprintf(stderr, "  policies %d -> %d (LAN/WAN ifaces unchanged)\n",
@@ -289,26 +301,56 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
     fflush(stderr);
 }
 
-void main_diag_log_lan_client_mac(const char *ifname,
-                                  const uint8_t client_mac[6],
-                                  const char *event) {
-    static const int w[DIAG_TBL_N] = { 12, 12, 20, 10, 0, 0, 0, 0 };
+void main_diag_log_local_port_macs(const struct app_config *cfg)
+{
+    static const int w[DIAG_TBL_N] = { 12, 12, 20, 20, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "event", "interface", "client_mac", "", "", "", "", ""
+        "role", "interface", "port_mac", "note", "", "", "", ""
     };
-    char client[32], c0[16], c1[16], c2[32];
 
-    fmt_mac(client, sizeof(client), client_mac);
+    if (!cfg)
+        return;
+
+    fprintf(stderr, "\n  [LAN-PORT]\n");
+    tbl_hline(w, 4);
+    tbl_row(w, 4, hdr);
+    tbl_hline(w, 4);
+    for (int i = 0; i < cfg->local_count; i++) {
+        char c0[16], c1[16], c2[32], c3[24];
+        snprintf(c0, sizeof(c0), "local");
+        snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
+        fmt_mac(c2, sizeof(c2), cfg->locals[i].src_mac);
+        snprintf(c3, sizeof(c3), "bridge port");
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
+        tbl_row(w, 4, row);
+    }
+    tbl_hline(w, 4);
+    fflush(stderr);
+}
+
+void main_diag_log_lan_neigh_event(const char *ifname, uint32_t client_ip,
+                                   const uint8_t old_mac[6],
+                                   const uint8_t new_mac[6],
+                                   const char *event)
+{
+    static const int w[DIAG_TBL_N] = { 10, 12, 16, 20, 20, 0, 0, 0 };
+    static const char *hdr[DIAG_TBL_N] = {
+        "event", "interface", "client_ip", "old_mac", "new_mac", "", "", ""
+    };
+    char c0[16], c1[16], c2[20], c3[24], c4[24];
+
     snprintf(c0, sizeof(c0), "%s", event && event[0] ? event : "change");
     snprintf(c1, sizeof(c1), "%s", ifname ? ifname : "?");
-    snprintf(c2, sizeof(c2), "%s", client);
+    fmt_ip4(c2, sizeof(c2), client_ip);
+    fmt_mac(c3, sizeof(c3), old_mac);
+    fmt_mac(c4, sizeof(c4), new_mac);
 
-    fprintf(stderr, "\n  [LAN-FDB]\n");
-    tbl_hline(w, 3);
-    tbl_row(w, 3, hdr);
-    tbl_hline(w, 3);
-    const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
-    tbl_row(w, 3, row);
-    tbl_hline(w, 3);
+    fprintf(stderr, "\n  [LAN-NEIGH]\n");
+    tbl_hline(w, 5);
+    tbl_row(w, 5, hdr);
+    tbl_hline(w, 5);
+    const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, c4, "", "", "" };
+    tbl_row(w, 5, row);
+    tbl_hline(w, 5);
     fflush(stderr);
 }

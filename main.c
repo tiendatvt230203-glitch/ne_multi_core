@@ -465,7 +465,7 @@ static int profiles_fully_unchanged(const struct app_config *old,
     return 1;
 }
 
-/* LAN/WAN rows from Postgres unchanged (client MAC is not stored in DB). */
+/* LAN/WAN rows from Postgres unchanged (client MAC learned via lan_neigh, not DB). */
 static int lan_wan_db_unchanged(const struct app_config *old,
                                 const struct app_config *new)
 {
@@ -640,7 +640,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     }
 
     fprintf(stderr,
-            "[RELOAD] profile %d — policies/crypto only (LAN MAC via FDB, not DB)\n",
+            "[RELOAD] profile %d — policies/crypto only (LAN MAC via lan_neigh, not DB)\n",
             trigger_id);
     fflush(stderr);
 

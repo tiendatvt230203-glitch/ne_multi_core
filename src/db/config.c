@@ -1,4 +1,5 @@
 #include "../../inc/core/config.h"
+#include "../../inc/policy/policy.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,30 +196,6 @@ int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip) {
     return -1;
 }
 
-static int cidr_match_with_negate(int any_flag, int negate,
-                                    uint32_t ip, uint32_t net, uint32_t mask) {
-    if (any_flag)
-        return 1;
-    int in_cidr = ((ip & mask) == (net & mask));
-    return negate ? !in_cidr : in_cidr;
-}
-
-int config_select_profile_for_local(const struct app_config *cfg, int local_idx) {
-    if (!cfg || local_idx < 0 || local_idx >= cfg->local_count)
-        return -1;
-
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        if (!p->enabled)
-            continue;
-        for (int i = 0; i < p->local_count; i++) {
-            if (p->local_indices[i] == local_idx)
-                return pi;
-        }
-    }
-    return -1;
-}
-
 static uint32_t flow_hash_u32(uint32_t src_ip, uint32_t dst_ip,
                               uint16_t src_port, uint16_t dst_port, uint8_t protocol) {
     uint32_t h = src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ dst_port ^ protocol;
@@ -281,34 +258,9 @@ int config_select_wan_for_profile(struct app_config *cfg, int profile_idx,
     return wan_idx;
 }
 
-static int crypto_policy_match_packet(const struct crypto_policy *cp,
-                                      uint32_t src_ip, uint32_t dst_ip,
-                                      uint16_t src_port, uint16_t dst_port,
-                                      uint8_t protocol) {
-    if (!cidr_match_with_negate(cp->src_any, cp->src_negate, src_ip, cp->src_net, cp->src_mask))
-        return 0;
-    if (!cidr_match_with_negate(cp->dst_any, cp->dst_negate, dst_ip, cp->dst_net, cp->dst_mask))
-        return 0;
-
-#if !CRYPTO_POLICY_MATCH_IP_ONLY
-    if (cp->src_port_from >= 0 && cp->src_port_to >= 0) {
-        if ((int)src_port < cp->src_port_from || (int)src_port > cp->src_port_to)
-            return 0;
-    }
-    if (cp->dst_port_from >= 0 && cp->dst_port_to >= 0) {
-        if ((int)dst_port < cp->dst_port_from || (int)dst_port > cp->dst_port_to)
-            return 0;
-    }
-#endif
-
-    if (cp->protocol == POLICY_PROTO_TCP_UDP) {
-        if (protocol != 6 && protocol != 17)
-            return 0;
-    } else if (cp->protocol != POLICY_PROTO_ANY && cp->protocol != protocol) {
-        return 0;
-    }
-
-    return 1;
+int config_select_profile_for_local(const struct app_config *cfg, int local_idx)
+{
+    return policy_profile_for_local(cfg, local_idx);
 }
 
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
@@ -316,36 +268,7 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                                                         uint16_t src_port, uint16_t dst_port,
                                                         uint8_t protocol)
 {
-    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count)
-        return NULL;
-
-    const struct profile_config *p = &cfg->profiles[profile_idx];
-    const struct crypto_policy *best = NULL;
-    int best_priority = 0x7fffffff;
-    int best_id = 0x7fffffff;
-
-    for (int i = 0; i < p->policy_count; i++) {
-        int pi = p->policy_indices[i];
-        if (pi < 0 || pi >= cfg->policy_count)
-            continue;
-
-        const struct crypto_policy *cp = &cfg->policies[pi];
-        int matched = crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol);
-        if (!matched)
-            matched = crypto_policy_match_packet(cp, dst_ip, src_ip, dst_port, src_port, protocol);
-        if (!matched)
-            continue;
-
-        if (!best ||
-            cp->priority < best_priority ||
-            (cp->priority == best_priority && cp->id < best_id)) {
-            best = cp;
-            best_priority = cp->priority;
-            best_id = cp->id;
-        }
-    }
-
-    return best;
+    return policy_select_in_profile(cfg, profile_idx, src_ip, dst_ip, src_port, dst_port, protocol);
 }
 
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network) {

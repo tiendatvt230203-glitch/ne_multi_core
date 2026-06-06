@@ -1,12 +1,11 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
-#include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define IPPROTO_ICMP_VAL 1
 #define ETH_P_ARP_VAL 0x0806
+
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __uint(max_entries, 64);
@@ -24,19 +23,13 @@ int xdp_redirect_prog(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    if (eth->h_proto == bpf_htons(ETH_P_ARP_VAL)) {
+    if (eth->h_proto == bpf_htons(ETH_P_ARP_VAL))
         return XDP_PASS;
-    }
 
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
-
-        if (ip->protocol == IPPROTO_ICMP_VAL) {
-            return XDP_PASS;
-        }
-
         goto redirect;
     }
 

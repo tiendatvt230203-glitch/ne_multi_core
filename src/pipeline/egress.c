@@ -1,22 +1,18 @@
-#include "../../inc/core/dataplane.h"
+#include "../../inc/pipeline/pipeline.h"
 #include "../../inc/core/dataplane_util.h"
-#include "../../inc/core/forwarder_wan.h"
-#include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/routing/wan_pick.h"
+#include "../../inc/crypto/runtime.h"
+#include "../../inc/lan_neigh/lan_neigh.h"
+#include "../../inc/policy/policy.h"
 
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
-#include "../../inc/core/fragment.h"
+#include "../../inc/crypto/fragment.h"
 
+#include <net/ethernet.h>
 #include <string.h>
-
-static int local_is_client_echo(struct forwarder *fwd, int li, const uint8_t *pkt, uint32_t len)
-{
-    if (li < 0 || li >= fwd->local_count || len < 14)
-        return 0;
-    return memcmp(pkt, fwd->locals[li].dst_mac, MAC_LEN) == 0;
-}
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
@@ -91,47 +87,7 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     return push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) == 0 ? 1 : -1;
 }
 
-static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok,
-                               uint32_t src_ip, uint32_t dst_ip,
-                               uint16_t src_port, uint16_t dst_port, uint8_t proto,
-                               int *profile_idx, const struct crypto_policy **cp)
-{
-    if (!fwd || !fwd->cfg || !profile_idx || !cp)
-        return -1;
-
-    const struct crypto_policy *best = NULL;
-    int best_pi = -1, best_pri = 0x7fffffff, best_id = 0x7fffffff;
-
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *p = &fwd->cfg->profiles[pi];
-        int found = 0;
-        if (!p->enabled)
-            continue;
-        for (int i = 0; i < p->local_count; i++)
-            if (p->local_indices[i] == local_idx)
-                found = 1;
-        if (!found)
-            continue;
-        const struct crypto_policy *c = flow_ok
-            ? config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto)
-            : NULL;
-        if (!c)
-            continue;
-        if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {
-            best = c;
-            best_pi = pi;
-            best_pri = c->priority;
-            best_id = c->id;
-        }
-    }
-    if (!best)
-        return -1;
-    *profile_idx = best_pi;
-    *cp = best;
-    return 0;
-}
-
-void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
+void pipeline_egress(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     uint32_t src_ip = 0, dst_ip = 0;
@@ -146,11 +102,16 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     struct packet_crypto_ctx *pctx;
     int enc;
 
-    if (local_is_client_echo(fwd, li, pkt, job.len))
+    if (lan_neigh_is_own_src(fwd, li, pkt, job.len))
         goto drop;
-    if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                            &profile_idx, &cp) != 0)
+    if (policy_resolve_egress(fwd->cfg, li, flow_ok, src_ip, dst_ip,
+                              src_port, dst_port, proto, &profile_idx, &cp) != 0)
         goto drop;
+
+    if (flow_ok) {
+        const struct ether_header *eth = (const struct ether_header *)pkt;
+        lan_neigh_learn(li, src_ip, eth->ether_shost, fwd->cfg);
+    }
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);

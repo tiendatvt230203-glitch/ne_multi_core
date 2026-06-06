@@ -1,7 +1,7 @@
-#include "../../inc/core/forwarder_reload.h"
+#include "../../inc/runtime/reload.h"
 #include "../../inc/core/forwarder.h"
-#include "../../inc/core/forwarder_wan.h"
-#include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/routing/wan_pick.h"
+#include "../../inc/crypto/runtime.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -136,7 +136,7 @@ static int forwarder_reload_wan_removal_impl(struct forwarder *fwd, struct app_c
 
 /*
  * Hot reload (same LAN/WAN ifnames): Postgres policies/crypto only.
- * LAN client MAC is NOT loaded from DB — bridge_mac_watch + fwd->locals stay as-is.
+ * LAN client MAC table is runtime-only (lan_neigh); not loaded from DB on reload.
  */
 static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg)
 {

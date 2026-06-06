@@ -1,8 +1,8 @@
-#include "../../inc/core/forwarder_wan.h"
+#include "../../inc/routing/wan_pick.h"
 
-#include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/crypto/runtime.h"
 #include "../../inc/core/interface.h"
-#include "../../inc/core/flow_table.h"
+#include "../../inc/routing/flow_table.h"
 
 #include <net/if.h>
 #include <stdio.h>

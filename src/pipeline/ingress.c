@@ -1,7 +1,7 @@
-#include "../../inc/core/dataplane.h"
+#include "../../inc/pipeline/pipeline.h"
 #include "../../inc/core/dataplane_util.h"
-#include "../../inc/core/forwarder_crypto_runtime.h"
-#include "../../inc/core/bridge_mac.h"
+#include "../../inc/crypto/runtime.h"
+#include "../../inc/lan_neigh/lan_neigh.h"
 
 #include "../../inc/crypto/crypto_dispatch.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -10,7 +10,7 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/crypto/packet_crypto.h"
 
-#include "../../inc/core/fragment.h"
+#include "../../inc/crypto/fragment.h"
 
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
@@ -209,13 +209,10 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 
 static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
 {
-    int li = bridge_mac_local_for_dmac(fwd, pkt, len);
-    if (li >= 0)
-        return li;
     return config_find_local_for_ip(fwd->cfg, dp_dest_ipv4(pkt, len));
 }
 
-void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
+void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     int li;
@@ -235,8 +232,14 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     li = pick_local(fwd, pkt, job.len);
     if (li < 0 || li >= fwd->local_count)
         goto drop;
-    if (dp_write_l2(pkt, job.len, fwd->locals[li].dst_mac, fwd->locals[li].src_mac, 0) != 0)
-        goto drop;
+    {
+        uint8_t client_mac[MAC_LEN];
+        uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
+        if (dest_ip == 0 || lan_neigh_lookup(li, dest_ip, client_mac) != 0)
+            goto drop;
+        if (dp_write_l2(pkt, job.len, client_mac, fwd->locals[li].src_mac, 0) != 0)
+            goto drop;
+    }
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;

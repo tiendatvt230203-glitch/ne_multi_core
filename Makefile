@@ -1,7 +1,7 @@
 CC     = gcc
 CLANG  = clang
 
-CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
+CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -Iinc/policy -Iinc/lan_neigh -Iinc/pipeline -Iinc/routing -Iinc/runtime -Iinc/io -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
 LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
@@ -12,15 +12,20 @@ TARGET  = $(BIN_DIR)/network-encryptor
 
 APP_SRC = main.c \
           src/core/main_diag.c \
-          src/core/interface.c \
+          src/io/interface_io.c \
+          src/io/interface_setup.c \
           src/core/forwarder.c \
-          src/core/forwarder_wan.c \
-          src/core/forwarder_reload.c \
-          src/core/forwarder_crypto_runtime.c \
+          src/core/forwarder_setup.c \
+          src/runtime/reload.c \
+          src/crypto/runtime.c \
           src/core/dataplane_util.c \
-          src/core/dataplane_local.c \
-          src/core/dataplane_wan.c \
-          src/core/bridge_mac.c \
+          src/pipeline/egress.c \
+          src/pipeline/ingress.c \
+          src/lan_neigh/lan_neigh.c \
+          src/policy/policy_match.c \
+          src/policy/policy_select.c \
+          src/policy/policy_resolve.c \
+          src/policy/policy_expand.c \
           src/core/ne_pqc_bridge.c \
           src/crypto/crypto_policy_utils.c \
           src/crypto/crypto_dispatch.c \
@@ -31,8 +36,9 @@ APP_SRC = main.c \
           src/crypto/crypto_layer4.c \
           src/crypto/pqc_handshake.c \
           src/crypto/pqc_l2_handshake.c \
-          src/core/flow_table.c \
-          src/core/fragment.c
+          src/routing/flow_table.c \
+          src/routing/wan_pick.c \
+          src/crypto/fragment.c
 APP_OBJ = $(APP_SRC:.c=.o)
 
 DB_SRC = src/db/config.c \
@@ -63,4 +69,4 @@ bpf/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)
+	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o src/policy/*.o src/lan_neigh/*.o src/io/*.o src/pipeline/*.o src/routing/*.o src/runtime/*.o *.o $(BPF_OBJ)
