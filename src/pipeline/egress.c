@@ -32,6 +32,7 @@ enum {
 static uint64_t g_egr_drop[EGR_DROP_N];
 static uint8_t g_egr_drop_logged[EGR_DROP_N];
 static uint8_t g_egr_ok_logged;
+static uint8_t g_egr_enter_logged;
 
 static const char *egr_action_str(int action)
 {
@@ -271,6 +272,16 @@ void pipeline_egress(struct forwarder *fwd, struct ne_packet job)
     int pi;
     struct packet_crypto_ctx *pctx;
     int enc;
+
+    if (!g_egr_enter_logged) {
+        g_egr_enter_logged = 1;
+        fprintf(stderr,
+                "[TRACE] pipeline_egress entered: li=%d if=%s len=%u flow_ok=%d\n",
+                li,
+                (li >= 0 && li < fwd->local_count) ? fwd->locals[li].ifname : "?",
+                (unsigned)job.len, flow_ok);
+        fflush(stderr);
+    }
 
     if (is_own_port_src(fwd, li, pkt, job.len)) {
         egr_bump_drop(EGR_DROP_OWN_MAC);

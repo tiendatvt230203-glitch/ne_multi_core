@@ -11,7 +11,13 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
+
+static uint8_t g_trace_lan_rx;
+static uint8_t g_trace_lan_ring_full;
+static uint8_t g_trace_mid_egr;
+static uint8_t g_trace_wan_rx;
 
 atomic_int running = 1;
 struct forwarder *g_active_fwd;
@@ -50,9 +56,26 @@ static void *local_core_thread(void *arg)
             continue;
         }
 
+        if (!g_trace_lan_rx) {
+            g_trace_lan_rx = 1;
+            fprintf(stderr,
+                    "[TRACE] LAN-RX first: pkts=%d li=%u len=%u "
+                    "(XDP->AF_XDP OK — packet entered local core)\n",
+                    rcvd, (unsigned)batch[0].local_idx, (unsigned)batch[0].len);
+            fflush(stderr);
+        }
+
         for (int i = 0; i < rcvd; i++) {
-            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0)
+            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0) {
                 ne_frame_free(&fwd->pair, batch[i].addr);
+                if (!g_trace_lan_ring_full) {
+                    g_trace_lan_ring_full = 1;
+                    fprintf(stderr,
+                            "[TRACE] LAN-RX DROP: local_to_mid ring full "
+                            "(mid core not draining — egress never runs)\n");
+                    fflush(stderr);
+                }
+            }
         }
         ne_recv_release_local(&fwd->pair);
     }
@@ -92,6 +115,14 @@ static void *wan_core_thread(void *arg)
         if (rcvd <= 0) {
             sched_yield();
             continue;
+        }
+
+        if (!g_trace_wan_rx) {
+            g_trace_wan_rx = 1;
+            fprintf(stderr,
+                    "[TRACE] WAN-RX first: pkts=%d wi=%u len=%u\n",
+                    rcvd, (unsigned)batch[0].wan_idx, (unsigned)batch[0].len);
+            fflush(stderr);
         }
 
         for (int i = 0; i < rcvd; i++) {
@@ -140,6 +171,14 @@ static void *middle_core_thread(void *arg)
             did_work = 1;
         }
         if (ne_ring_try_pop(&fwd->local_to_mid, &job) == 0) {
+            if (!g_trace_mid_egr) {
+                g_trace_mid_egr = 1;
+                fprintf(stderr,
+                        "[TRACE] MID->egress first: li=%u len=%u "
+                        "(packet reached egress — expect [EGR-WAN] next)\n",
+                        (unsigned)job.local_idx, (unsigned)job.len);
+                fflush(stderr);
+            }
             pipeline_egress(fwd, job);
             did_work = 1;
         }
@@ -177,6 +216,9 @@ void forwarder_run(struct forwarder *fwd)
     }
 
     fwd->threads_started = 1;
+    fprintf(stderr,
+            "[TRACE] dataplane trace ON — watch [TRACE] LAN-RX / MID->egress / [EGR-WAN]\n");
+    fflush(stderr);
     if (fwd->cfg)
         main_diag_log_dataplane_ready(fwd->cfg);
     pthread_join(fwd->local_thread, NULL);
