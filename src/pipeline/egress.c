@@ -11,6 +11,7 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/crypto/fragment.h"
 
+#include <arpa/inet.h>
 #include <net/ethernet.h>
 #include <stdio.h>
 #include <string.h>
@@ -24,51 +25,151 @@ enum {
     EGR_DROP_CRYPTO_OFF,
     EGR_DROP_CRYPTO_NOT_READY,
     EGR_DROP_ENCRYPT,
+    EGR_DROP_PUSH_FAIL,
     EGR_DROP_N
 };
 
-static const char *egr_drop_name(int reason)
+static uint64_t g_egr_drop[EGR_DROP_N];
+static uint8_t g_egr_drop_logged[EGR_DROP_N];
+static uint8_t g_egr_ok_logged;
+
+static const char *egr_action_str(int action)
 {
-    switch (reason) {
-    case EGR_DROP_OWN_MAC:          return "own_port_src";
-    case EGR_DROP_POLICY:           return "no_policy_match";
-    case EGR_DROP_NO_WAN:           return "br_wire_no_wan";
-    case EGR_DROP_TX_ROOM:          return "wan_tx_blocked";
-    case EGR_DROP_L2:               return "l2_rewrite_fail";
-    case EGR_DROP_CRYPTO_OFF:       return "crypto_disabled";
-    case EGR_DROP_CRYPTO_NOT_READY: return "crypto_not_ready";
-    case EGR_DROP_ENCRYPT:          return "encrypt_fail";
+    switch (action) {
+    case POLICY_ACTION_BYPASS:      return "bypass";
+    case POLICY_ACTION_ENCRYPT_L2:  return "L2";
+    case POLICY_ACTION_ENCRYPT_L3:  return "L3";
+    case POLICY_ACTION_ENCRYPT_L4:  return "L4";
     default:                        return "?";
     }
 }
 
-static uint64_t g_egr_drop[EGR_DROP_N];
-static uint8_t g_egr_drop_first[EGR_DROP_N];
-
-static void egr_drop_count(int reason)
+static void egr_fmt_mac(const uint8_t mac[MAC_LEN], char *out, size_t outsz)
 {
-    if (reason < 0 || reason >= EGR_DROP_N)
+    snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void egr_bump_drop(int reason)
+{
+    if (reason >= 0 && reason < EGR_DROP_N)
+        (void)__sync_add_and_fetch(&g_egr_drop[reason], 1);
+}
+
+static void egr_log_ok(struct forwarder *fwd, int li, int wan_dp,
+                       const struct crypto_policy *cp, int flow_ok,
+                       uint16_t dst_port)
+{
+    if (g_egr_ok_logged || !fwd || !cp)
         return;
-    uint64_t n = __sync_add_and_fetch(&g_egr_drop[reason], 1);
-    if (!g_egr_drop_first[reason]) {
-        g_egr_drop_first[reason] = 1;
-        fprintf(stderr, "[EGR-DROP] first: %s (lan->wan packet dropped)\n",
-                egr_drop_name(reason));
+    g_egr_ok_logged = 1;
+    fprintf(stderr,
+            "[EGR-WAN] OK li=%d lan=%s -> wan_dp=%d wan=%s "
+            "policy_id=%d action=%s prio=%d flow_ok=%d dst_port=%u\n",
+            li,
+            (li >= 0 && li < fwd->local_count) ? fwd->locals[li].ifname : "?",
+            wan_dp,
+            (wan_dp >= 0 && wan_dp < fwd->wan_count) ? fwd->wans[wan_dp].ifname : "?",
+            cp->id, egr_action_str(cp->action), cp->priority,
+            flow_ok, (unsigned)dst_port);
+    fflush(stderr);
+}
+
+static void egr_log_own_mac(struct forwarder *fwd, int li, const uint8_t *pkt)
+{
+    char pkt_mac[24], loc_mac[24];
+
+    if (g_egr_drop_logged[EGR_DROP_OWN_MAC])
+        return;
+    g_egr_drop_logged[EGR_DROP_OWN_MAC] = 1;
+    egr_fmt_mac(pkt + MAC_LEN, pkt_mac, sizeof(pkt_mac));
+    egr_fmt_mac(fwd->locals[li].src_mac, loc_mac, sizeof(loc_mac));
+    fprintf(stderr,
+            "[EGR-WAN] DROP own_port_src: li=%d if=%s "
+            "pkt_src_mac=%s == local_src_mac=%s (packet originated on NE port)\n",
+            li, fwd->locals[li].ifname, pkt_mac, loc_mac);
+    fflush(stderr);
+}
+
+static void egr_log_no_wan(struct forwarder *fwd, int li)
+{
+    if (g_egr_drop_logged[EGR_DROP_NO_WAN])
+        return;
+    g_egr_drop_logged[EGR_DROP_NO_WAN] = 1;
+    fprintf(stderr,
+            "[EGR-WAN] DROP br_wire_no_wan: li=%d if=%s br_id=%d "
+            "local_to_wan_dp=%d (check ne_lan/ne_wan br_id in DB)\n",
+            li, fwd->locals[li].ifname,
+            (li >= 0 && li < fwd->cfg->local_count) ? fwd->cfg->locals[li].br_id : -1,
+            (li >= 0 && li < MAX_INTERFACES) ? fwd->local_to_wan_dp[li] : -1);
+    fflush(stderr);
+}
+
+static void egr_log_tx_room(struct forwarder *fwd, int wan_dp)
+{
+    if (g_egr_drop_logged[EGR_DROP_TX_ROOM])
+        return;
+    g_egr_drop_logged[EGR_DROP_TX_ROOM] = 1;
+    fprintf(stderr,
+            "[EGR-WAN] DROP wan_tx_blocked: wan_dp=%d if=%s "
+            "mid_to_wan=%u stopped=%d cooldown=%u\n",
+            wan_dp,
+            (wan_dp >= 0 && wan_dp < fwd->wan_count) ? fwd->wans[wan_dp].ifname : "?",
+            (wan_dp >= 0 && wan_dp < fwd->wan_count)
+                ? ne_ring_count(&fwd->mid_to_wan[wan_dp]) : 0u,
+            fwd_wan_is_stopped(wan_dp),
+            (wan_dp >= 0 && wan_dp < MAX_INTERFACES) ? fwd->wan_tx_cooldown[wan_dp] : 0u);
+    fflush(stderr);
+}
+
+static void egr_log_l2(struct forwarder *fwd, int wan_dp)
+{
+    char dst_mac[24], src_mac[24];
+    static const uint8_t zero[MAC_LEN];
+
+    if (g_egr_drop_logged[EGR_DROP_L2])
+        return;
+    g_egr_drop_logged[EGR_DROP_L2] = 1;
+    if (wan_dp < 0 || wan_dp >= fwd->wan_count) {
+        fprintf(stderr, "[EGR-WAN] DROP l2_rewrite_fail: invalid wan_dp=%d\n", wan_dp);
         fflush(stderr);
-    } else if ((n & 0x3FFFu) == 0) {
-        fprintf(stderr,
-                "[EGR-DROP] own_mac=%llu policy=%llu no_wan=%llu tx_room=%llu "
-                "l2=%llu crypto_off=%llu not_ready=%llu encrypt=%llu\n",
-                (unsigned long long)g_egr_drop[EGR_DROP_OWN_MAC],
-                (unsigned long long)g_egr_drop[EGR_DROP_POLICY],
-                (unsigned long long)g_egr_drop[EGR_DROP_NO_WAN],
-                (unsigned long long)g_egr_drop[EGR_DROP_TX_ROOM],
-                (unsigned long long)g_egr_drop[EGR_DROP_L2],
-                (unsigned long long)g_egr_drop[EGR_DROP_CRYPTO_OFF],
-                (unsigned long long)g_egr_drop[EGR_DROP_CRYPTO_NOT_READY],
-                (unsigned long long)g_egr_drop[EGR_DROP_ENCRYPT]);
-        fflush(stderr);
+        return;
     }
+    egr_fmt_mac(fwd->wans[wan_dp].dst_mac, dst_mac, sizeof(dst_mac));
+    egr_fmt_mac(fwd->wans[wan_dp].src_mac, src_mac, sizeof(src_mac));
+    fprintf(stderr,
+            "[EGR-WAN] DROP l2_rewrite_fail: wan=%s dst_mac=%s%s src_mac=%s%s\n",
+            fwd->wans[wan_dp].ifname, dst_mac,
+            memcmp(fwd->wans[wan_dp].dst_mac, zero, MAC_LEN) == 0 ? " (empty)" : "",
+            src_mac,
+            memcmp(fwd->wans[wan_dp].src_mac, zero, MAC_LEN) == 0 ? " (empty)" : "");
+    fflush(stderr);
+}
+
+static void egr_log_push_fail(struct forwarder *fwd, int wan_dp)
+{
+    if (g_egr_drop_logged[EGR_DROP_PUSH_FAIL])
+        return;
+    g_egr_drop_logged[EGR_DROP_PUSH_FAIL] = 1;
+    fprintf(stderr,
+            "[EGR-WAN] DROP mid_to_wan_ring_full: wan_dp=%d if=%s "
+            "queue=%u/%u (policy matched but packet never queued for WAN TX)\n",
+            wan_dp,
+            (wan_dp >= 0 && wan_dp < fwd->wan_count) ? fwd->wans[wan_dp].ifname : "?",
+            (wan_dp >= 0 && wan_dp < fwd->wan_count)
+                ? ne_ring_count(&fwd->mid_to_wan[wan_dp]) : 0u,
+            (wan_dp >= 0 && wan_dp < fwd->wan_count)
+                ? fwd->mid_to_wan[wan_dp].cap : 0u);
+    fflush(stderr);
+}
+
+static void egr_log_simple_drop(int reason, const char *detail)
+{
+    if (reason < 0 || reason >= EGR_DROP_N || g_egr_drop_logged[reason])
+        return;
+    g_egr_drop_logged[reason] = 1;
+    fprintf(stderr, "[EGR-WAN] DROP %s\n", detail);
+    fflush(stderr);
 }
 
 static int is_own_port_src(const struct forwarder *fwd, int li,
@@ -172,56 +273,73 @@ void pipeline_egress(struct forwarder *fwd, struct ne_packet job)
     int enc;
 
     if (is_own_port_src(fwd, li, pkt, job.len)) {
-        egr_drop_count(EGR_DROP_OWN_MAC);
+        egr_bump_drop(EGR_DROP_OWN_MAC);
+        egr_log_own_mac(fwd, li, pkt);
         goto drop;
     }
     if (policy_resolve_egress(fwd->cfg, li, flow_ok, src_ip, dst_ip,
                               src_port, dst_port, proto, &profile_idx, &cp) != 0) {
-        egr_drop_count(EGR_DROP_POLICY);
+        egr_bump_drop(EGR_DROP_POLICY);
+        policy_log_egress_miss(fwd->cfg, li, flow_ok, src_ip, dst_ip,
+                               src_port, dst_port, proto);
         goto drop;
     }
 
     wan_dp = br_wire_wan_dp_for_local(fwd, li);
     if (wan_dp < 0) {
-        egr_drop_count(EGR_DROP_NO_WAN);
+        egr_bump_drop(EGR_DROP_NO_WAN);
+        egr_log_no_wan(fwd, li);
         goto drop;
     }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
         if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
-            egr_drop_count(EGR_DROP_TX_ROOM);
+            egr_bump_drop(EGR_DROP_TX_ROOM);
+            egr_log_tx_room(fwd, wan_dp);
             goto drop;
         }
         if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac,
                             fwd->wans[wan_dp].src_mac) != 0) {
-            egr_drop_count(EGR_DROP_L2);
+            egr_bump_drop(EGR_DROP_L2);
+            egr_log_l2(fwd, wan_dp);
             goto drop;
         }
-        (void)push_to_wan(fwd, &job, wan_dp);
+        egr_log_ok(fwd, li, wan_dp, cp, flow_ok, dst_port);
+        if (push_to_wan(fwd, &job, wan_dp) != 0) {
+            egr_bump_drop(EGR_DROP_PUSH_FAIL);
+            egr_log_push_fail(fwd, wan_dp);
+        }
         return;
     }
 
     if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
-        egr_drop_count(EGR_DROP_TX_ROOM);
+        egr_bump_drop(EGR_DROP_TX_ROOM);
+        egr_log_tx_room(fwd, wan_dp);
         goto drop;
     }
     if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
-        egr_drop_count(EGR_DROP_L2);
+        egr_bump_drop(EGR_DROP_L2);
+        egr_log_l2(fwd, wan_dp);
         goto drop;
     }
     if (!fwd->cfg->crypto_enabled) {
-        egr_drop_count(EGR_DROP_CRYPTO_OFF);
+        egr_bump_drop(EGR_DROP_CRYPTO_OFF);
+        egr_log_simple_drop(EGR_DROP_CRYPTO_OFF,
+                            "crypto_disabled: policy requires encrypt but crypto_enabled=0");
         goto drop;
     }
 
     pi = (int)(cp - fwd->cfg->policies);
     if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
-        egr_drop_count(EGR_DROP_CRYPTO_NOT_READY);
+        egr_bump_drop(EGR_DROP_CRYPTO_NOT_READY);
+        egr_log_simple_drop(EGR_DROP_CRYPTO_NOT_READY,
+                            "crypto_not_ready: policy slot not initialized (keys/handshake?)");
         goto drop;
     }
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx) {
-        egr_drop_count(EGR_DROP_CRYPTO_NOT_READY);
+        egr_bump_drop(EGR_DROP_CRYPTO_NOT_READY);
+        egr_log_simple_drop(EGR_DROP_CRYPTO_NOT_READY, "crypto_not_ready: null policy ctx");
         goto drop;
     }
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
@@ -229,12 +347,18 @@ void pipeline_egress(struct forwarder *fwd, struct ne_packet job)
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx);
     if (enc < 0) {
-        egr_drop_count(EGR_DROP_ENCRYPT);
+        egr_bump_drop(EGR_DROP_ENCRYPT);
+        egr_log_simple_drop(EGR_DROP_ENCRYPT,
+                            "encrypt_fail: crypto_layer encrypt returned error");
         goto drop;
     }
     if (enc > 0)
         return;
-    (void)push_to_wan(fwd, &job, wan_dp);
+    egr_log_ok(fwd, li, wan_dp, cp, flow_ok, dst_port);
+    if (push_to_wan(fwd, &job, wan_dp) != 0) {
+        egr_bump_drop(EGR_DROP_PUSH_FAIL);
+        egr_log_push_fail(fwd, wan_dp);
+    }
     return;
 
 drop:

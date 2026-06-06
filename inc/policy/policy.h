@@ -24,6 +24,10 @@ int policy_resolve_egress(const struct app_config *cfg, int local_idx, int flow_
                           uint16_t src_port, uint16_t dst_port, uint8_t proto,
                           int *profile_idx, const struct crypto_policy **cp);
 
+void policy_log_egress_miss(const struct app_config *cfg, int local_idx, int flow_ok,
+                            uint32_t src_ip, uint32_t dst_ip,
+                            uint16_t src_port, uint16_t dst_port, uint8_t proto);
+
 int policy_expand_cartesian(struct app_config *cfg, struct profile_config *prof,
                             const struct crypto_policy *base,
                             int invert_src, int invert_dst,
