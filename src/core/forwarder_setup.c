@@ -6,6 +6,7 @@
 
 #include <net/if.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 extern atomic_int running;
@@ -71,8 +72,16 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd_crypto_ensure_profile_slots(cfg) != 0)
         return -1;
 
-    if (ne_pair_open(&fwd->pair, cfg) != 0)
+    fprintf(stderr, "[TRACE] opening XSK/XDP on %d LAN + %d WAN ifaces...\n",
+            fwd->local_count, fwd->wan_count);
+    fflush(stderr);
+    if (ne_pair_open(&fwd->pair, cfg) != 0) {
+        fprintf(stderr, "[FATAL] ne_pair_open failed (XDP attach or AF_XDP create)\n");
+        fflush(stderr);
         return -1;
+    }
+    fprintf(stderr, "[TRACE] XSK/XDP open OK\n");
+    fflush(stderr);
     if (forwarder_should_stop()) {
         forwarder_cleanup(fwd);
         return -1;

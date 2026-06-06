@@ -18,6 +18,7 @@ static uint8_t g_trace_lan_rx;
 static uint8_t g_trace_lan_ring_full;
 static uint8_t g_trace_mid_egr;
 static uint8_t g_trace_wan_rx;
+static uint8_t g_trace_wan_tx;
 
 atomic_int running = 1;
 struct forwarder *g_active_fwd;
@@ -96,17 +97,17 @@ static void *wan_core_thread(void *arg)
                 continue;
             if (fwd->wan_tx_cooldown[wi] > 0)
                 fwd->wan_tx_cooldown[wi]--;
-            uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
-            uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
             int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
             if (sent > 0) {
                 fwd->wan_tx_stuck[wi] = 0;
-            } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
-                uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
-                if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
-                    (void)fwd_wan_flush_queue(fwd, wi);
-                    fwd->wan_tx_cooldown[wi] = 65535;
-                    fwd->wan_tx_stuck[wi] = 0;
+                if (!g_trace_wan_tx) {
+                    g_trace_wan_tx = 1;
+                    fprintf(stderr,
+                            "[TRACE] WAN-TX first: wi=%d if=%s sent=%d "
+                            "mid_to_wan_left=%u\n",
+                            wi, fwd->wans[wi].ifname, sent,
+                            ne_ring_count(&fwd->mid_to_wan[wi]));
+                    fflush(stderr);
                 }
             }
         }

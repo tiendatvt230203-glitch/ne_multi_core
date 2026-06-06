@@ -130,6 +130,10 @@ static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t
                       uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
     uint32_t idx = 0;
+
+    if (slot->rx.flags && (*slot->rx.flags & XDP_RING_NEED_WAKEUP))
+        (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+
     uint32_t n = xsk_ring_cons__peek(&slot->rx, max, &idx);
     for (uint32_t i = 0; i < n; i++) {
         const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + i);

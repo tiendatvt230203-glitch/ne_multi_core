@@ -186,6 +186,8 @@ static int notify_profile_load(int profile_id) {
 static void *forwarder_thread_main(void *arg) {
     forwarder_pin_cpu();
     struct runtime_state *rt = (struct runtime_state *)arg;
+    fprintf(stderr, "[TRACE] forwarder_init starting (XDP/AF_XDP setup)...\n");
+    fflush(stderr);
     if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot]) != 0) {
         forwarder_cleanup(&rt->fwd);
         if (forwarder_should_stop())
@@ -206,6 +208,8 @@ static void *forwarder_thread_main(void *arg) {
         rt->running = 0;
         return NULL;
     }
+    fprintf(stderr, "[TRACE] forwarder_init OK — starting dataplane threads\n");
+    fflush(stderr);
     rt->running = 1;
     forwarder_run(&rt->fwd);
     rt->running = 0;
@@ -821,6 +825,8 @@ int main(int argc, char **argv) {
     }
 
     libbpf_set_print(libbpf_print_silent);
+    /* Daemon may run without TTY — force stderr flush so [TRACE]/[EGR-WAN] show immediately. */
+    setvbuf(stderr, NULL, _IONBF, 0);
 
     struct sigaction sa = { .sa_handler = on_stop_signal };
     sigemptyset(&sa.sa_mask);
