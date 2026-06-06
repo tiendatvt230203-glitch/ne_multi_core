@@ -27,14 +27,35 @@ enum {
     EGR_DROP_N
 };
 
+static const char *egr_drop_name(int reason)
+{
+    switch (reason) {
+    case EGR_DROP_OWN_MAC:          return "own_port_src";
+    case EGR_DROP_POLICY:           return "no_policy_match";
+    case EGR_DROP_NO_WAN:           return "br_wire_no_wan";
+    case EGR_DROP_TX_ROOM:          return "wan_tx_blocked";
+    case EGR_DROP_L2:               return "l2_rewrite_fail";
+    case EGR_DROP_CRYPTO_OFF:       return "crypto_disabled";
+    case EGR_DROP_CRYPTO_NOT_READY: return "crypto_not_ready";
+    case EGR_DROP_ENCRYPT:          return "encrypt_fail";
+    default:                        return "?";
+    }
+}
+
 static uint64_t g_egr_drop[EGR_DROP_N];
+static uint8_t g_egr_drop_first[EGR_DROP_N];
 
 static void egr_drop_count(int reason)
 {
     if (reason < 0 || reason >= EGR_DROP_N)
         return;
     uint64_t n = __sync_add_and_fetch(&g_egr_drop[reason], 1);
-    if ((n & 0x3FFFu) == 1) {
+    if (!g_egr_drop_first[reason]) {
+        g_egr_drop_first[reason] = 1;
+        fprintf(stderr, "[EGR-DROP] first: %s (lan->wan packet dropped)\n",
+                egr_drop_name(reason));
+        fflush(stderr);
+    } else if ((n & 0x3FFFu) == 0) {
         fprintf(stderr,
                 "[EGR-DROP] own_mac=%llu policy=%llu no_wan=%llu tx_room=%llu "
                 "l2=%llu crypto_off=%llu not_ready=%llu encrypt=%llu\n",

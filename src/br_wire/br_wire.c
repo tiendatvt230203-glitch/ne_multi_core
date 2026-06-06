@@ -171,6 +171,8 @@ int br_wire_install(struct forwarder *fwd)
         return -1;
 
     main_diag_log_br_wire_table(fwd->cfg);
+    fprintf(stderr, "[BR-WIRE] dataplane ready (no per-packet trace)\n");
+    fflush(stderr);
     return 0;
 }
 
