@@ -634,13 +634,14 @@ void ne_pair_close(struct ne_pair *p)
 }
 
 static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t max,
-                      uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
+                      uint8_t dir, uint8_t wan_idx, uint8_t local_idx,
+                      uint32_t frame_size)
 {
     uint32_t idx = 0;
     uint32_t n = xsk_ring_cons__peek(&slot->rx, max, &idx);
     for (uint32_t i = 0; i < n; i++) {
         const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + i);
-        out[i].addr = d->addr;
+        out[i].addr = ne_frame_base_addr(d->addr, frame_size);
         out[i].len = d->len;
         out[i].dir = dir;
         out[i].wan_idx = wan_idx;
@@ -663,7 +664,7 @@ int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             iface->queues[q].rx_pending = 0; 
             
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
-                               NE_DIR_LOCAL, 0, (uint8_t)i);
+                               NE_DIR_LOCAL, 0, (uint8_t)i, p->frame_size);
             
             total += (uint32_t)n;
             out_ptr += n;
@@ -685,7 +686,7 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             iface->queues[q].rx_pending = 0; 
             
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
-                               NE_DIR_WAN, (uint8_t)i, 0);
+                               NE_DIR_WAN, (uint8_t)i, 0, p->frame_size);
             
             total += (uint32_t)n;
             out_ptr += n;
@@ -799,8 +800,7 @@ void ne_refill_fq_wan(struct ne_pair *p)
 }
 
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
-                          uint32_t max_pkt_len, uint32_t frame_headroom,
-                          uint64_t *tx_no_free)
+                          uint32_t max_pkt_len, uint64_t *tx_no_free)
 {
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
@@ -836,8 +836,10 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
 
     for (uint32_t i = 0; i < popped; i++) {
         struct xdp_desc *d = xsk_ring_prod__tx_desc(&slot->tx, idx + i);
-        d->addr = jobs[i].addr + frame_headroom;
+        /* Chunk-aligned UMEM offset; NIC DMAs from addr + frame_headroom. */
+        d->addr = jobs[i].addr;
         d->len = jobs[i].len;
+        d->options = 0;
     }
 
     xsk_ring_prod__submit(&slot->tx, popped);
@@ -848,12 +850,11 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
 
 
 static int tx_drain_iface(struct ne_iface *iface, struct ne_ring *src,
-                          uint32_t max_pkt_len, uint32_t frame_headroom)
+                          uint32_t max_pkt_len)
 {
     int sent = 0;
     int q = iface->tx_queue_rr % iface->queue_count;
-    sent += tx_drain_queue(&iface->queues[q], src, max_pkt_len, frame_headroom,
-                           &iface->tx_no_free);
+    sent += tx_drain_queue(&iface->queues[q], src, max_pkt_len, &iface->tx_no_free);
     iface->tx_queue_rr = (q + 1) % iface->queue_count;
     return sent;
 }
@@ -862,15 +863,13 @@ int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx)
 {
     if (!p || local_idx < 0 || local_idx >= p->local_count)
         return 0;
-    return tx_drain_iface(&p->locals[local_idx], src, ne_frame_max_pkt_len(p),
-                          p->frame_headroom);
+    return tx_drain_iface(&p->locals[local_idx], src, ne_frame_max_pkt_len(p));
 }
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
 {
     if (!p || wan_idx < 0 || wan_idx >= p->wan_count)
         return 0;
-    return tx_drain_iface(&p->wans[wan_idx], src, ne_frame_max_pkt_len(p),
-                          p->frame_headroom);
+    return tx_drain_iface(&p->wans[wan_idx], src, ne_frame_max_pkt_len(p));
 }
 
