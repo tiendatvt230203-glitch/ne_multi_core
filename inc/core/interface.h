@@ -164,4 +164,14 @@ void interface_promisc_off_config(const struct app_config *cfg);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
 
+/* Set NE_XDP_DEBUG=1 to emit [XDP-DBG] counters every 5s on stderr. */
+#define NE_XDP_DBG_DROP_POLICY  1
+#define NE_XDP_DBG_DROP_WAN     2
+#define NE_XDP_DBG_DROP_L2      3
+#define NE_XDP_DBG_DROP_CRYPTO  4
+#define NE_XDP_DBG_PUSH_WAN     5
+
+void ne_xdp_debug_drop_local(int reason);
+void ne_xdp_debug_push_wan(void);
+
 #endif

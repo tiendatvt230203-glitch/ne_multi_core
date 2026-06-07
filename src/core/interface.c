@@ -12,6 +12,121 @@
 #include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <stdlib.h>
+#include <time.h>
+
+struct ne_xdp_dbg {
+    uint64_t rx_local;
+    uint64_t rx_wan;
+    uint64_t tx_local;
+    uint64_t tx_wan;
+    uint64_t tx_ring_full;
+    uint64_t tx_bad_len;
+    uint64_t mid_wan_depth_max;
+    uint64_t drop_policy;
+    uint64_t drop_wan;
+    uint64_t drop_l2;
+    uint64_t drop_crypto;
+    uint64_t push_wan;
+};
+
+static struct ne_xdp_dbg g_xdp_dbg;
+static uint64_t g_xdp_dbg_last_ms;
+
+static uint64_t dbg_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static int xdp_debug_on(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("NE_XDP_DEBUG");
+        cached = (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+    }
+    return cached;
+}
+
+static void xdp_dbg_bump(uint64_t *c, uint64_t n)
+{
+    if (n)
+        __atomic_add_fetch(c, n, __ATOMIC_RELAXED);
+}
+
+void ne_xdp_debug_drop_local(int reason)
+{
+    if (!xdp_debug_on())
+        return;
+    switch (reason) {
+    case NE_XDP_DBG_DROP_POLICY: xdp_dbg_bump(&g_xdp_dbg.drop_policy, 1); break;
+    case NE_XDP_DBG_DROP_WAN:    xdp_dbg_bump(&g_xdp_dbg.drop_wan, 1); break;
+    case NE_XDP_DBG_DROP_L2:     xdp_dbg_bump(&g_xdp_dbg.drop_l2, 1); break;
+    case NE_XDP_DBG_DROP_CRYPTO: xdp_dbg_bump(&g_xdp_dbg.drop_crypto, 1); break;
+    default: break;
+    }
+}
+
+void ne_xdp_debug_push_wan(void)
+{
+    xdp_dbg_bump(&g_xdp_dbg.push_wan, 1);
+}
+
+static void xdp_log_sock_stats(const char *ifname, struct xsk_socket *xsk)
+{
+    struct xdp_statistics xs;
+    socklen_t len = sizeof(xs);
+    int opt = 0;
+    socklen_t optlen = sizeof(opt);
+
+    if (!xsk)
+        return;
+    memset(&xs, 0, sizeof(xs));
+    (void)getsockopt(xsk_socket__fd(xsk), SOL_XDP, XDP_STATISTICS, &xs, &len);
+    (void)getsockopt(xsk_socket__fd(xsk), SOL_XDP, XDP_OPTIONS, &opt, &optlen);
+    fprintf(stderr,
+            "[XDP-DBG] %s zc=%d rx_drop=%llu rx_inv=%llu tx_inv=%llu\n",
+            ifname, !!(opt & XDP_OPTIONS_ZEROCOPY),
+            (unsigned long long)xs.rx_dropped,
+            (unsigned long long)xs.rx_invalid_descs,
+            (unsigned long long)xs.tx_invalid_descs);
+}
+
+static void xdp_debug_maybe_log(const struct ne_pair *p)
+{
+    uint64_t now;
+
+    if (!xdp_debug_on() || !p)
+        return;
+    now = dbg_now_ms();
+    if (now - g_xdp_dbg_last_ms < 5000)
+        return;
+    g_xdp_dbg_last_ms = now;
+
+    fprintf(stderr,
+            "[XDP-DBG] rx_l=%llu rx_w=%llu push_wan=%llu "
+            "drop{pol=%llu wan=%llu l2=%llu crypto=%llu} "
+            "tx_w=%llu tx_l=%llu tx_full=%llu tx_bad_len=%llu mid_wan_max=%llu\n",
+            (unsigned long long)g_xdp_dbg.rx_local,
+            (unsigned long long)g_xdp_dbg.rx_wan,
+            (unsigned long long)g_xdp_dbg.push_wan,
+            (unsigned long long)g_xdp_dbg.drop_policy,
+            (unsigned long long)g_xdp_dbg.drop_wan,
+            (unsigned long long)g_xdp_dbg.drop_l2,
+            (unsigned long long)g_xdp_dbg.drop_crypto,
+            (unsigned long long)g_xdp_dbg.tx_wan,
+            (unsigned long long)g_xdp_dbg.tx_local,
+            (unsigned long long)g_xdp_dbg.tx_ring_full,
+            (unsigned long long)g_xdp_dbg.tx_bad_len,
+            (unsigned long long)g_xdp_dbg.mid_wan_depth_max);
+    if (p->local_count > 0 && p->locals[0].queues[0].xsk)
+        xdp_log_sock_stats(p->locals[0].ifname, p->locals[0].queues[0].xsk);
+    if (p->wan_count > 0 && p->wans[0].queues[0].xsk)
+        xdp_log_sock_stats(p->wans[0].ifname, p->wans[0].queues[0].xsk);
+    fflush(stderr);
+}
 
 static uint32_t next_pow2_u32(uint32_t v)
 {
@@ -289,16 +404,10 @@ uint32_t ne_frame_max_pkt_len(const struct ne_pair *p)
 
 #define NE_XSK_BIND_FLAGS ((uint16_t)(XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP))
 
-static void xsk_socket_kick(struct xsk_socket *xsk)
-{
-    if (xsk)
-        (void)sendto(xsk_socket__fd(xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-}
-
 static void xsk_ring_wakeup(struct xsk_socket *xsk, struct xsk_ring_prod *ring)
 {
-    (void)ring;
-    xsk_socket_kick(xsk);
+    if (xsk && ring && xsk_ring_prod__needs_wakeup(ring))
+        (void)sendto(xsk_socket__fd(xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 }
 
 static uint64_t ne_frame_base_addr(uint64_t addr, uint32_t frame_size)
@@ -564,6 +673,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
             "[XSK] UMEM frames=%u frame_size=%u headroom=%u max_pkt=%u mode=zerocopy\n",
             p->n_frames, p->frame_size, p->frame_headroom,
             ne_frame_max_pkt_len(p));
+    if (xdp_debug_on())
+        fprintf(stderr, "[XDP-DBG] enabled — set NE_XDP_DEBUG=0 to silence\n");
     fflush(stderr);
 
     for (int i = 0; i < p->local_count; i++) {
@@ -676,6 +787,7 @@ int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             out_ptr += n;
         }
     }
+    xdp_dbg_bump(&g_xdp_dbg.rx_local, (uint64_t)total);
     return (int)total;
 }
 
@@ -698,6 +810,7 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             out_ptr += n;
         }
     }
+    xdp_dbg_bump(&g_xdp_dbg.rx_wan, (uint64_t)total);
     return (int)total;
 }
 
@@ -813,7 +926,7 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
     if (!free_slots) {
         if (tx_no_free)
             (*tx_no_free)++;
-        
+        xdp_dbg_bump(&g_xdp_dbg.tx_ring_full, 1);
         xsk_ring_wakeup(slot->xsk, &slot->tx);
         return 0;
     }
@@ -827,6 +940,13 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
 
     for (uint32_t i = 0; i < popped; i++) {
         if (jobs[i].len == 0 || jobs[i].len > max_pkt_len) {
+            xdp_dbg_bump(&g_xdp_dbg.tx_bad_len, 1);
+            if (xdp_debug_on()) {
+                fprintf(stderr, "[XDP-DBG] tx reject len=%u max=%u addr=%llu\n",
+                        jobs[i].len, max_pkt_len,
+                        (unsigned long long)jobs[i].addr);
+                fflush(stderr);
+            }
             for (uint32_t j = 0; j < popped; j++)
                 (void)ne_ring_try_push(src, &jobs[j]);
             return 0;
@@ -866,15 +986,29 @@ static int tx_drain_iface(struct ne_iface *iface, struct ne_ring *src,
 
 int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx)
 {
+    int sent;
+
     if (!p || local_idx < 0 || local_idx >= p->local_count)
         return 0;
-    return tx_drain_iface(&p->locals[local_idx], src, ne_frame_max_pkt_len(p));
+    sent = tx_drain_iface(&p->locals[local_idx], src, ne_frame_max_pkt_len(p));
+    xdp_dbg_bump(&g_xdp_dbg.tx_local, (uint64_t)(sent > 0 ? sent : 0));
+    xdp_debug_maybe_log(p);
+    return sent;
 }
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
 {
+    uint32_t depth;
+    int sent;
+
     if (!p || wan_idx < 0 || wan_idx >= p->wan_count)
         return 0;
-    return tx_drain_iface(&p->wans[wan_idx], src, ne_frame_max_pkt_len(p));
+    depth = ne_ring_count(src);
+    if (depth > g_xdp_dbg.mid_wan_depth_max)
+        g_xdp_dbg.mid_wan_depth_max = depth;
+    sent = tx_drain_iface(&p->wans[wan_idx], src, ne_frame_max_pkt_len(p));
+    xdp_dbg_bump(&g_xdp_dbg.tx_wan, (uint64_t)(sent > 0 ? sent : 0));
+    xdp_debug_maybe_log(p);
+    return sent;
 }
 

@@ -105,9 +105,9 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
                 found = 1;
         if (!found)
             continue;
-        const struct crypto_policy *c = config_select_crypto_policy(
-            fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port,
-            flow_ok ? proto : POLICY_PROTO_ANY);
+        const struct crypto_policy *c = flow_ok
+            ? config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto)
+            : NULL;
         if (!c)
             continue;
         if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {
@@ -140,37 +140,53 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     int enc;
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                            &profile_idx, &cp) != 0)
+                            &profile_idx, &cp) != 0) {
+        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_POLICY);
         goto drop;
+    }
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
+    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp)) {
+        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_WAN);
         goto drop;
-    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
+    }
+    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
+        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_L2);
         goto drop;
+    }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
+        ne_xdp_debug_push_wan();
         (void)push_to_wan(fwd, &job, wan_dp);
         return;
     }
-    if (!fwd->cfg->crypto_enabled)
+    if (!fwd->cfg->crypto_enabled) {
+        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
         goto drop;
+    }
 
     pi = (int)(cp - fwd->cfg->policies);
-    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
+    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
+        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
         goto drop;
+    }
     pctx = fwd_crypto_policy_ctx(pi);
-    if (!pctx)
+    if (!pctx) {
+        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
         goto drop;
+    }
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
     pctx->policy_id = cp->id;
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx);
-    if (enc < 0)
+    if (enc < 0) {
+        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
         goto drop;
+    }
     if (enc > 0)
         return;
+    ne_xdp_debug_push_wan();
     (void)push_to_wan(fwd, &job, wan_dp);
     return;
 

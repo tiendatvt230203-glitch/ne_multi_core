@@ -64,7 +64,6 @@ static void *local_core_thread(void *arg)
             sched_yield();
             continue;
         }
-
         for (int i = 0; i < rcvd; i++) {
             if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
