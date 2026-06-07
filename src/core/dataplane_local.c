@@ -123,9 +123,13 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
                 found = 1;
         if (!found)
             continue;
-        const struct crypto_policy *c = flow_ok
-            ? config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto)
-            : NULL;
+        const struct crypto_policy *c = config_select_crypto_policy(
+            fwd->cfg, pi,
+            flow_ok ? src_ip : 0,
+            flow_ok ? dst_ip : 0,
+            flow_ok ? src_port : 0,
+            flow_ok ? dst_port : 0,
+            flow_ok ? proto : 0);
         if (!c)
             continue;
         if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {
@@ -159,7 +163,15 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0) {
-        wan_tx_fail(fwd, -1, &job, "no matching policy");
+        if (pkt && job.len >= 14) {
+            uint16_t et = (uint16_t)(((uint16_t)pkt[12] << 8) | pkt[13]);
+            fprintf(stderr,
+                    "[WAN-TX] ?: no matching policy len=%u flow_ok=%d ethertype=0x%04x local=%d\n",
+                    job.len, flow_ok, et, li);
+        } else {
+            wan_tx_fail(fwd, -1, &job, "no matching policy");
+        }
+        fflush(stderr);
         goto drop;
     }
 

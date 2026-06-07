@@ -1,6 +1,7 @@
 #include "../../inc/core/dataplane_util.h"
 
 #include <arpa/inet.h>
+#include <linux/if_ether.h>
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -15,12 +16,23 @@ int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
         return -1;
 
     struct ether_header *eth = pkt_data;
-    if (ntohs(eth->ether_type) != ETHERTYPE_IP)
+    uint16_t etype = ntohs(eth->ether_type);
+    const uint8_t *ip_ptr = (const uint8_t *)(eth + 1);
+    size_t l2_len = sizeof(*eth);
+
+    if (etype == ETH_P_8021Q || etype == ETH_P_8021AD) {
+        if (pkt_len < l2_len + 4 + sizeof(struct iphdr))
+            return -1;
+        etype = ntohs(*(const uint16_t *)(ip_ptr + 2));
+        ip_ptr += 4;
+        l2_len += 4;
+    }
+    if (etype != ETHERTYPE_IP)
         return -1;
 
-    struct iphdr *ip = (struct iphdr *)((uint8_t *)pkt_data + sizeof(*eth));
+    struct iphdr *ip = (struct iphdr *)ip_ptr;
     uint32_t ihl = (uint32_t)ip->ihl * 4U;
-    if (ihl < sizeof(struct iphdr) || pkt_len < sizeof(*eth) + ihl)
+    if (ihl < sizeof(struct iphdr) || pkt_len < l2_len + ihl)
         return -1;
 
     *src_ip = ip->saddr;
@@ -30,7 +42,7 @@ int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
     *dst_port = 0;
 
     if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
-        uint8_t *l4 = (uint8_t *)pkt_data + sizeof(*eth) + ihl;
+        uint8_t *l4 = (uint8_t *)pkt_data + l2_len + ihl;
         if (pkt_len < (uint32_t)(l4 - (uint8_t *)pkt_data + 4))
             return -1;
         uint16_t *ports = (uint16_t *)l4;
