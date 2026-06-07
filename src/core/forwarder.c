@@ -9,6 +9,7 @@
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/core/crypto_trace.h"
 
 #include <net/if.h>
 #include <pthread.h>
@@ -199,6 +200,7 @@ static void *crypto_worker_thread(void *arg)
         }
         if (is_primary && ++gc_tick >= 8192) {
             fwd_crypto_frag_gc_tick();
+            crypto_trace_maybe_summary();
             gc_tick = 0;
         }
         if (is_primary)

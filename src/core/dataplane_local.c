@@ -8,6 +8,9 @@
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
+#include "../../inc/core/crypto_trace.h"
+#include "../../inc/core/crypto_route.h"
+#include "../../inc/crypto/crypto_layer2.h"
 
 #include <string.h>
 
@@ -43,9 +46,45 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
     return 0;
 }
 
+static const char *policy_layer_name(const struct crypto_policy *cp)
+{
+    if (!cp)
+        return "?";
+    if (cp->action == POLICY_ACTION_ENCRYPT_L2)
+        return "L2";
+    if (cp->action == POLICY_ACTION_ENCRYPT_L3)
+        return "L3";
+    if (cp->action == POLICY_ACTION_ENCRYPT_L4)
+        return "L4";
+    return "?";
+}
+
+static void trace_encrypt_flow(const struct crypto_policy *cp, uint8_t *pkt, uint32_t len,
+                               uint32_t src_ip, uint32_t dst_ip,
+                               uint16_t src_port, uint16_t dst_port, uint8_t proto,
+                               int flow_ok)
+{
+    uint8_t core_id = crypto_layer2_worker_core_id();
+    uint32_t sip = src_ip, dip = dst_ip;
+    uint16_t sp = src_port, dp = dst_port;
+    uint8_t pr = proto;
+
+    if (cp->action == POLICY_ACTION_ENCRYPT_L2 &&
+        crypto_layer2_read_core_id(pkt, len, &core_id) != 0)
+        core_id = dp_crypto_worker_cpu(dp_crypto_current_worker_idx());
+
+    if (!flow_ok)
+        dp_parse_flow(pkt, len, &sip, &dip, &sp, &dp, &pr);
+
+    crypto_trace_encrypt(policy_layer_name(cp), sip, dip, sp, dp, pr, core_id);
+}
+
 static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
                           const struct crypto_policy *cp, int wan_dp,
-                          struct packet_crypto_ctx *pctx)
+                          struct packet_crypto_ctx *pctx,
+                          uint32_t src_ip, uint32_t dst_ip,
+                          uint16_t src_port, uint16_t dst_port, uint8_t proto,
+                          int flow_ok)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
@@ -81,7 +120,10 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
         dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         return -1;
-    return push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) == 0 ? 1 : -1;
+    if (push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) != 0)
+        return -1;
+    trace_encrypt_flow(cp, pkt, l1, src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
+    return 1;
 }
 
 static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok,
@@ -166,11 +208,13 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
     pctx->policy_id = cp->id;
     crypto_apply_from_policy(cp);
-    enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx);
+    enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
+                         src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
     if (enc < 0)
         goto drop;
     if (enc > 0)
         return;
+    trace_encrypt_flow(cp, pkt, job.len, src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
     (void)push_to_wan(fwd, &job, wan_dp);
     return;
 
