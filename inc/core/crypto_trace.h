@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-/* Mặc định bật. Tắt: export NE_CRYPTO_TRACE=0
- * Mỗi connection (5-tuple) in đúng 1 dòng ENC và 1 dòng DEC. */
+/* Bật debug: export NE_CRYPTO_TRACE=1
+ * Mỗi connection (5-tuple) in đúng 1 dòng ENC và 1 dòng DEC (không lặp). */
 
 void crypto_trace_encrypt(const char *layer,
                           uint32_t src_ip, uint32_t dst_ip,

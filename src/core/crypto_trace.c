@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FLOW_LOG_SLOTS 4096u
+#define FLOW_LOG_SLOTS 8192u
+#define FLOW_LOG_PROBE 32u
 
 struct flow_key {
     uint32_t src_ip;
@@ -31,11 +32,8 @@ static pthread_mutex_t dec_lock = PTHREAD_MUTEX_INITIALIZER;
 static void trace_init_once(void)
 {
     const char *ev = getenv("NE_CRYPTO_TRACE");
-    /* Mặc định bật; tắt: export NE_CRYPTO_TRACE=0 */
-    if (ev && ev[0] == '0' && ev[1] == '\0')
-        trace_enabled = 0;
-    else
-        trace_enabled = 1;
+    /* Mặc định tắt; bật khi debug: export NE_CRYPTO_TRACE=1 */
+    trace_enabled = (ev && ev[0] == '1' && ev[1] == '\0') ? 1 : 0;
 }
 
 static int trace_on(void)
@@ -58,12 +56,18 @@ static uint32_t flow_hash(const struct flow_key *k)
     return h;
 }
 
+static int flow_key_equal(const struct flow_key *a, const struct flow_key *b)
+{
+    return memcmp(a, b, sizeof(*a)) == 0;
+}
+
 static int flow_first_time(struct flow_slot *slots, pthread_mutex_t *lock,
                            uint32_t src_ip, uint32_t dst_ip,
                            uint16_t src_port, uint16_t dst_port, uint8_t proto)
 {
     struct flow_key key;
     uint32_t idx;
+    uint32_t i;
 
     memset(&key, 0, sizeof(key));
     key.src_ip = src_ip;
@@ -74,27 +78,32 @@ static int flow_first_time(struct flow_slot *slots, pthread_mutex_t *lock,
     idx = flow_hash(&key) % FLOW_LOG_SLOTS;
 
     pthread_mutex_lock(lock);
-    if (slots[idx].used && memcmp(&slots[idx].key, &key, sizeof(key)) == 0) {
-        pthread_mutex_unlock(lock);
-        return 0;
+    for (i = 0; i < FLOW_LOG_PROBE; i++) {
+        uint32_t slot = (idx + i) % FLOW_LOG_SLOTS;
+        struct flow_slot *s = &slots[slot];
+
+        if (!s->used) {
+            s->key = key;
+            s->used = 1;
+            pthread_mutex_unlock(lock);
+            return 1;
+        }
+        if (flow_key_equal(&s->key, &key)) {
+            pthread_mutex_unlock(lock);
+            return 0;
+        }
     }
-    slots[idx].key = key;
-    slots[idx].used = 1;
     pthread_mutex_unlock(lock);
-    return 1;
+    return 0;
 }
 
 static void fmt_ip(char *buf, size_t bufsz, uint32_t ip)
 {
     struct in_addr a;
-    const char *s;
 
     a.s_addr = ip;
-    s = inet_ntoa(a);
-    if (!s)
+    if (!inet_ntop(AF_INET, &a, buf, (socklen_t)bufsz))
         snprintf(buf, bufsz, "0.0.0.0");
-    else
-        snprintf(buf, bufsz, "%s", s);
 }
 
 void crypto_trace_encrypt(const char *layer,
@@ -115,6 +124,7 @@ void crypto_trace_encrypt(const char *layer,
             "[CRYPTO-ENC] core=%u %s:%u -> %s:%u proto=%u %s\n",
             (unsigned)core_id, sip, (unsigned)src_port, dip, (unsigned)dst_port,
             (unsigned)proto, layer ? layer : "");
+    fflush(stderr);
 }
 
 void crypto_trace_decrypt(const char *layer,
@@ -137,6 +147,7 @@ void crypto_trace_decrypt(const char *layer,
             (unsigned)wire_core_id, (unsigned)handler_core_id,
             sip, (unsigned)src_port, dip, (unsigned)dst_port,
             (unsigned)proto, layer ? layer : "");
+    fflush(stderr);
 }
 
 void crypto_trace_maybe_summary(void)
