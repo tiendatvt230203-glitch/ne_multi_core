@@ -11,12 +11,7 @@
 #include "../../inc/crypto/packet_crypto.h"
 
 #include "../../inc/core/fragment.h"
-#include "../../inc/core/interface.h"
-#include "../../inc/core/local_hwaddr.h"
-
-#include <arpa/inet.h>
-#include <stdio.h>
-#include <time.h>
+#include "../../inc/core/crypto_route.h"
 
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
@@ -45,7 +40,7 @@ static int decrypt_l2(uint8_t *pkt, uint32_t *len)
     struct packet_crypto_ctx *ctx;
     int n;
 
-    if (!fake || *len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN)
+    if (!fake || *len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN)
         return 0;
     if ((((uint16_t)pkt[12] << 8) | pkt[13]) != fake)
         return 0;
@@ -79,7 +74,8 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
     if (nd < 0)
         return -1;
-    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot), pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
+    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
+                                pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
@@ -155,11 +151,10 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     return 0;
 }
 
-static int decrypt_wan(struct forwarder *fwd, struct ne_pipeline *pl,
-                       struct ne_packet *job)
+static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 {
     uint8_t scratch[8192];
-    uint8_t *pkt = ne_packet_data(&pl->pair, job->addr);
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
     uint16_t pid = 0;
     uint8_t fidx = 0;
@@ -222,53 +217,34 @@ static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
     return config_find_local_for_ip(fwd->cfg, dest_ip);
 }
 
-void dataplane_process_wan(struct forwarder *fwd, struct ne_pipeline *pl,
-                            struct ne_packet job)
+void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
-    uint8_t *pkt = ne_packet_data(&pl->pair, job.addr);
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     int li;
     int dec;
-    int needs_csum = 0;
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
-        needs_csum = 1;
-        dec = decrypt_wan(fwd, pl, &job);
+        dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
-            ne_frame_free(&pl->pair, job.addr);
+            ne_frame_free(&fwd->pair, job.addr);
             return;
         }
         if (dec != 0)
             goto drop;
-        pkt = ne_packet_data(&pl->pair, job.addr);
+        pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
     li = pick_local(fwd, pkt, job.len);
     if (li < 0 || li >= fwd->local_count)
         goto drop;
-
-    if (needs_csum) {
-        uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
-        uint8_t dst_mac[MAC_LEN];
-
-        if (dest_ip == 0)
-            goto drop;
-        if (local_neigh_resolve(li, fwd->locals[li].ifname, dest_ip, dst_mac) != 0) {
-            local_neigh_arp_probe(fwd->locals[li].ifname, fwd->locals[li].src_mac,
-                                  dest_ip);
-            if (local_neigh_resolve(li, fwd->locals[li].ifname, dest_ip,
-                                    dst_mac) != 0)
-                memset(dst_mac, 0xff, MAC_LEN);
-        }
-        if (dp_write_l2(pkt, job.len, dst_mac, fwd->locals[li].src_mac, 0) != 0)
-            goto drop;
-        dp_fixup_tx_csum(pkt, job.len);
-    }
+    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
+        goto drop;
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    (void)dp_ring_push(fwd, pl, &pl->mid_to_local[li], &job);
+    (void)dp_ring_push(fwd, &fwd->mid_to_local[li], &job);
     return;
 
 drop:
-    ne_frame_free(&pl->pair, job.addr);
+    ne_frame_free(&fwd->pair, job.addr);
 }

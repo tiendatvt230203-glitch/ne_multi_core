@@ -1,4 +1,5 @@
 #include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/core/crypto_route.h"
 
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
@@ -30,7 +31,7 @@ static struct crypto_policy prev_active_policies[MAX_CRYPTO_POLICIES];
 static int prev_active_policy_count;
 static int prev_grace_active;
 static uint64_t prev_grace_until_ms;
-static struct frag_table profile_frag_l2[MAX_PROFILES];
+static struct frag_table profile_frag_l2[MAX_PROFILES][NE_CRYPTO_WORKERS];
 static struct frag_table profile_frag_l3[MAX_PROFILES];
 static struct frag_table profile_frag_l4[MAX_PROFILES];
 static struct flow_table profile_flow_tables[MAX_PROFILES];
@@ -76,7 +77,8 @@ int fwd_crypto_ensure_profile_slots(struct app_config *cfg)
                 windows[wi] = cfg->wans[wi].window_size;
             flow_table_init(&profile_flow_tables[slot], windows, cfg->wan_count);
             profile_flow_table_ready[slot] = 1;
-            frag_table_init(&profile_frag_l2[slot]);
+            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+                frag_table_init(&profile_frag_l2[slot][w]);
             frag_table_init(&profile_frag_l3[slot]);
             frag_table_init(&profile_frag_l4[slot]);
         }
@@ -379,7 +381,8 @@ void fwd_crypto_frag_gc_tick(void)
     for (int s = 0; s < MAX_PROFILES; s++) {
         if (!profile_flow_table_ready[s])
             continue;
-        frag_table_gc(&profile_frag_l2[s]);
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+            frag_table_gc(&profile_frag_l2[s][w]);
         frag_table_gc(&profile_frag_l3[s]);
         frag_table_gc(&profile_frag_l4[s]);
     }
@@ -400,7 +403,7 @@ struct packet_crypto_ctx *fwd_crypto_policy_ctx(int policy_index)
 int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len)
 {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
-    if (!fake || !pkt || pkt_len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN)
+    if (!fake || !pkt || pkt_len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN)
         return 0;
     uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
     if (et != fake)
@@ -408,11 +411,13 @@ int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len)
     return policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][pkt[CRYPTO_L2_POLICY_OFF]] >= 0;
 }
 
-struct frag_table *fwd_crypto_frag_l2(int slot)
+struct frag_table *fwd_crypto_frag_l2(int slot, int worker_idx)
 {
     if (slot < 0 || slot >= MAX_PROFILES)
         return NULL;
-    return &profile_frag_l2[slot];
+    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
+        return NULL;
+    return &profile_frag_l2[slot][worker_idx];
 }
 
 struct frag_table *fwd_crypto_frag_l3(int slot)

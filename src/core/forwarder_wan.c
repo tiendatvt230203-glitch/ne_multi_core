@@ -102,28 +102,15 @@ int fwd_wan_ifname_dataplane_in_cfg(const struct app_config *cfg, const char *if
     return 0;
 }
 
-static uint32_t fwd_mid_to_wan_depth(struct forwarder *fwd, int wan_idx)
-{
-    uint32_t depth = 0;
-
-    for (uint32_t p = 0; p < NE_PIPELINE_COUNT; p++)
-        depth += ne_ring_count(&fwd->pipes[p].mid_to_wan[wan_idx]);
-    return depth;
-}
-
 uint32_t fwd_wan_flush_queue(struct forwarder *fwd, int wan_idx)
 {
     struct ne_packet pkt;
     uint32_t dropped = 0;
-
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return 0;
-    for (uint32_t p = 0; p < NE_PIPELINE_COUNT; p++) {
-        struct ne_pipeline *pl = &fwd->pipes[p];
-        while (ne_ring_try_pop(&pl->mid_to_wan[wan_idx], &pkt) == 0) {
-            ne_frame_free(&pl->pair, pkt.addr);
-            dropped++;
-        }
+    while (ne_ring_try_pop(&fwd->mid_to_wan[wan_idx], &pkt) == 0) {
+        ne_frame_free(&fwd->pair, pkt.addr);
+        dropped++;
     }
     return dropped;
 }
@@ -134,12 +121,8 @@ int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx)
         return 0;
     if (fwd->wan_tx_cooldown[wan_idx] > 0)
         return 0;
-    for (uint32_t p = 0; p < NE_PIPELINE_COUNT; p++) {
-        struct ne_ring *r = &fwd->pipes[p].mid_to_wan[wan_idx];
-        if (ne_ring_count(r) + NE_BATCH_SIZE < r->cap)
-            return 1;
-    }
-    return 0;
+    struct ne_ring *r = &fwd->mid_to_wan[wan_idx];
+    return ne_ring_count(r) + NE_BATCH_SIZE < r->cap;
 }
 
 static void wan_drain_finish_slot(struct forwarder *fwd, int dp)
@@ -423,7 +406,7 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
             int dp = config_wan_cfg_to_dp(fwd->cfg, p->wan_indices[i]);
             if (dp < 0 || !fwd_wan_dp_ok_for_new_traffic(dp) || !fwd_wan_has_tx_room(fwd, dp))
                 continue;
-            uint32_t d = fwd_mid_to_wan_depth(fwd, dp);
+            uint32_t d = ne_ring_count(&fwd->mid_to_wan[dp]);
             if (d < best_depth) {
                 best_depth = d;
                 best = dp;
@@ -439,7 +422,7 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
     for (int wi = 0; wi < fwd->wan_count; wi++) {
         if (!fwd_wan_dp_ok_for_new_traffic(wi) || !fwd_wan_has_tx_room(fwd, wi))
             continue;
-        uint32_t d = fwd_mid_to_wan_depth(fwd, wi);
+        uint32_t d = ne_ring_count(&fwd->mid_to_wan[wi]);
         if (d < best_depth) {
             best_depth = d;
             best = wi;

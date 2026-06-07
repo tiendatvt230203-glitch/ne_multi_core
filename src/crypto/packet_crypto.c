@@ -417,14 +417,14 @@ void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
     packet[12] = (uint8_t)(fake >> 8);
     packet[13] = (uint8_t)(fake & 0xFF);
     packet[CRYPTO_L2_POLICY_OFF] = policy_id;
-    memcpy(packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce, nonce_size);
+    memcpy(packet + CRYPTO_L2_NONCE_OFF, nonce, (size_t)nonce_size);
 }
 
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
                          uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag) {
     if (policy_id)
         *policy_id = packet[CRYPTO_L2_POLICY_OFF];
-    memcpy(nonce_out, packet + CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN, nonce_size);
+    memcpy(nonce_out, packet + CRYPTO_L2_NONCE_OFF, (size_t)nonce_size);
     if (proto_flag)
         *proto_flag = nonce_out[0] >> 7;
 }

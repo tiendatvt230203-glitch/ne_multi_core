@@ -32,7 +32,7 @@ int fwd_crypto_policy_ready(int policy_index);
 struct packet_crypto_ctx *fwd_crypto_policy_ctx(int policy_index);
 int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len);
 
-struct frag_table *fwd_crypto_frag_l2(int slot);
+struct frag_table *fwd_crypto_frag_l2(int slot, int worker_idx);
 struct frag_table *fwd_crypto_frag_l3(int slot);
 struct frag_table *fwd_crypto_frag_l4(int slot);
 

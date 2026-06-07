@@ -8,23 +8,12 @@
 
 #define NE_RING        8192u
 #define NE_FRAME       2048u
-#define NE_FRAME_HEADROOM 0u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
-#define NE_PIPELINE_COUNT 2u
-
-/* Pipeline A: even queues (0,2,4...) */
-#define NE_CPU_LOC_A   0u
-#define NE_CPU_MID_A   3u
-#define NE_CPU_WAN_A   11u
-/* Pipeline B: odd queues (1,3,5...) */
-#define NE_CPU_LOC_B   1u
-#define NE_CPU_MID_B   4u
-#define NE_CPU_WAN_B   10u
-
-#define NE_CPU_LOC     NE_CPU_LOC_A
-#define NE_CPU_MID     NE_CPU_MID_A
-#define NE_CPU_WAN     NE_CPU_WAN_A
+#define NE_CPU_LOC     0u
+#define NE_CPU_MID     3u
+#define NE_CPU_WAN     11u
+/* NE_CPU_CRYPTO_AUX / NE_CRYPTO_WORKERS: inc/core/crypto_route.h */
 
 struct bpf_object;
 
@@ -122,9 +111,6 @@ struct ne_pair {
     void *bufs;
     size_t bufsize;
     uint32_t frame_size;
-    uint32_t frame_headroom;
-    uint8_t shard_id;
-    uint8_t owns_xdp;
     uint32_t n_frames;
     struct xsk_umem *umem;
     struct ne_iface locals[MAX_INTERFACES];
@@ -147,8 +133,6 @@ int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt);
 int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt);
 uint32_t ne_ring_count(const struct ne_ring *r);
 
-int ne_pairs_open(struct ne_pair pairs[NE_PIPELINE_COUNT], const struct app_config *cfg);
-void ne_pairs_close(struct ne_pair pairs[NE_PIPELINE_COUNT]);
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg);
 void ne_pair_close(struct ne_pair *p);
 
@@ -159,14 +143,12 @@ void ne_recv_release_wan(struct ne_pair *p);
 
 void ne_drain_cq_local(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);
-void ne_drain_cq_burst(struct ne_pair *p, int rounds);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
 int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx);
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx);
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
-uint32_t ne_frame_max_pkt_len(const struct ne_pair *p);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 

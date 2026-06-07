@@ -141,17 +141,6 @@ struct app_config {
     int policy_count;
 };
 
-static inline int config_wan_bridge_mode(const struct app_config *cfg)
-{
-    if (!cfg || cfg->wan_count <= 0)
-        return 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (cfg->wans[i].dst_ip == 0)
-            return 1;
-    }
-    return 0;
-}
-
 static inline int config_count_dataplane_wans(const struct app_config *cfg)
 {
     int n = 0;
