@@ -8,6 +8,15 @@
 /* "!" + "255.255.255.255/32" + NUL */
 #define DIAG_CIDR_LEN  24
 
+static void fmt_mac(char *out, size_t outsz, const uint8_t mac[6]) {
+    int zero = !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]);
+    if (zero)
+        snprintf(out, outsz, "(waiting)");
+    else
+        snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
 static void tbl_hline(const int *w, int n) {
     fputc('+', stderr);
     for (int i = 0; i < n; i++) {
@@ -41,8 +50,6 @@ static const char *policy_proto_str(uint8_t proto) {
     if (proto == POLICY_PROTO_TCP_UDP) return "tcp/udp";
     if (proto == 6) return "tcp";
     if (proto == 17) return "udp";
-    if (proto == 1) return "icmp";
-    if (proto == 89) return "ospf";
     return "?";
 }
 
@@ -111,43 +118,56 @@ static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_
              (unsigned)cp->aes_bits);
 }
 
-static void fmt_ip4(char *out, size_t outsz, uint32_t ip_be)
-{
-    struct in_addr a = { .s_addr = ip_be };
-    if (!inet_ntop(AF_INET, &a, out, (socklen_t)outsz))
-        snprintf(out, outsz, "?");
+static void fmt_subnet(char *out, size_t outsz, const struct local_config *loc) {
+    struct in_addr net;
+    int prefix = 0;
+    uint32_t mask = ntohl(loc->netmask);
+
+    if (!out || outsz == 0 || loc->netmask == 0) {
+        if (out && outsz > 0)
+            out[0] = '\0';
+        return;
+    }
+    while (prefix < 32 && (mask & (1u << (31 - prefix))))
+        prefix++;
+    net.s_addr = loc->network;
+    snprintf(out, outsz, "%s/%d", inet_ntoa(net), prefix);
 }
 
 static void print_iface_table(const struct app_config *cfg) {
-    static const int w[DIAG_TBL_N] = { 14, 14, 24, 0, 0, 0, 0, 0 };
+    static const int w[DIAG_TBL_N] = { 14, 12, 20, 20, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "note", "", "", "", "", ""
+        "role", "interface", "subnet", "note", "", "", "", ""
     };
 
     fprintf(stderr, "\n  [interfaces]\n");
-    tbl_hline(w, 3);
-    tbl_row(w, 3, hdr);
-    tbl_hline(w, 3);
+    tbl_hline(w, 4);
+    tbl_row(w, 4, hdr);
+    tbl_hline(w, 4);
 
     for (int i = 0; i < cfg->local_count; i++) {
-        char c0[32], c1[32], c2[32];
+        char subnet[32], c0[32], c1[32], c2[32], c3[32];
+        fmt_subnet(subnet, sizeof(subnet), &cfg->locals[i]);
         snprintf(c0, sizeof(c0), "lan");
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        snprintf(c2, sizeof(c2), "br_id=%d", cfg->locals[i].br_id);
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
-        tbl_row(w, 3, row);
+        snprintf(c2, sizeof(c2), "%s", subnet);
+        snprintf(c3, sizeof(c3), "remote subnet");
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
+        tbl_row(w, 4, row);
     }
     for (int i = 0; i < cfg->wan_count; i++) {
         const struct wan_config *wan = &cfg->wans[i];
-        char c0[32], c1[32], c2[32];
+        char c0[32], c1[32], c2[32], c3[32];
+        char peer[32];
+        fmt_mac(peer, sizeof(peer), wan->dst_mac);
         snprintf(c0, sizeof(c0), "%s", wan->dataplane ? "wan-traffic" : "wan-handshake");
         snprintf(c1, sizeof(c1), "%s", wan->ifname);
-        snprintf(c2, sizeof(c2), "%s br_id=%d",
-                 wan->dataplane ? "dataplane" : "PQC only", wan->br_id);
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
-        tbl_row(w, 3, row);
+        snprintf(c2, sizeof(c2), "%s", peer);
+        snprintf(c3, sizeof(c3), "%s", wan->dataplane ? "dataplane" : "PQC only");
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
+        tbl_row(w, 4, row);
     }
-    tbl_hline(w, 3);
+    tbl_hline(w, 4);
 }
 
 static void print_policy_table(const struct app_config *cfg) {
@@ -241,7 +261,7 @@ void main_diag_log_db_policy_apply(const struct app_config *cfg, int trigger_pro
         return;
 
     fprintf(stderr,
-            "\n[DB] profile %d — policy update from Postgres (br_id wire map unchanged)\n",
+            "\n[DB] profile %d — policy update from Postgres (LAN client MAC is runtime/FDB, not DB)\n",
             trigger_profile_id);
     if (prev_cfg) {
         fprintf(stderr, "  policies %d -> %d (LAN/WAN ifaces unchanged)\n",
@@ -285,40 +305,26 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
     fflush(stderr);
 }
 
-void main_diag_log_br_wire_table(const struct app_config *cfg)
-{
-    static const int w[DIAG_TBL_N] = { 8, 14, 14, 20, 0, 0, 0, 0 };
+void main_diag_log_lan_client_mac(const char *ifname,
+                                  const uint8_t client_mac[6],
+                                  const char *event) {
+    static const int w[DIAG_TBL_N] = { 12, 12, 20, 10, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "br_id", "lan", "wan", "note", "", "", "", ""
+        "event", "interface", "client_mac", "", "", "", "", ""
     };
+    char client[32], c0[16], c1[16], c2[32];
 
-    if (!cfg)
-        return;
+    fmt_mac(client, sizeof(client), client_mac);
+    snprintf(c0, sizeof(c0), "%s", event && event[0] ? event : "change");
+    snprintf(c1, sizeof(c1), "%s", ifname ? ifname : "?");
+    snprintf(c2, sizeof(c2), "%s", client);
 
-    fprintf(stderr, "\n  [BR-WIRE]\n");
-    tbl_hline(w, 4);
-    tbl_row(w, 4, hdr);
-    tbl_hline(w, 4);
-
-    for (int li = 0; li < cfg->local_count; li++) {
-        int br = cfg->locals[li].br_id;
-        const char *wan_name = "?";
-        char c0[12], c1[20], c2[20], c3[32];
-
-        for (int wi = 0; wi < cfg->wan_count; wi++) {
-            if (cfg->wans[wi].dataplane && cfg->wans[wi].br_id == br) {
-                wan_name = cfg->wans[wi].ifname;
-                break;
-            }
-        }
-        snprintf(c0, sizeof(c0), "%d", br);
-        snprintf(c1, sizeof(c1), "%s", cfg->locals[li].ifname);
-        snprintf(c2, sizeof(c2), "%s", wan_name);
-        snprintf(c3, sizeof(c3), "lan<->wan pair");
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
-        tbl_row(w, 4, row);
-    }
-    tbl_hline(w, 4);
+    fprintf(stderr, "\n  [LAN-FDB]\n");
+    tbl_hline(w, 3);
+    tbl_row(w, 3, hdr);
+    tbl_hline(w, 3);
+    const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
+    tbl_row(w, 3, row);
+    tbl_hline(w, 3);
     fflush(stderr);
 }
-

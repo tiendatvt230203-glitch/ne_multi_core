@@ -1,8 +1,8 @@
-#include "../../inc/routing/wan_pick.h"
+#include "../../inc/core/forwarder_wan.h"
 
-#include "../../inc/crypto/runtime.h"
+#include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/interface.h"
-#include "../../inc/routing/flow_table.h"
+#include "../../inc/core/flow_table.h"
 
 #include <net/if.h>
 #include <stdio.h>
@@ -118,10 +118,6 @@ uint32_t fwd_wan_flush_queue(struct forwarder *fwd, int wan_idx)
 int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx)
 {
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
-        return 0;
-    if (fwd_wan_is_stopped(wan_idx))
-        return 0;
-    if (!fwd_wan_dp_ok_for_new_traffic(wan_idx))
         return 0;
     if (fwd->wan_tx_cooldown[wan_idx] > 0)
         return 0;

@@ -5,7 +5,6 @@ DELETE FROM ne_lan WHERE profile_id = 30;
 DELETE FROM ne_wan WHERE profile_id = 30;
 DELETE FROM ne_profiles WHERE id = 30;
 
--- Thêm profile mới
 INSERT INTO ne_profiles (id, name, description, weight_enable, latency_enable, loss_enable, created_by)
 VALUES (
     30, 'profile30',
@@ -34,35 +33,20 @@ INSERT INTO ne_policies (
     'aes-gcm-128', 12, '1234fc1037ab91a5702b4874b2d293a1', 'seed'
 ),
 (
-    30, 30, 3, 'L4', NULL,
-    ARRAY['192.168.9.2/32']::text[], FALSE,
-    ARRAY['192.168.180.2/32']::text[], FALSE,
-    NULL, ARRAY['7004']::text[],
-    'aes-gcm-128', 12, 'aac816a88e013feb4925f9f2af602b3f', 'seed'
-),
-(
-    40, 30, 4, 'L2', NULL,
-    ARRAY['192.168.9.2/32']::text[], FALSE,
-    ARRAY['192.168.180.2/32']::text[], FALSE,
-    NULL, ARRAY['7004']::text[],
-    'pqc-gcm', 12, NULL, 'seed'
+    5, 30, 3, 'bypass', NULL,
+    NULL, FALSE,
+    NULL, FALSE,
+    NULL, NULL,
+    NULL, NULL, NULL, 'seed'
 );
--- (
---     40, 30, 4, 'bypass', NULL,
---     NULL, FALSE,
---     NULL, FALSE,
---     NULL, NULL,
---     NULL, NULL, NULL, 'seed'
--- );
+
+INSERT INTO ne_lan (interface, subnet, profile_id, created_by) VALUES
+    ('enp5s0', '192.168.9.0/24', 30, 'seed');
 
 
-INSERT INTO ne_lan (interface, profile_id, br_id, created_by) VALUES
-    ('enp5s0', 30, 0, 'seed');
-
-
-INSERT INTO ne_wan (interface, profile_id, br_id, dst_ip, weight, created_by) VALUES
-    ('enp7s0', 30, 0, NULL, 75, 'seed'),
-    ('enp8s0', 30, 0, NULL, 25, 'seed');
+INSERT INTO ne_wan (interface, profile_id, dst_ip, weight, created_by) VALUES
+    ('enp7s0', 30, NULL, NULL, 'seed'),
+    ('enp6s0', 30, '192.168.8.2/24', NULL, 'seed');
 
 
 SELECT setval(pg_get_serial_sequence('ne_profiles', 'id')::regclass,

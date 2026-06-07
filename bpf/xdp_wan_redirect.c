@@ -1,6 +1,7 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -18,6 +19,10 @@ struct {
     __type(value, __u16);
 } wan_config_map SEC(".maps");
 
+#define IPPROTO_TCP_VAL 6
+#define IPPROTO_UDP_VAL 17
+#define IPPROTO_CUSTOM_VAL 99
+
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
 {
@@ -30,14 +35,20 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 
     __u16 proto = eth->h_proto;
 
-    if (proto == __constant_htons(ETH_P_ARP))
+    if (proto == __constant_htons(ETH_P_ARP)) {
         return XDP_PASS;
+    }
 
     if (proto == __constant_htons(ETH_P_IP)) {
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
-        goto redirect;
+
+        if (ip->protocol == IPPROTO_TCP_VAL || ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_CUSTOM_VAL) {
+            goto redirect;
+        }
+
+        return XDP_PASS;
     }
 
     int key0 = 0;
@@ -50,7 +61,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 redirect:
     ;
     __u32 qid = ctx->rx_queue_index;
-    return bpf_redirect_map(&wan_xsks_map, qid, XDP_DROP);
+    return bpf_redirect_map(&wan_xsks_map, qid, 0);
 }
 
 char _license[] SEC("license") = "GPL";

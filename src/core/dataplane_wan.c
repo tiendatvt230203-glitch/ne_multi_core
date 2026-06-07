@@ -1,7 +1,7 @@
-#include "../../inc/pipeline/pipeline.h"
+#include "../../inc/core/dataplane.h"
 #include "../../inc/core/dataplane_util.h"
-#include "../../inc/crypto/runtime.h"
-#include "../../inc/br_wire/br_wire.h"
+#include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/core/config.h"
 
 #include "../../inc/crypto/crypto_dispatch.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -10,7 +10,7 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/crypto/packet_crypto.h"
 
-#include "../../inc/crypto/fragment.h"
+#include "../../inc/core/fragment.h"
 
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
@@ -207,10 +207,17 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     return 0;
 }
 
-void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
+static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
+{
+    uint32_t dest_ip = dp_dest_ipv4(pkt, len);
+    if (dest_ip == 0)
+        return -1;
+    return config_find_local_for_ip(fwd->cfg, dest_ip);
+}
+
+void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
-    int wan_dp = (int)job.wan_idx;
     int li;
     int dec;
 
@@ -225,8 +232,10 @@ void pipeline_ingress(struct forwarder *fwd, struct ne_packet job)
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
-    li = br_wire_local_for_wan_dp(fwd, wan_dp);
-    if (li < 0 || li >= fwd->local_count || job.len < ETH_HEADER_SIZE)
+    li = pick_local(fwd, pkt, job.len);
+    if (li < 0 || li >= fwd->local_count)
+        goto drop;
+    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
         goto drop;
 
     job.dir = NE_DIR_LOCAL;

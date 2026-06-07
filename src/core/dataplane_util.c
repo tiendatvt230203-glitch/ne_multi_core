@@ -50,6 +50,18 @@ uint32_t dp_dest_ipv4(void *pkt, uint32_t len)
     return dst;
 }
 
+int dp_write_l2_src_only(uint8_t *pkt, uint32_t len, const uint8_t src[MAC_LEN])
+{
+    static const uint8_t zero[MAC_LEN];
+
+    if (!pkt || len < sizeof(struct ether_header))
+        return -1;
+    if (memcmp(src, zero, MAC_LEN) == 0)
+        return -1;
+    memcpy(pkt + MAC_LEN, src, MAC_LEN);
+    return 0;
+}
+
 int dp_write_l2(uint8_t *pkt, uint32_t len,
                 const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN],
                 int allow_empty_src)

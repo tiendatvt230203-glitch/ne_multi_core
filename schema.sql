@@ -85,8 +85,8 @@ CREATE INDEX idx_encryption_action      ON ne_policies (action);
 
 CREATE TABLE ne_lan (
     id          UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
-    interface   VARCHAR(100)    NULL,
-    br_id       INT             NOT NULL DEFAULT 0,
+    interface   VARCHAR(100)    NOT NULL,
+    subnet      CIDR            NOT NULL,
     profile_id  INT             NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE,
     created_at  TIMESTAMP       NOT NULL DEFAULT NOW(),
     created_by  VARCHAR(100)    NULL,
@@ -97,7 +97,6 @@ CREATE TABLE ne_lan (
 CREATE TABLE ne_wan (
     id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
     interface       VARCHAR(100)    NULL,
-    br_id           INT             NOT NULL DEFAULT 0,
     profile_id      INT             NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE,
     dst_ip          VARCHAR(45)     NULL,
     CONSTRAINT chk_dst_ip CHECK (dst_ip IS NULL OR is_valid_ip(dst_ip)),

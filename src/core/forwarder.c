@@ -1,9 +1,10 @@
 #include "../../inc/core/forwarder.h"
-#include "../../inc/routing/wan_pick.h"
-#include "../../inc/runtime/reload.h"
-#include "../../inc/crypto/runtime.h"
-#include "../../inc/pipeline/pipeline.h"
+#include "../../inc/core/forwarder_wan.h"
+#include "../../inc/core/forwarder_reload.h"
+#include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/core/dataplane.h"
 
+#include "../../inc/core/bridge_mac.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 
@@ -11,16 +12,9 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
-#include <stdio.h>
 #include <string.h>
 
-static uint8_t g_trace_lan_rx;
-static uint8_t g_trace_lan_ring_full;
-static uint8_t g_trace_mid_egr;
-static uint8_t g_trace_wan_rx;
-static uint8_t g_trace_wan_tx;
-
-atomic_int running = 1;
+static atomic_int running = 1;
 struct forwarder *g_active_fwd;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -37,6 +31,22 @@ void forwarder_pin_cpu(void)
     pin_cpu(NE_CPU_LOC);
 }
 
+static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
+                            const uint8_t src_mac[MAC_LEN],
+                            const uint8_t dst_mac[MAC_LEN])
+{
+    memset(iface, 0, sizeof(*iface));
+    iface->ifindex = if_nametoindex(ifname);
+    strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
+    iface->ifname[sizeof(iface->ifname) - 1] = '\0';
+    iface->queue_count = 0;
+    iface->ring_size = NE_RING;
+    iface->batch_size = NE_BATCH_SIZE;
+    iface->frame_size = NE_FRAME;
+    memcpy(iface->src_mac, src_mac, MAC_LEN);
+    memcpy(iface->dst_mac, dst_mac, MAC_LEN);
+}
+
 static void *local_core_thread(void *arg)
 {
     struct forwarder *fwd = arg;
@@ -46,10 +56,8 @@ static void *local_core_thread(void *arg)
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
-        for (int pass = 0; pass < 4; pass++) {
-            for (int li = 0; li < fwd->local_count; li++)
-                (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
-        }
+        for (int li = 0; li < fwd->local_count; li++)
+            (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
@@ -57,26 +65,9 @@ static void *local_core_thread(void *arg)
             continue;
         }
 
-        if (!g_trace_lan_rx) {
-            g_trace_lan_rx = 1;
-            fprintf(stderr,
-                    "[TRACE] LAN-RX first: pkts=%d li=%u len=%u "
-                    "(XDP->AF_XDP OK — packet entered local core)\n",
-                    rcvd, (unsigned)batch[0].local_idx, (unsigned)batch[0].len);
-            fflush(stderr);
-        }
-
         for (int i = 0; i < rcvd; i++) {
-            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0) {
+            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
-                if (!g_trace_lan_ring_full) {
-                    g_trace_lan_ring_full = 1;
-                    fprintf(stderr,
-                            "[TRACE] LAN-RX DROP: local_to_mid ring full "
-                            "(mid core not draining — egress never runs)\n");
-                    fflush(stderr);
-                }
-            }
         }
         ne_recv_release_local(&fwd->pair);
     }
@@ -97,17 +88,17 @@ static void *wan_core_thread(void *arg)
                 continue;
             if (fwd->wan_tx_cooldown[wi] > 0)
                 fwd->wan_tx_cooldown[wi]--;
+            uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
+            uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
             int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
             if (sent > 0) {
                 fwd->wan_tx_stuck[wi] = 0;
-                if (!g_trace_wan_tx) {
-                    g_trace_wan_tx = 1;
-                    fprintf(stderr,
-                            "[TRACE] WAN-TX first: wi=%d if=%s sent=%d "
-                            "mid_to_wan_left=%u\n",
-                            wi, fwd->wans[wi].ifname, sent,
-                            ne_ring_count(&fwd->mid_to_wan[wi]));
-                    fflush(stderr);
+            } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
+                uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
+                if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
+                    (void)fwd_wan_flush_queue(fwd, wi);
+                    fwd->wan_tx_cooldown[wi] = 65535;
+                    fwd->wan_tx_stuck[wi] = 0;
                 }
             }
         }
@@ -116,14 +107,6 @@ static void *wan_core_thread(void *arg)
         if (rcvd <= 0) {
             sched_yield();
             continue;
-        }
-
-        if (!g_trace_wan_rx) {
-            g_trace_wan_rx = 1;
-            fprintf(stderr,
-                    "[TRACE] WAN-RX first: pkts=%d wi=%u len=%u\n",
-                    rcvd, (unsigned)batch[0].wan_idx, (unsigned)batch[0].len);
-            fflush(stderr);
         }
 
         for (int i = 0; i < rcvd; i++) {
@@ -168,19 +151,11 @@ static void *middle_core_thread(void *arg)
         fwd_wan_weight_blend_tick();
         fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
         if (ne_ring_try_pop(&fwd->wan_to_mid, &job) == 0) {
-            pipeline_ingress(fwd, job);
+            dataplane_process_wan(fwd, job);
             did_work = 1;
         }
         if (ne_ring_try_pop(&fwd->local_to_mid, &job) == 0) {
-            if (!g_trace_mid_egr) {
-                g_trace_mid_egr = 1;
-                fprintf(stderr,
-                        "[TRACE] MID->egress first: li=%u len=%u "
-                        "(packet reached egress — expect [EGR-WAN] next)\n",
-                        (unsigned)job.local_idx, (unsigned)job.len);
-                fflush(stderr);
-            }
-            pipeline_egress(fwd, job);
+            dataplane_process_local(fwd, job);
             did_work = 1;
         }
         if (++gc_tick >= 8192) {
@@ -193,6 +168,98 @@ static void *middle_core_thread(void *arg)
             sched_yield();
     }
     return NULL;
+}
+
+int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
+{
+    if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
+        return -1;
+    if (forwarder_should_stop())
+        return -1;
+
+    memset(fwd, 0, sizeof(*fwd));
+    fwd->cfg = cfg;
+    fwd->local_count = cfg->local_count;
+    fwd->wan_count = config_count_dataplane_wans(cfg);
+    if (fwd->local_count > MAX_INTERFACES)
+        fwd->local_count = MAX_INTERFACES;
+    if (fwd->wan_count > MAX_INTERFACES)
+        fwd->wan_count = MAX_INTERFACES;
+
+    for (int i = 0; i < fwd->local_count; i++)
+        init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname,
+                        cfg->locals[i].src_mac, cfg->locals[i].dst_mac);
+    for (int di = 0; di < fwd->wan_count; di++) {
+        int ci = config_wan_dp_to_cfg(cfg, di);
+        if (ci < 0)
+            return -1;
+        fwd->wan_cfg_idx[di] = ci;
+        init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
+                        cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
+    }
+
+    interface_ip_xdp_off_config(cfg);
+    interface_reset_redirect_maps();
+
+    if (bridge_mac_prepare(cfg) != 0)
+        return -1;
+    if (forwarder_should_stop())
+        return -1;
+
+    if (fwd_crypto_rebuild(cfg) != 0)
+        return -1;
+    if (forwarder_should_stop())
+        return -1;
+
+    fwd_crypto_reset_on_init();
+    if (fwd_crypto_ensure_profile_slots(cfg) != 0)
+        return -1;
+
+    /* PQC wire path uses HARDCODED_KEY in crypto_pqc_layer.h; HS optional for later. */
+    if (ne_pair_open(&fwd->pair, cfg) != 0)
+        return -1;
+    if (forwarder_should_stop()) {
+        forwarder_cleanup(fwd);
+        return -1;
+    }
+
+    if (ne_ring_init(&fwd->local_to_mid, NE_RING) != 0 ||
+        ne_ring_init(&fwd->wan_to_mid, NE_RING) != 0) {
+        forwarder_cleanup(fwd);
+        return -1;
+    }
+    for (int i = 0; i < fwd->local_count; i++) {
+        if (ne_ring_init(&fwd->mid_to_local[i], NE_RING) != 0) {
+            forwarder_cleanup(fwd);
+            return -1;
+        }
+    }
+    for (int i = 0; i < fwd->wan_count; i++) {
+        if (ne_ring_init(&fwd->mid_to_wan[i], NE_RING) != 0) {
+            forwarder_cleanup(fwd);
+            return -1;
+        }
+    }
+
+    (void)bridge_mac_install(fwd);
+    fwd_wan_reset_on_init(fwd);
+
+    atomic_store_explicit(&running, 1, memory_order_release);
+    return 0;
+}
+
+void forwarder_cleanup(struct forwarder *fwd)
+{
+    if (!fwd)
+        return;
+    ne_ring_destroy(&fwd->local_to_mid);
+    ne_ring_destroy(&fwd->wan_to_mid);
+    for (int i = 0; i < MAX_INTERFACES; i++)
+        ne_ring_destroy(&fwd->mid_to_wan[i]);
+    for (int i = 0; i < MAX_INTERFACES; i++)
+        ne_ring_destroy(&fwd->mid_to_local[i]);
+    fwd_crypto_cleanup_all_profile_slots();
+    ne_pair_close(&fwd->pair);
 }
 
 void forwarder_run(struct forwarder *fwd)
@@ -217,9 +284,6 @@ void forwarder_run(struct forwarder *fwd)
     }
 
     fwd->threads_started = 1;
-    fprintf(stderr,
-            "[TRACE] dataplane trace ON — watch [TRACE] LAN-RX / MID->egress / [EGR-WAN]\n");
-    fflush(stderr);
     if (fwd->cfg)
         main_diag_log_dataplane_ready(fwd->cfg);
     pthread_join(fwd->local_thread, NULL);
@@ -238,6 +302,7 @@ void forwarder_stop(void)
 void forwarder_shutdown_resources(void)
 {
     fwd_reload_shutdown();
+    bridge_mac_watch_stop();
 }
 
 int forwarder_should_stop(void)

@@ -12,8 +12,6 @@ struct forwarder {
     struct xsk_interface wans[MAX_INTERFACES];
     int wan_count;
     int wan_cfg_idx[MAX_INTERFACES]; /* dataplane slot -> cfg->wans[] index */
-    int local_to_wan_dp[MAX_INTERFACES];
-    int wan_dp_to_local[MAX_INTERFACES];
 
     struct ne_pair pair;
     struct ne_ring local_to_mid;

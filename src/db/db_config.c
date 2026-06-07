@@ -1,7 +1,6 @@
 #include "../../inc/db/db_config.h"
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/db/db_env.h"
-#include "../../inc/policy/policy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +14,26 @@ static int str_is_any(const char *v) {
     if (!v) return 1;
     while (*v == ' ' || *v == '\t') v++;
     return (v[0] == '\0' || strcasecmp(v, "any") == 0 || strcmp(v, "*") == 0);
+}
+
+static int parse_port_range(const char *v, int *from_out, int *to_out) {
+    if (str_is_any(v)) {
+        *from_out = -1;
+        *to_out = -1;
+        return 0;
+    }
+    int a = -1, b = -1;
+    if (sscanf(v, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a && b <= 65535) {
+        *from_out = a;
+        *to_out = b;
+        return 0;
+    }
+    if (sscanf(v, "%d", &a) == 1 && a >= 0 && a <= 65535) {
+        *from_out = a;
+        *to_out = a;
+        return 0;
+    }
+    return -1;
 }
 
 static int parse_ipv4_addr(const char *v, uint32_t *out_ip) {
@@ -120,6 +139,38 @@ static int parse_action_name(const char *v) {
     return atoi(v);
 }
 
+static int parse_cidr_any_or_negated(const char *v_in, int *any_out, int *neg_out,
+                                     uint32_t *net_out, uint32_t *mask_out) {
+    if (!any_out || !neg_out || !net_out || !mask_out)
+        return -1;
+
+    *any_out = 1;
+    *neg_out = 0;
+    *net_out = 0;
+    *mask_out = 0;
+
+    if (str_is_any(v_in)) {
+        *any_out = 1;
+        return 0;
+    }
+
+    while (*v_in == ' ' || *v_in == '\t') v_in++;
+    if (v_in[0] == '!') {
+        *neg_out = 1;
+        v_in++;
+        while (*v_in == ' ' || *v_in == '\t') v_in++;
+    }
+
+    uint32_t ip = 0, mask = 0, net = 0;
+    if (parse_ip_cidr_pub(v_in, &ip, &mask, &net) != 0) {
+        return -1;
+    }
+    *any_out = 0;
+    *net_out = net;
+    *mask_out = mask;
+    return 0;
+}
+
 static void trim_spaces_inplace(char *s) {
     if (!s)
         return;
@@ -139,8 +190,8 @@ static void trim_spaces_inplace(char *s) {
     s[end - start] = '\0';
 }
 
-#define MAX_CIDR_LIST_ITEMS POLICY_CIDR_LIST_MAX
-#define MAX_CIDR_ITEM_LEN   POLICY_CIDR_ITEM_LEN
+#define MAX_CIDR_LIST_ITEMS 32
+#define MAX_CIDR_ITEM_LEN 96
 
 static int split_cidr_list(const char *input, char out[][MAX_CIDR_ITEM_LEN], int max_out) {
     if (!input || !out || max_out <= 0)
@@ -234,6 +285,14 @@ static void ne_fill_policy_key(const char *enc_key, int enc_null, int key_len_by
     memcpy(out, md, (size_t)key_len_bytes);
 }
 
+static void ne_cidr_buf_with_invert(char *buf, size_t bufsz, const char *tok, int invert_db) {
+    int max_body = (int)((bufsz > 2) ? bufsz - 2 : 0);
+    if (invert_db && tok[0] != '!')
+        snprintf(buf, bufsz, "!%.*s", max_body, tok);
+    else
+        snprintf(buf, bufsz, "%.*s", (int)(bufsz - 1), tok);
+}
+
 static int find_local_index_by_ifname(const struct app_config *cfg, const char *ifname) {
     for (int i = 0; i < cfg->local_count; i++) {
         if (strcmp(cfg->locals[i].ifname, ifname) == 0) return i;
@@ -321,7 +380,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     PQclear(res);
 
     res = PQexecParams(conn,
-        "SELECT interface AS ifname FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
+        "SELECT interface AS ifname, subnet::text AS subnet "
+        "FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
         1, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         int rows = PQntuples(res);
@@ -443,12 +503,53 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
             return -1;
         }
 
-        if (policy_expand_cartesian(cfg, p, &cp_base, invert_src, invert_dst,
-                                  src_items, src_n, dst_items, dst_n,
-                                  sp_items, sp_n, dp_items, dp_n) != 0) {
-            fprintf(stderr, "[DB CRYPTO] policy expansion overflow id=%d\n", db_policy_id);
-            PQclear(res);
-            return -1;
+        for (int si = 0; si < src_n; si++) {
+            for (int di = 0; di < dst_n; di++) {
+                for (int spi = 0; spi < sp_n; spi++) {
+                    for (int dpi = 0; dpi < dp_n; dpi++) {
+                        if (cfg->policy_count >= MAX_CRYPTO_POLICIES || p->policy_count >= MAX_CRYPTO_POLICIES) {
+                            fprintf(stderr, "[DB CRYPTO] policy expansion overflow id=%d\n", db_policy_id);
+                            PQclear(res);
+                            return -1;
+                        }
+
+                        struct crypto_policy *cp = &cfg->policies[cfg->policy_count];
+                        *cp = cp_base;
+
+                        if (parse_port_range(sp_items[spi], &cp->src_port_from, &cp->src_port_to) != 0) {
+                            cp->src_port_from = -1;
+                            cp->src_port_to = -1;
+                        }
+                        if (parse_port_range(dp_items[dpi], &cp->dst_port_from, &cp->dst_port_to) != 0) {
+                            cp->dst_port_from = -1;
+                            cp->dst_port_to = -1;
+                        }
+
+                        char src_buf[MAX_CIDR_ITEM_LEN + 2];
+                        char dst_buf[MAX_CIDR_ITEM_LEN + 2];
+                        ne_cidr_buf_with_invert(src_buf, sizeof(src_buf), src_items[si], invert_src);
+                        ne_cidr_buf_with_invert(dst_buf, sizeof(dst_buf), dst_items[di], invert_dst);
+
+                        if (parse_cidr_any_or_negated(src_buf, &cp->src_any, &cp->src_negate,
+                                                      &cp->src_net, &cp->src_mask) != 0) {
+                            cp->src_any = 1;
+                            cp->src_negate = 0;
+                            cp->src_net = 0;
+                            cp->src_mask = 0;
+                        }
+                        if (parse_cidr_any_or_negated(dst_buf, &cp->dst_any, &cp->dst_negate,
+                                                      &cp->dst_net, &cp->dst_mask) != 0) {
+                            cp->dst_any = 1;
+                            cp->dst_negate = 0;
+                            cp->dst_net = 0;
+                            cp->dst_mask = 0;
+                        }
+
+                        p->policy_indices[p->policy_count++] = cfg->policy_count;
+                        cfg->policy_count++;
+                    }
+                }
+            }
         }
     }
     PQclear(res);
@@ -503,16 +604,13 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
             return -1;
         }
         strncpy(loc->ifname, v, IF_NAMESIZE - 1);
-        {
-            int br_col = PQfnumber(res, "br_id");
-            if (br_col < 0 && row == 0)
-                fprintf(stderr, "[DB] ne_lan: column br_id missing — using row index; run ALTER TABLE ne_lan ADD br_id INT NOT NULL DEFAULT 0\n");
-            const char *bv = br_col >= 0 ? PQgetvalue(res, row, br_col) : NULL;
-            loc->br_id = (bv && bv[0] != '\0') ? atoi(bv) : row;
+
+        v = PQgetvalue(res, row, PQfnumber(res, "subnet"));
+        if (!v || v[0] == '\0' ||
+            parse_ip_cidr_pub(v, &loc->ip, &loc->netmask, &loc->network) != 0) {
+            fprintf(stderr, "[DB LOCAL][%d] %s: invalid or missing subnet\n", row, loc->ifname);
+            return -1;
         }
-        loc->ip = 0;
-        loc->netmask = 0;
-        loc->network = 0;
 
         cfg->local_count++;
     }
@@ -547,14 +645,6 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
             return -1;
         }
         strncpy(wan->ifname, v, IF_NAMESIZE - 1);
-
-        {
-            int br_col = PQfnumber(res, "br_id");
-            if (br_col < 0 && row == 0)
-                fprintf(stderr, "[DB] ne_wan: column br_id missing — using row index; run ALTER TABLE ne_wan ADD br_id INT NOT NULL DEFAULT 0\n");
-            const char *bv = br_col >= 0 ? PQgetvalue(res, row, br_col) : NULL;
-            wan->br_id = (bv && bv[0] != '\0') ? atoi(bv) : row;
-        }
 
         v = PQgetvalue(res, row, PQfnumber(res, "dst_ip"));
         if (v && v[0] != '\0')
@@ -612,7 +702,8 @@ static int db_load_lan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, br_id FROM ne_lan WHERE profile_id = $1 ORDER BY br_id, created_at",
+        "SELECT interface AS ifname, subnet::text AS subnet "
+        "FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -635,8 +726,7 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, br_id, dst_ip::text AS dst_ip FROM ne_wan "
-        "WHERE profile_id = $1 ORDER BY br_id, created_at",
+        "SELECT interface AS ifname, dst_ip::text AS dst_ip FROM ne_wan WHERE profile_id = $1 ORDER BY created_at",
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {

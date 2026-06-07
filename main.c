@@ -186,8 +186,6 @@ static int notify_profile_load(int profile_id) {
 static void *forwarder_thread_main(void *arg) {
     forwarder_pin_cpu();
     struct runtime_state *rt = (struct runtime_state *)arg;
-    fprintf(stderr, "[TRACE] forwarder_init starting (XDP/AF_XDP setup)...\n");
-    fflush(stderr);
     if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot]) != 0) {
         forwarder_cleanup(&rt->fwd);
         if (forwarder_should_stop())
@@ -208,8 +206,6 @@ static void *forwarder_thread_main(void *arg) {
         rt->running = 0;
         return NULL;
     }
-    fprintf(stderr, "[TRACE] forwarder_init OK — starting dataplane threads\n");
-    fflush(stderr);
     rt->running = 1;
     forwarder_run(&rt->fwd);
     rt->running = 0;
@@ -315,8 +311,7 @@ static int local_db_equal(const struct local_config *a, const struct local_confi
            a->ring_size == b->ring_size &&
            a->batch_size == b->batch_size &&
            a->frame_size == b->frame_size &&
-           a->queue_count == b->queue_count &&
-           a->br_id == b->br_id;
+           a->queue_count == b->queue_count;
 }
 
 static const struct wan_config *wan_by_ifname(const struct app_config *cfg,
@@ -339,8 +334,7 @@ static int wan_db_equal(const struct wan_config *a, const struct wan_config *b)
            a->batch_size == b->batch_size &&
            a->frame_size == b->frame_size &&
            a->queue_count == b->queue_count &&
-           a->dataplane == b->dataplane &&
-           a->br_id == b->br_id;
+           a->dataplane == b->dataplane;
 }
 
 static int profile_db_unchanged(const struct profile_config *old,
@@ -471,7 +465,7 @@ static int profiles_fully_unchanged(const struct app_config *old,
     return 1;
 }
 
-/* LAN/WAN rows from Postgres unchanged (br_id wire map is in DB). */
+/* LAN/WAN rows from Postgres unchanged (client MAC is not stored in DB). */
 static int lan_wan_db_unchanged(const struct app_config *old,
                                 const struct app_config *new)
 {
@@ -646,7 +640,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     }
 
     fprintf(stderr,
-            "[RELOAD] profile %d — policies/crypto only (br_id wire map unchanged)\n",
+            "[RELOAD] profile %d — policies/crypto only (LAN MAC via FDB, not DB)\n",
             trigger_id);
     fflush(stderr);
 
@@ -825,8 +819,6 @@ int main(int argc, char **argv) {
     }
 
     libbpf_set_print(libbpf_print_silent);
-    /* Daemon may run without TTY — force stderr flush so [TRACE]/[EGR-WAN] show immediately. */
-    setvbuf(stderr, NULL, _IONBF, 0);
 
     struct sigaction sa = { .sa_handler = on_stop_signal };
     sigemptyset(&sa.sa_mask);
