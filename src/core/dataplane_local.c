@@ -11,13 +11,6 @@
 
 #include <string.h>
 
-static int local_is_client_echo(struct forwarder *fwd, int li, const uint8_t *pkt, uint32_t len)
-{
-    if (li < 0 || li >= fwd->local_count || len < 14)
-        return 0;
-    return memcmp(pkt, fwd->locals[li].dst_mac, MAC_LEN) == 0;
-}
-
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
     job->dir = NE_DIR_WAN;
@@ -146,8 +139,6 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     struct packet_crypto_ctx *pctx;
     int enc;
 
-    if (local_is_client_echo(fwd, li, pkt, job.len))
-        goto drop;
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)
         goto drop;

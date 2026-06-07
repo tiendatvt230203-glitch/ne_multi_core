@@ -4,7 +4,7 @@
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/dataplane.h"
 
-#include "../../inc/core/bridge_mac.h"
+#include "../../inc/core/local_hwaddr.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 
@@ -186,9 +186,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
 
+    static const uint8_t zero_mac[MAC_LEN];
     for (int i = 0; i < fwd->local_count; i++)
         init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname,
-                        cfg->locals[i].src_mac, cfg->locals[i].dst_mac);
+                        cfg->locals[i].src_mac, zero_mac);
     for (int di = 0; di < fwd->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
         if (ci < 0)
@@ -201,7 +202,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     interface_ip_xdp_off_config(cfg);
     interface_reset_redirect_maps();
 
-    if (bridge_mac_prepare(cfg) != 0)
+    if (local_hwaddr_prepare(cfg) != 0)
         return -1;
     if (forwarder_should_stop())
         return -1;
@@ -241,7 +242,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         }
     }
 
-    (void)bridge_mac_install(fwd);
+    (void)local_hwaddr_install(fwd);
     fwd_wan_reset_on_init(fwd);
 
     atomic_store_explicit(&running, 1, memory_order_release);
@@ -302,7 +303,6 @@ void forwarder_stop(void)
 void forwarder_shutdown_resources(void)
 {
     fwd_reload_shutdown();
-    bridge_mac_watch_stop();
 }
 
 int forwarder_should_stop(void)

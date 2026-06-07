@@ -20,7 +20,7 @@ APP_SRC = main.c \
           src/core/dataplane_util.c \
           src/core/dataplane_local.c \
           src/core/dataplane_wan.c \
-          src/core/bridge_mac.c \
+          src/core/local_hwaddr.c \
           src/core/ne_pqc_bridge.c \
           src/crypto/crypto_policy_utils.c \
           src/crypto/crypto_dispatch.c \

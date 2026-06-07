@@ -640,7 +640,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     }
 
     fprintf(stderr,
-            "[RELOAD] profile %d — policies/crypto only (LAN MAC via FDB, not DB)\n",
+            "[RELOAD] profile %d — policies/crypto only (LAN/WAN ifaces unchanged)\n",
             trigger_id);
     fflush(stderr);
 

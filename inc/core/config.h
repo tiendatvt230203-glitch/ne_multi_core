@@ -89,7 +89,6 @@ struct local_config {
     uint32_t netmask;
     uint32_t network;
     uint8_t src_mac[MAC_LEN];
-    uint8_t dst_mac[MAC_LEN];
     uint32_t umem_mb;
     uint32_t ring_size;
     uint32_t batch_size;

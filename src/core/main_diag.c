@@ -261,7 +261,7 @@ void main_diag_log_db_policy_apply(const struct app_config *cfg, int trigger_pro
         return;
 
     fprintf(stderr,
-            "\n[DB] profile %d — policy update from Postgres (LAN client MAC is runtime/FDB, not DB)\n",
+            "\n[DB] profile %d — policy update from Postgres\n",
             trigger_profile_id);
     if (prev_cfg) {
         fprintf(stderr, "  policies %d -> %d (LAN/WAN ifaces unchanged)\n",
@@ -302,29 +302,5 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
     fprintf(stderr, "+-- DATAPLANE ready --+\n");
     print_iface_table(cfg);
     fprintf(stderr, "\n");
-    fflush(stderr);
-}
-
-void main_diag_log_lan_client_mac(const char *ifname,
-                                  const uint8_t client_mac[6],
-                                  const char *event) {
-    static const int w[DIAG_TBL_N] = { 12, 12, 20, 10, 0, 0, 0, 0 };
-    static const char *hdr[DIAG_TBL_N] = {
-        "event", "interface", "client_mac", "", "", "", "", ""
-    };
-    char client[32], c0[16], c1[16], c2[32];
-
-    fmt_mac(client, sizeof(client), client_mac);
-    snprintf(c0, sizeof(c0), "%s", event && event[0] ? event : "change");
-    snprintf(c1, sizeof(c1), "%s", ifname ? ifname : "?");
-    snprintf(c2, sizeof(c2), "%s", client);
-
-    fprintf(stderr, "\n  [LAN-FDB]\n");
-    tbl_hline(w, 3);
-    tbl_row(w, 3, hdr);
-    tbl_hline(w, 3);
-    const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
-    tbl_row(w, 3, row);
-    tbl_hline(w, 3);
     fflush(stderr);
 }
