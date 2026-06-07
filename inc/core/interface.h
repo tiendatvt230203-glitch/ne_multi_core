@@ -173,5 +173,6 @@ int interface_get_queue_count(const char *ifname);
 
 void ne_xdp_debug_drop_local(int reason);
 void ne_xdp_debug_push_wan(void);
+void ne_xdp_debug_tick(const struct ne_pair *p);
 
 #endif

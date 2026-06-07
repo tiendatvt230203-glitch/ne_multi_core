@@ -128,6 +128,11 @@ static void xdp_debug_maybe_log(const struct ne_pair *p)
     fflush(stderr);
 }
 
+void ne_xdp_debug_tick(const struct ne_pair *p)
+{
+    xdp_debug_maybe_log(p);
+}
+
 static uint32_t next_pow2_u32(uint32_t v)
 {
     if (v <= 1)
@@ -673,8 +678,17 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
             "[XSK] UMEM frames=%u frame_size=%u headroom=%u max_pkt=%u mode=zerocopy\n",
             p->n_frames, p->frame_size, p->frame_headroom,
             ne_frame_max_pkt_len(p));
-    if (xdp_debug_on())
-        fprintf(stderr, "[XDP-DBG] enabled — set NE_XDP_DEBUG=0 to silence\n");
+    {
+        const char *xd = getenv("NE_XDP_DEBUG");
+        fprintf(stderr,
+                "[XSK] NE_XDP_DEBUG=%s — debug logs on **daemon** stderr (not -id client); "
+                "set in shell or /opt/SEP/be/.env\n",
+                xd ? xd : "unset");
+        if (xdp_debug_on()) {
+            g_xdp_dbg_last_ms = 0;
+            fprintf(stderr, "[XDP-DBG] enabled — counters every 5s\n");
+        }
+    }
     fflush(stderr);
 
     for (int i = 0; i < p->local_count; i++) {

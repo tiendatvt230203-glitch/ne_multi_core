@@ -61,6 +61,7 @@ static void *local_core_thread(void *arg)
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
+            ne_xdp_debug_tick(&fwd->pair);
             sched_yield();
             continue;
         }
@@ -69,6 +70,7 @@ static void *local_core_thread(void *arg)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
         ne_recv_release_local(&fwd->pair);
+        ne_xdp_debug_tick(&fwd->pair);
     }
     return NULL;
 }
@@ -104,6 +106,7 @@ static void *wan_core_thread(void *arg)
 
         int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
+            ne_xdp_debug_tick(&fwd->pair);
             sched_yield();
             continue;
         }
@@ -117,6 +120,7 @@ static void *wan_core_thread(void *arg)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
         ne_recv_release_wan(&fwd->pair);
+        ne_xdp_debug_tick(&fwd->pair);
     }
     return NULL;
 }
