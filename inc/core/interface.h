@@ -8,6 +8,8 @@
 
 #define NE_RING        8192u
 #define NE_FRAME       2048u
+/* Reserved before packet data in each UMEM frame (RX/TX offset). */
+#define NE_FRAME_HEADROOM 256u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
 #define NE_CPU_LOC     0u
@@ -110,6 +112,8 @@ struct ne_pair {
     void *bufs;
     size_t bufsize;
     uint32_t frame_size;
+    uint32_t frame_headroom;
+    uint16_t xsk_bind_flags;
     uint32_t n_frames;
     struct xsk_umem *umem;
     struct ne_iface locals[MAX_INTERFACES];
@@ -148,6 +152,7 @@ int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx);
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx);
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
+uint32_t ne_frame_max_pkt_len(const struct ne_pair *p);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 
