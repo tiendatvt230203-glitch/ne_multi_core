@@ -359,6 +359,13 @@ static uint32_t pool_pop(struct ne_pool *p, uint64_t *addrs, uint32_t n)
     return got;
 }
 
+static uint64_t ne_chunk_base(uint64_t addr, uint32_t frame_size)
+{
+    if (!frame_size)
+        return addr;
+    return addr & ~((uint64_t)frame_size - 1U);
+}
+
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
 {
     return (p && addr_out && pool_pop(&p->pool, addr_out, 1) == 1) ? 0 : -1;
@@ -366,8 +373,12 @@ int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
 
 void ne_frame_free(struct ne_pair *p, uint64_t addr)
 {
-    if (p)
-        (void)pool_push(&p->pool, &addr, 1);
+    uint64_t base;
+
+    if (!p)
+        return;
+    base = ne_chunk_base(addr, p->frame_size);
+    (void)pool_push(&p->pool, &base, 1);
 }
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr)
@@ -756,22 +767,42 @@ void ne_pair_close(struct ne_pair *p)
     memset(p, 0, sizeof(*p));
 }
 
+/*
+ * Zerocopy RX often lands packets at a non-base offset inside the UMEM chunk.
+ * TX and the frame pool require chunk-base addresses (0, 2048, ...).
+ */
 static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t max,
-                      uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
+                      uint8_t dir, uint8_t wan_idx, uint8_t local_idx,
+                      struct ne_pool *pool, void *bufs, uint32_t frame_size)
 {
     uint32_t idx = 0;
     uint32_t n = xsk_ring_cons__peek(&slot->rx, max, &idx);
+    uint32_t kept = 0;
 
     for (uint32_t i = 0; i < n; i++) {
         const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + i);
-        out[i].addr = d->addr;
-        out[i].len = d->len;
-        out[i].dir = dir;
-        out[i].wan_idx = wan_idx;
-        out[i].local_idx = local_idx;
+        uint64_t raw = d->addr;
+        uint64_t base = ne_chunk_base(raw, frame_size);
+        uint32_t off = (uint32_t)(raw - base);
+
+        if (d->len == 0 || d->len > frame_size || off + d->len > frame_size) {
+            if (pool)
+                (void)pool_push(pool, &base, 1);
+            continue;
+        }
+        if (off != 0 && bufs) {
+            uint8_t *frame = (uint8_t *)xsk_umem__get_data(bufs, base);
+            memmove(frame, frame + off, d->len);
+        }
+        out[kept].addr = base;
+        out[kept].len = d->len;
+        out[kept].dir = dir;
+        out[kept].wan_idx = wan_idx;
+        out[kept].local_idx = local_idx;
+        kept++;
     }
     slot->rx_pending = n;
-    return (int)n;
+    return (int)kept;
 }
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
@@ -787,7 +818,8 @@ int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             iface->queues[q].rx_pending = 0; 
             
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
-                               NE_DIR_LOCAL, 0, (uint8_t)i);
+                               NE_DIR_LOCAL, 0, (uint8_t)i, &p->pool, p->bufs,
+                               p->frame_size);
             
             total += (uint32_t)n;
             out_ptr += n;
@@ -810,7 +842,8 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             iface->queues[q].rx_pending = 0; 
             
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
-                               NE_DIR_WAN, (uint8_t)i, 0);
+                               NE_DIR_WAN, (uint8_t)i, 0, &p->pool, p->bufs,
+                               p->frame_size);
             
             total += (uint32_t)n;
             out_ptr += n;
@@ -856,7 +889,8 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool,
 
     while ((n = xsk_ring_cons__peek(&slot->cq, NE_BATCH_SIZE, &idx)) > 0) {
         for (uint32_t i = 0; i < n; i++)
-            addrs[i] = *xsk_ring_cons__comp_addr(&slot->cq, idx + i);
+            addrs[i] = ne_chunk_base(*xsk_ring_cons__comp_addr(&slot->cq, idx + i),
+                                     frame_size);
         xsk_ring_cons__release(&slot->cq, n);
         (void)pool_push(pool, addrs, n);
         if (n < NE_BATCH_SIZE) {
