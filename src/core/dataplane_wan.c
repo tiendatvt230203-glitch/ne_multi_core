@@ -11,6 +11,11 @@
 #include "../../inc/crypto/packet_crypto.h"
 
 #include "../../inc/core/fragment.h"
+#include "../../inc/core/local_hwaddr.h"
+
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <time.h>
 
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
@@ -235,8 +240,29 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     li = pick_local(fwd, pkt, job.len);
     if (li < 0 || li >= fwd->local_count)
         goto drop;
-    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
-        goto drop;
+
+    {
+        uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
+        uint8_t dst_mac[MAC_LEN];
+        char ipbuf[INET_ADDRSTRLEN];
+
+        if (dest_ip == 0)
+            goto drop;
+        if (local_neigh_resolve(li, fwd->locals[li].ifname, dest_ip, dst_mac) != 0) {
+            static uint64_t last_bcast_ms;
+            uint64_t now = (uint64_t)time(NULL) * 1000ull;
+            memset(dst_mac, 0xff, MAC_LEN);
+            if (now - last_bcast_ms >= 5000) {
+                last_bcast_ms = now;
+                inet_ntop(AF_INET, &dest_ip, ipbuf, sizeof(ipbuf));
+                fprintf(stderr, "[WAN-RX] %s: no MAC for %s, broadcast fallback\n",
+                        fwd->locals[li].ifname, ipbuf);
+                fflush(stderr);
+            }
+        }
+        if (dp_write_l2(pkt, job.len, dst_mac, fwd->locals[li].src_mac, 0) != 0)
+            goto drop;
+    }
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;

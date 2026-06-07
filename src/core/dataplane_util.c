@@ -62,6 +62,16 @@ uint32_t dp_dest_ipv4(void *pkt, uint32_t len)
     return dst;
 }
 
+uint32_t dp_src_ipv4(void *pkt, uint32_t len)
+{
+    uint32_t src = 0, dst = 0;
+    uint16_t sp = 0, dp = 0;
+    uint8_t proto = 0;
+    if (dp_parse_flow(pkt, len, &src, &dst, &sp, &dp, &proto) != 0)
+        return 0;
+    return src;
+}
+
 int dp_write_l2_src_only(uint8_t *pkt, uint32_t len, const uint8_t src[MAC_LEN])
 {
     static const uint8_t zero[MAC_LEN];

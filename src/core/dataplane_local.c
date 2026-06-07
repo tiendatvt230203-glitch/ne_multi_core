@@ -8,9 +8,12 @@
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
+#include "../../inc/core/local_hwaddr.h"
 
 #include <arpa/inet.h>
+#include <net/ethernet.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 
 static void wan_tx_fail(struct forwarder *fwd, int wan_dp, const struct ne_packet *job,
@@ -146,6 +149,14 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
     return 0;
 }
 
+static void learn_client_mac(struct forwarder *fwd, int li, uint8_t *pkt, uint32_t len)
+{
+    uint32_t src_ip = dp_src_ipv4(pkt, len);
+
+    if (src_ip && len >= sizeof(struct ether_header))
+        local_neigh_learn(li, src_ip, pkt + offsetof(struct ether_header, ether_shost));
+}
+
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -154,6 +165,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     uint8_t proto = 0;
     int flow_ok = dp_parse_flow(pkt, job.len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0;
     int li = job.local_idx < fwd->local_count ? (int)job.local_idx : 0;
+    learn_client_mac(fwd, li, pkt, job.len);
     int profile_idx;
     const struct crypto_policy *cp;
     int wan_dp;
@@ -196,8 +208,10 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
-        if (push_to_wan(fwd, &job, wan_dp) != 0)
+        if (push_to_wan(fwd, &job, wan_dp) != 0) {
+            ne_stat_bump_lan_fwd_drop();
             wan_tx_fail(fwd, wan_dp, &job, "mid_to_wan push failed");
+        }
         return;
     }
     if (!fwd->cfg->crypto_enabled) {
@@ -225,10 +239,13 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
     if (enc > 0)
         return;
-    if (push_to_wan(fwd, &job, wan_dp) != 0)
+    if (push_to_wan(fwd, &job, wan_dp) != 0) {
+        ne_stat_bump_lan_fwd_drop();
         wan_tx_fail(fwd, wan_dp, &job, "mid_to_wan push failed");
+    }
     return;
 
 drop:
+    ne_stat_bump_lan_fwd_drop();
     ne_frame_free(&fwd->pair, job.addr);
 }

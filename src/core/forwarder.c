@@ -7,6 +7,7 @@
 #include "../../inc/core/local_hwaddr.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
+#include "../../inc/core/dataplane_util.h"
 
 #include <net/if.h>
 #include <pthread.h>
@@ -19,6 +20,43 @@ static atomic_int running = 1;
 struct forwarder *g_active_fwd;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_local_mid_drop;
+
+static void learn_lan_rx_batch(struct forwarder *fwd, struct ne_packet *batch, int n)
+{
+    for (int i = 0; i < n; i++) {
+        int li = batch[i].local_idx < fwd->local_count ? (int)batch[i].local_idx : 0;
+        uint8_t *pkt = ne_packet_data(&fwd->pair, batch[i].addr);
+
+        if (!pkt || batch[i].len < 14)
+            continue;
+        uint32_t src_ip = dp_src_ipv4(pkt, batch[i].len);
+        if (src_ip)
+            local_neigh_learn(li, src_ip, pkt + 6);
+    }
+}
+
+static void tx_drain_local_burst(struct forwarder *fwd, int li)
+{
+    for (int n = 0; n < 512; n++) {
+        if (ne_ring_count(&fwd->mid_to_local[li]) == 0)
+            break;
+        if (ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li) <= 0)
+            break;
+    }
+}
+
+static void tx_drain_wan_burst(struct forwarder *fwd, int wi)
+{
+    if (fwd_wan_is_stopped(wi))
+        return;
+    for (int n = 0; n < 512; n++) {
+        if (ne_ring_count(&fwd->mid_to_wan[wi]) == 0)
+            break;
+        if (ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi) <= 0)
+            break;
+        fwd->wan_tx_stuck[wi] = 0;
+    }
+}
 
 static void stat_tick(struct forwarder *fwd)
 {
@@ -70,7 +108,7 @@ static void *local_core_thread(void *arg)
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
         for (int li = 0; li < fwd->local_count; li++)
-            (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
+            tx_drain_local_burst(fwd, li);
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
@@ -78,6 +116,7 @@ static void *local_core_thread(void *arg)
             sched_yield();
             continue;
         }
+        learn_lan_rx_batch(fwd, batch, rcvd);
         for (int i = 0; i < rcvd; i++) {
             if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0) {
                 g_local_mid_drop++;
@@ -102,29 +141,9 @@ static void *wan_core_thread(void *arg)
         ne_drain_cq_wan(&fwd->pair);
         ne_refill_fq_wan(&fwd->pair);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
-            if (fwd_wan_is_stopped(wi))
-                continue;
             if (fwd->wan_tx_cooldown[wi] > 0)
                 fwd->wan_tx_cooldown[wi]--;
-            uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
-            uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
-            int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
-            if (sent > 0) {
-                fwd->wan_tx_stuck[wi] = 0;
-            } else if (before > 0) {
-                if (fwd->pair.wans[wi].tx_no_free != no_free_before) {
-                    fprintf(stderr,
-                            "[WAN-TX] %s: %u pkts queued, XDP TX ring blocked\n",
-                            fwd->pair.wans[wi].ifname, before);
-                    fflush(stderr);
-                }
-                uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
-                if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
-                    (void)fwd_wan_flush_queue(fwd, wi);
-                    fwd->wan_tx_cooldown[wi] = 65535;
-                    fwd->wan_tx_stuck[wi] = 0;
-                }
-            }
+            tx_drain_wan_burst(fwd, wi);
         }
 
         stat_tick(fwd);

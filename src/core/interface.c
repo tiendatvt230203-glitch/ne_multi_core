@@ -20,10 +20,22 @@ struct ne_stat_counters {
     uint64_t rx_wan;
     uint64_t tx_local;
     uint64_t tx_wan;
+    uint64_t wan_tx_full;
+    uint64_t lan_fwd_drop;
     uint64_t last_ms;
 };
 
 static struct ne_stat_counters g_ne_stat;
+
+void ne_stat_bump_wan_tx_full(void)
+{
+    g_ne_stat.wan_tx_full++;
+}
+
+void ne_stat_bump_lan_fwd_drop(void)
+{
+    g_ne_stat.lan_fwd_drop++;
+}
 
 static uint64_t ne_now_ms(void)
 {
@@ -41,11 +53,14 @@ void ne_stat_tick(const struct ne_pair *p, uint32_t wan_q_depth, uint64_t mid_dr
         return;
     g_ne_stat.last_ms = now;
     fprintf(stderr,
-            "[NE] rx_l=%llu rx_w=%llu tx_l=%llu tx_w=%llu mid_drop=%llu wan_q=%u\n",
+            "[NE] rx_l=%llu rx_w=%llu tx_l=%llu tx_w=%llu "
+            "lan_drop=%llu wan_tx_full=%llu mid_drop=%llu wan_q=%u\n",
             (unsigned long long)g_ne_stat.rx_local,
             (unsigned long long)g_ne_stat.rx_wan,
             (unsigned long long)g_ne_stat.tx_local,
             (unsigned long long)g_ne_stat.tx_wan,
+            (unsigned long long)g_ne_stat.lan_fwd_drop,
+            (unsigned long long)g_ne_stat.wan_tx_full,
             (unsigned long long)mid_drop,
             wan_q_depth);
     fflush(stderr);
@@ -53,8 +68,16 @@ void ne_stat_tick(const struct ne_pair *p, uint32_t wan_q_depth, uint64_t mid_dr
 
 static void wan_tx_log(const char *ifname, const char *msg)
 {
+    static uint64_t last_ms;
+    uint64_t now;
+
     if (!ifname || !msg)
         return;
+    ne_stat_bump_wan_tx_full();
+    now = ne_now_ms();
+    if (last_ms && now - last_ms < 5000)
+        return;
+    last_ms = now;
     fprintf(stderr, "[WAN-TX] %s: %s\n", ifname, msg);
     fflush(stderr);
 }
