@@ -105,9 +105,9 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
                 found = 1;
         if (!found)
             continue;
-        const struct crypto_policy *c = flow_ok
-            ? config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto)
-            : NULL;
+        const struct crypto_policy *c = config_select_crypto_policy(
+            fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port,
+            flow_ok ? proto : POLICY_PROTO_ANY);
         if (!c)
             continue;
         if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {

@@ -289,10 +289,16 @@ uint32_t ne_frame_max_pkt_len(const struct ne_pair *p)
 
 #define NE_XSK_BIND_FLAGS ((uint16_t)(XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP))
 
+static void xsk_socket_kick(struct xsk_socket *xsk)
+{
+    if (xsk)
+        (void)sendto(xsk_socket__fd(xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+}
+
 static void xsk_ring_wakeup(struct xsk_socket *xsk, struct xsk_ring_prod *ring)
 {
-    if (xsk && ring && xsk_ring_prod__needs_wakeup(ring))
-        (void)sendto(xsk_socket__fd(xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+    (void)ring;
+    xsk_socket_kick(xsk);
 }
 
 static uint64_t ne_frame_base_addr(uint64_t addr, uint32_t frame_size)
@@ -836,7 +842,7 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
 
     for (uint32_t i = 0; i < popped; i++) {
         struct xdp_desc *d = xsk_ring_prod__tx_desc(&slot->tx, idx + i);
-        /* Chunk-aligned UMEM offset; NIC DMAs from addr + frame_headroom. */
+        /* Chunk-aligned UMEM offset; packet data at ne_packet_data(addr). */
         d->addr = jobs[i].addr;
         d->len = jobs[i].len;
         d->options = 0;
@@ -853,9 +859,8 @@ static int tx_drain_iface(struct ne_iface *iface, struct ne_ring *src,
                           uint32_t max_pkt_len)
 {
     int sent = 0;
-    int q = iface->tx_queue_rr % iface->queue_count;
-    sent += tx_drain_queue(&iface->queues[q], src, max_pkt_len, &iface->tx_no_free);
-    iface->tx_queue_rr = (q + 1) % iface->queue_count;
+    for (int q = 0; q < iface->queue_count; q++)
+        sent += tx_drain_queue(&iface->queues[q], src, max_pkt_len, &iface->tx_no_free);
     return sent;
 }
 

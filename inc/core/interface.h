@@ -8,8 +8,8 @@
 
 #define NE_RING        8192u
 #define NE_FRAME       2048u
-/* Reserved before packet data in each UMEM frame (RX/TX offset). */
-#define NE_FRAME_HEADROOM 256u
+/* UMEM headroom; keep 0 for zerocopy TX/RX addr alignment on all drivers. */
+#define NE_FRAME_HEADROOM 0u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
 #define NE_CPU_LOC     0u
