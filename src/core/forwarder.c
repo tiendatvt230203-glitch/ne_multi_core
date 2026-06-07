@@ -105,7 +105,7 @@ static void *local_core_thread(void *arg)
     pin_cpu(NE_CPU_LOC);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        ne_drain_cq_local(&fwd->pair);
+        ne_drain_cq_burst(&fwd->pair, 8);
         ne_refill_fq_local(&fwd->pair);
         for (int li = 0; li < fwd->local_count; li++)
             tx_drain_local_burst(fwd, li);
@@ -138,7 +138,7 @@ static void *wan_core_thread(void *arg)
     pin_cpu(NE_CPU_WAN);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        ne_drain_cq_wan(&fwd->pair);
+        ne_drain_cq_burst(&fwd->pair, 8);
         ne_refill_fq_wan(&fwd->pair);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
             if (fwd->wan_tx_cooldown[wi] > 0)
@@ -195,12 +195,22 @@ static void *middle_core_thread(void *arg)
         fwd_wan_drain_tick(fwd);
         fwd_wan_weight_blend_tick();
         fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
-        if (ne_ring_try_pop(&fwd->wan_to_mid, &job) == 0) {
-            dataplane_process_wan(fwd, job);
-            did_work = 1;
-        }
-        if (ne_ring_try_pop(&fwd->local_to_mid, &job) == 0) {
-            dataplane_process_local(fwd, job);
+        for (int round = 0; round < 16; round++) {
+            int round_work = 0;
+            for (int n = 0; n < NE_BATCH_SIZE; n++) {
+                if (ne_ring_try_pop(&fwd->wan_to_mid, &job) != 0)
+                    break;
+                dataplane_process_wan(fwd, job);
+                round_work = 1;
+            }
+            for (int n = 0; n < NE_BATCH_SIZE; n++) {
+                if (ne_ring_try_pop(&fwd->local_to_mid, &job) != 0)
+                    break;
+                dataplane_process_local(fwd, job);
+                round_work = 1;
+            }
+            if (!round_work)
+                break;
             did_work = 1;
         }
         if (++gc_tick >= 8192) {

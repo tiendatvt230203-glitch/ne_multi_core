@@ -12,5 +12,7 @@ void local_neigh_reset(void);
 void local_neigh_learn(int local_idx, uint32_t ip, const uint8_t mac[MAC_LEN]);
 int local_neigh_resolve(int local_idx, const char *ifname, uint32_t ip,
                         uint8_t mac_out[MAC_LEN]);
+void local_neigh_arp_probe(const char *ifname, const uint8_t src_mac[MAC_LEN],
+                           uint32_t ip);
 
 #endif

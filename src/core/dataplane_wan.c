@@ -225,8 +225,10 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     int li;
     int dec;
+    int needs_csum = 0;
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
+        needs_csum = 1;
         dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
             ne_frame_free(&fwd->pair, job.addr);
@@ -241,27 +243,22 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     if (li < 0 || li >= fwd->local_count)
         goto drop;
 
-    {
+    if (needs_csum) {
         uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
         uint8_t dst_mac[MAC_LEN];
-        char ipbuf[INET_ADDRSTRLEN];
 
         if (dest_ip == 0)
             goto drop;
         if (local_neigh_resolve(li, fwd->locals[li].ifname, dest_ip, dst_mac) != 0) {
-            static uint64_t last_bcast_ms;
-            uint64_t now = (uint64_t)time(NULL) * 1000ull;
-            memset(dst_mac, 0xff, MAC_LEN);
-            if (now - last_bcast_ms >= 5000) {
-                last_bcast_ms = now;
-                inet_ntop(AF_INET, &dest_ip, ipbuf, sizeof(ipbuf));
-                fprintf(stderr, "[WAN-RX] %s: no MAC for %s, broadcast fallback\n",
-                        fwd->locals[li].ifname, ipbuf);
-                fflush(stderr);
-            }
+            local_neigh_arp_probe(fwd->locals[li].ifname, fwd->locals[li].src_mac,
+                                  dest_ip);
+            if (local_neigh_resolve(li, fwd->locals[li].ifname, dest_ip,
+                                    dst_mac) != 0)
+                memset(dst_mac, 0xff, MAC_LEN);
         }
         if (dp_write_l2(pkt, job.len, dst_mac, fwd->locals[li].src_mac, 0) != 0)
             goto drop;
+        dp_fixup_tx_csum(pkt, job.len);
     }
 
     job.dir = NE_DIR_LOCAL;

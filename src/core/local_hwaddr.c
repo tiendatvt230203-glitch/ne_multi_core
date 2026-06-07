@@ -2,6 +2,8 @@
 #include "../../inc/core/forwarder.h"
 
 #include <arpa/inet.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <stdio.h>
@@ -124,6 +126,69 @@ int local_neigh_resolve(int local_idx, const char *ifname, uint32_t ip,
         return 0;
     }
     return -1;
+}
+
+void local_neigh_arp_probe(const char *ifname, const uint8_t src_mac[MAC_LEN],
+                           uint32_t ip)
+{
+    static uint64_t last_ms[256];
+    uint8_t frame[64];
+    struct sockaddr_ll sa;
+    int ifindex, fd, slot;
+    uint64_t now;
+    struct timespec ts;
+    char ipbuf[INET_ADDRSTRLEN];
+
+    if (!ifname || !src_mac || ip == 0)
+        return;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+    slot = (int)(ip % 256u);
+    if (last_ms[slot] && now - last_ms[slot] < 200)
+        return;
+    last_ms[slot] = now;
+
+    ifindex = (int)if_nametoindex(ifname);
+    if (ifindex == 0)
+        return;
+
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETHERTYPE_ARP));
+    if (fd < 0)
+        return;
+
+    memset(frame, 0, sizeof(frame));
+    memset(frame, 0xff, MAC_LEN);
+    memcpy(frame + MAC_LEN, src_mac, MAC_LEN);
+    frame[12] = 0x08;
+    frame[13] = 0x06;
+    {
+        uint8_t *a = frame + 14;
+        a[0] = 0x00;
+        a[1] = 0x01;
+        a[2] = 0x08;
+        a[3] = 0x00;
+        a[4] = 6;
+        a[5] = 4;
+        a[6] = 0x00;
+        a[7] = 0x01;
+        memcpy(a + 8, src_mac, MAC_LEN);
+        memcpy(a + 24, &ip, 4);
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sll_family = AF_PACKET;
+    sa.sll_ifindex = ifindex;
+    sa.sll_halen = MAC_LEN;
+    memset(sa.sll_addr, 0xff, MAC_LEN);
+    sa.sll_protocol = htons(ETHERTYPE_ARP);
+
+    (void)sendto(fd, frame, 42, 0, (struct sockaddr *)&sa, sizeof(sa));
+    close(fd);
+
+    inet_ntop(AF_INET, &ip, ipbuf, sizeof(ipbuf));
+    fprintf(stderr, "[LAN] ARP who-has %s on %s\n", ipbuf, ifname);
+    fflush(stderr);
 }
 
 static int read_iface_hwaddr(const char *ifname, uint8_t mac[MAC_LEN])

@@ -1,4 +1,5 @@
 #include "../../inc/core/dataplane_util.h"
+#include "../../inc/crypto/packet_crypto.h"
 
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
@@ -111,6 +112,70 @@ int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
     if (memcmp(dst, zero, MAC_LEN) == 0 || memcmp(src, zero, MAC_LEN) == 0)
         return 0;
     return dp_write_l2(pkt, len, dst, src, 0);
+}
+
+void dp_fixup_tx_csum(uint8_t *pkt, uint32_t len)
+{
+    struct ether_header *eth;
+    uint16_t etype;
+    uint8_t *ip_ptr;
+    size_t l2_len;
+    struct iphdr *ip;
+    uint32_t ihl;
+    uint8_t *l4;
+
+    if (!pkt || len < sizeof(struct ether_header) + sizeof(struct iphdr))
+        return;
+
+    eth = (struct ether_header *)pkt;
+    etype = ntohs(eth->ether_type);
+    ip_ptr = (uint8_t *)(eth + 1);
+    l2_len = sizeof(*eth);
+
+    if (etype == ETH_P_8021Q || etype == ETH_P_8021AD) {
+        if (len < l2_len + 4 + sizeof(struct iphdr))
+            return;
+        etype = ntohs(*(uint16_t *)(ip_ptr + 2));
+        ip_ptr += 4;
+        l2_len += 4;
+    }
+    if (etype != ETHERTYPE_IP)
+        return;
+
+    ip = (struct iphdr *)ip_ptr;
+    ihl = (uint32_t)ip->ihl * 4U;
+    if (ihl < sizeof(struct iphdr) || len < l2_len + ihl)
+        return;
+
+    {
+        uint16_t csum = crypto_calc_ip_checksum((const uint8_t *)ip, (int)ihl);
+        ip->check = 0;
+        ((uint8_t *)ip)[10] = (uint8_t)(csum >> 8);
+        ((uint8_t *)ip)[11] = (uint8_t)(csum & 0xFF);
+    }
+
+    l4 = (uint8_t *)pkt + l2_len + ihl;
+    if (ip->protocol == IPPROTO_UDP) {
+        int l4_len = (int)ntohs(ip->tot_len) - (int)ihl;
+        uint16_t ucsum;
+        if (l4_len < 8 || len < l2_len + (uint32_t)ntohs(ip->tot_len))
+            return;
+        l4[6] = 0;
+        l4[7] = 0;
+        ucsum = crypto_calc_udp_checksum((const uint8_t *)ip, (int)ihl, l4, l4_len);
+        l4[6] = (uint8_t)(ucsum >> 8);
+        l4[7] = (uint8_t)(ucsum & 0xFF);
+    } else if (ip->protocol == IPPROTO_TCP) {
+        int l4_len = (int)ntohs(ip->tot_len) - (int)ihl;
+        uint16_t tcsum;
+        if (l4_len < 20 || len < l2_len + (uint32_t)ntohs(ip->tot_len))
+            return;
+        l4[16] = 0;
+        l4[17] = 0;
+        tcsum = crypto_calc_tcp_checksum((const uint8_t *)ip, (int)ihl, l4, l4_len);
+        l4[16] = (uint8_t)(tcsum >> 8);
+        l4[17] = (uint8_t)(tcsum & 0xFF);
+    }
 }
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)

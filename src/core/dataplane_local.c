@@ -99,9 +99,11 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
         return 0;
     }
 
-    if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
-        dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
-        return -1;
+    if (!config_wan_bridge_mode(fwd->cfg)) {
+        if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
+            dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
+            return -1;
+    }
     return push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) == 0 ? 1 : -1;
 }
 
@@ -193,19 +195,6 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         wan_tx_fail(fwd, -1, &job, "no WAN route");
         goto drop;
     }
-    if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
-        struct ne_ring *q = &fwd->mid_to_wan[wan_dp];
-        fprintf(stderr,
-                "[WAN-TX] %s: mid queue full or cooldown depth=%u cap=%u cooldown=%u len=%u\n",
-                fwd->wans[wan_dp].ifname, ne_ring_count(q), q->cap,
-                fwd->wan_tx_cooldown[wan_dp], job.len);
-        fflush(stderr);
-        goto drop;
-    }
-    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
-        wan_tx_fail(fwd, wan_dp, &job, "L2 header write failed");
-        goto drop;
-    }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
         if (push_to_wan(fwd, &job, wan_dp) != 0) {
@@ -213,6 +202,12 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
             wan_tx_fail(fwd, wan_dp, &job, "mid_to_wan push failed");
         }
         return;
+    }
+    if (!config_wan_bridge_mode(fwd->cfg)) {
+        if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
+            wan_tx_fail(fwd, wan_dp, &job, "L2 header write failed");
+            goto drop;
+        }
     }
     if (!fwd->cfg->crypto_enabled) {
         wan_tx_fail(fwd, wan_dp, &job, "crypto disabled");
@@ -239,6 +234,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
     if (enc > 0)
         return;
+    dp_fixup_tx_csum(pkt, job.len);
     if (push_to_wan(fwd, &job, wan_dp) != 0) {
         ne_stat_bump_lan_fwd_drop();
         wan_tx_fail(fwd, wan_dp, &job, "mid_to_wan push failed");

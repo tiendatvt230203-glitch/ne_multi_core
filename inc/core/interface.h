@@ -146,6 +146,7 @@ void ne_recv_release_wan(struct ne_pair *p);
 
 void ne_drain_cq_local(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);
+void ne_drain_cq_burst(struct ne_pair *p, int rounds);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
 int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx);
