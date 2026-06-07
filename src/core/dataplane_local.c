@@ -200,6 +200,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         if (push_to_wan(fwd, &job, wan_dp) != 0) {
             ne_stat_bump_lan_fwd_drop();
             wan_tx_fail(fwd, wan_dp, &job, "mid_to_wan push failed");
+            ne_frame_free(&fwd->pair, job.addr);
         }
         return;
     }

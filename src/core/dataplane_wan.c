@@ -11,6 +11,7 @@
 #include "../../inc/crypto/packet_crypto.h"
 
 #include "../../inc/core/fragment.h"
+#include "../../inc/core/interface.h"
 #include "../../inc/core/local_hwaddr.h"
 
 #include <arpa/inet.h>
@@ -240,8 +241,10 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     }
 
     li = pick_local(fwd, pkt, job.len);
-    if (li < 0 || li >= fwd->local_count)
+    if (li < 0 || li >= fwd->local_count) {
+        ne_stat_bump_wan_mid_drop();
         goto drop;
+    }
 
     if (needs_csum) {
         uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
@@ -263,7 +266,8 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    (void)dp_ring_push(fwd, &fwd->mid_to_local[li], &job);
+    if (dp_ring_push(fwd, &fwd->mid_to_local[li], &job) != 0)
+        ne_stat_bump_wan_mid_drop();
     return;
 
 drop:

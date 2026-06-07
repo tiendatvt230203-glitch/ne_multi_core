@@ -166,8 +166,12 @@ int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
 
 /* Always prints [NE] counters every 5s while forwarder threads call this. */
-void ne_stat_tick(const struct ne_pair *p, uint32_t wan_q_depth, uint64_t mid_drop);
+void ne_stat_tick(const struct ne_pair *p, uint32_t lan_q_depth, uint32_t wan_q_depth,
+                  uint64_t mid_drop);
 void ne_stat_bump_wan_tx_full(void);
 void ne_stat_bump_lan_fwd_drop(void);
+void ne_stat_bump_wan_ring_drop(void);
+void ne_stat_bump_wan_mid_drop(void);
+uint32_t ne_pool_avail(const struct ne_pair *p);
 
 #endif

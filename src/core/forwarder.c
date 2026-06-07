@@ -60,13 +60,16 @@ static void tx_drain_wan_burst(struct forwarder *fwd, int wi)
 
 static void stat_tick(struct forwarder *fwd)
 {
+    uint32_t lan_q = 0;
     uint32_t wan_q = 0;
 
     if (!fwd)
         return;
+    for (int li = 0; li < fwd->local_count; li++)
+        lan_q += ne_ring_count(&fwd->mid_to_local[li]);
     for (int wi = 0; wi < fwd->wan_count; wi++)
         wan_q += ne_ring_count(&fwd->mid_to_wan[wi]);
-    ne_stat_tick(&fwd->pair, wan_q, g_local_mid_drop);
+    ne_stat_tick(&fwd->pair, lan_q, wan_q, g_local_mid_drop);
 }
 
 static void pin_cpu(unsigned int cpu)
@@ -159,8 +162,10 @@ static void *wan_core_thread(void *arg)
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 continue;
             }
-            if (ne_ring_try_push(&fwd->wan_to_mid, &batch[i]) != 0)
+            if (ne_ring_try_push(&fwd->wan_to_mid, &batch[i]) != 0) {
+                ne_stat_bump_wan_ring_drop();
                 ne_frame_free(&fwd->pair, batch[i].addr);
+            }
         }
         ne_recv_release_wan(&fwd->pair);
     }
