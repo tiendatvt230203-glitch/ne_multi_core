@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 static atomic_int running = 1;
@@ -61,7 +62,6 @@ static void *local_core_thread(void *arg)
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
-            ne_xdp_debug_tick(&fwd->pair);
             sched_yield();
             continue;
         }
@@ -70,7 +70,6 @@ static void *local_core_thread(void *arg)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
         ne_recv_release_local(&fwd->pair);
-        ne_xdp_debug_tick(&fwd->pair);
     }
     return NULL;
 }
@@ -94,7 +93,13 @@ static void *wan_core_thread(void *arg)
             int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
             if (sent > 0) {
                 fwd->wan_tx_stuck[wi] = 0;
-            } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
+            } else if (before > 0) {
+                if (fwd->pair.wans[wi].tx_no_free != no_free_before) {
+                    fprintf(stderr,
+                            "[WAN-TX] %s: %u pkts queued, XDP TX ring blocked\n",
+                            fwd->pair.wans[wi].ifname, before);
+                    fflush(stderr);
+                }
                 uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
                 if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
                     (void)fwd_wan_flush_queue(fwd, wi);
@@ -106,7 +111,6 @@ static void *wan_core_thread(void *arg)
 
         int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
-            ne_xdp_debug_tick(&fwd->pair);
             sched_yield();
             continue;
         }
@@ -120,7 +124,6 @@ static void *wan_core_thread(void *arg)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
         ne_recv_release_wan(&fwd->pair);
-        ne_xdp_debug_tick(&fwd->pair);
     }
     return NULL;
 }

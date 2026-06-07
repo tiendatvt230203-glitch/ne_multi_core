@@ -837,12 +837,6 @@ int main(int argc, char **argv) {
     }
     PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
 
-    {
-        const char *xd = getenv("NE_XDP_DEBUG");
-        fprintf(stderr,
-                "[DAEMON] NE_XDP_DEBUG=%s (XDP counters: set on this process, not -id client)\n",
-                xd ? xd : "unset");
-    }
     fprintf(stderr, "[DAEMON] listening %s — use %s -id <id>\n", NOTIFY_CHANNEL, argv[0]);
 
     /* forwarder is ~585 KiB; keep runtime off the main-thread stack (avoids segfault on small stacks). */

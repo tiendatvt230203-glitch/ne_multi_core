@@ -9,7 +9,25 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
 
+#include <arpa/inet.h>
+#include <stdio.h>
 #include <string.h>
+
+static void wan_tx_fail(struct forwarder *fwd, int wan_dp, const struct ne_packet *job,
+                        const char *reason)
+{
+    const char *ifn = (wan_dp >= 0 && wan_dp < fwd->wan_count)
+                          ? fwd->wans[wan_dp].ifname
+                          : "?";
+    char dst[INET_ADDRSTRLEN] = "-";
+    const uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
+    uint32_t ip = dp_dest_ipv4((void *)pkt, job->len);
+
+    if (ip)
+        inet_ntop(AF_INET, &ip, dst, sizeof(dst));
+    fprintf(stderr, "[WAN-TX] %s: %s len=%u dst=%s\n", ifn, reason, job->len, dst);
+    fflush(stderr);
+}
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
@@ -141,39 +159,48 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0) {
-        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_POLICY);
+        wan_tx_fail(fwd, -1, &job, "no matching policy");
         goto drop;
     }
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp)) {
-        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_WAN);
+    if (wan_dp < 0) {
+        wan_tx_fail(fwd, -1, &job, "no WAN route");
+        goto drop;
+    }
+    if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
+        struct ne_ring *q = &fwd->mid_to_wan[wan_dp];
+        fprintf(stderr,
+                "[WAN-TX] %s: mid queue full or cooldown depth=%u cap=%u cooldown=%u len=%u\n",
+                fwd->wans[wan_dp].ifname, ne_ring_count(q), q->cap,
+                fwd->wan_tx_cooldown[wan_dp], job.len);
+        fflush(stderr);
         goto drop;
     }
     if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
-        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_L2);
+        wan_tx_fail(fwd, wan_dp, &job, "L2 header write failed");
         goto drop;
     }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
-        ne_xdp_debug_push_wan();
-        (void)push_to_wan(fwd, &job, wan_dp);
+        if (push_to_wan(fwd, &job, wan_dp) != 0)
+            wan_tx_fail(fwd, wan_dp, &job, "mid_to_wan push failed");
         return;
     }
     if (!fwd->cfg->crypto_enabled) {
-        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
+        wan_tx_fail(fwd, wan_dp, &job, "crypto disabled");
         goto drop;
     }
 
     pi = (int)(cp - fwd->cfg->policies);
     if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
-        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
+        wan_tx_fail(fwd, wan_dp, &job, "crypto policy not ready");
         goto drop;
     }
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx) {
-        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
+        wan_tx_fail(fwd, wan_dp, &job, "no crypto context");
         goto drop;
     }
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
@@ -181,13 +208,13 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx);
     if (enc < 0) {
-        ne_xdp_debug_drop_local(NE_XDP_DBG_DROP_CRYPTO);
+        wan_tx_fail(fwd, wan_dp, &job, "encrypt failed");
         goto drop;
     }
     if (enc > 0)
         return;
-    ne_xdp_debug_push_wan();
-    (void)push_to_wan(fwd, &job, wan_dp);
+    if (push_to_wan(fwd, &job, wan_dp) != 0)
+        wan_tx_fail(fwd, wan_dp, &job, "mid_to_wan push failed");
     return;
 
 drop:
