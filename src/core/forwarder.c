@@ -18,6 +18,18 @@
 static atomic_int running = 1;
 struct forwarder *g_active_fwd;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_local_mid_drop;
+
+static void stat_tick(struct forwarder *fwd)
+{
+    uint32_t wan_q = 0;
+
+    if (!fwd)
+        return;
+    for (int wi = 0; wi < fwd->wan_count; wi++)
+        wan_q += ne_ring_count(&fwd->mid_to_wan[wi]);
+    ne_stat_tick(&fwd->pair, wan_q, g_local_mid_drop);
+}
 
 static void pin_cpu(unsigned int cpu)
 {
@@ -62,14 +74,20 @@ static void *local_core_thread(void *arg)
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
+            stat_tick(fwd);
             sched_yield();
             continue;
         }
         for (int i = 0; i < rcvd; i++) {
-            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0)
+            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0) {
+                g_local_mid_drop++;
+                fprintf(stderr, "[NE] local_to_mid full, drop len=%u\n", batch[i].len);
+                fflush(stderr);
                 ne_frame_free(&fwd->pair, batch[i].addr);
+            }
         }
         ne_recv_release_local(&fwd->pair);
+        stat_tick(fwd);
     }
     return NULL;
 }
@@ -108,6 +126,8 @@ static void *wan_core_thread(void *arg)
                 }
             }
         }
+
+        stat_tick(fwd);
 
         int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {

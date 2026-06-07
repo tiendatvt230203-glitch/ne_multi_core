@@ -164,4 +164,7 @@ void interface_promisc_off_config(const struct app_config *cfg);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
 
+/* Always prints [NE] counters every 5s while forwarder threads call this. */
+void ne_stat_tick(const struct ne_pair *p, uint32_t wan_q_depth, uint64_t mid_drop);
+
 #endif

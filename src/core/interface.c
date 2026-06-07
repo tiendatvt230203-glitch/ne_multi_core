@@ -13,6 +13,43 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <time.h>
+
+struct ne_stat_counters {
+    uint64_t rx_local;
+    uint64_t rx_wan;
+    uint64_t tx_local;
+    uint64_t tx_wan;
+    uint64_t last_ms;
+};
+
+static struct ne_stat_counters g_ne_stat;
+
+static uint64_t ne_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+void ne_stat_tick(const struct ne_pair *p, uint32_t wan_q_depth, uint64_t mid_drop)
+{
+    uint64_t now = ne_now_ms();
+
+    (void)p;
+    if (g_ne_stat.last_ms && now - g_ne_stat.last_ms < 5000)
+        return;
+    g_ne_stat.last_ms = now;
+    fprintf(stderr,
+            "[NE] rx_l=%llu rx_w=%llu tx_l=%llu tx_w=%llu mid_drop=%llu wan_q=%u\n",
+            (unsigned long long)g_ne_stat.rx_local,
+            (unsigned long long)g_ne_stat.rx_wan,
+            (unsigned long long)g_ne_stat.tx_local,
+            (unsigned long long)g_ne_stat.tx_wan,
+            (unsigned long long)mid_drop,
+            wan_q_depth);
+    fflush(stderr);
+}
 
 static void wan_tx_log(const char *ifname, const char *msg)
 {
@@ -565,10 +602,12 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         close_all_xsk_sockets(p);
         goto fail;
     }
+    g_ne_stat.last_ms = 0;
     fprintf(stderr,
             "[XSK] UMEM frames=%u frame_size=%u headroom=%u max_pkt=%u mode=zerocopy\n",
             p->n_frames, p->frame_size, p->frame_headroom,
             ne_frame_max_pkt_len(p));
+    fprintf(stderr, "[NE] activity stats every 5s on daemon stderr\n");
     fflush(stderr);
 
     for (int i = 0; i < p->local_count; i++) {
@@ -691,6 +730,7 @@ int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             out_ptr += n;
         }
     }
+    g_ne_stat.rx_local += total;
     return (int)total;
 }
 
@@ -714,6 +754,7 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
             out_ptr += n;
         }
     }
+    g_ne_stat.rx_wan += total;
     return (int)total;
 }
 
@@ -896,10 +937,15 @@ static int tx_drain_iface(struct ne_iface *iface, struct ne_ring *src,
 
 int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx)
 {
+    int sent;
+
     if (!p || local_idx < 0 || local_idx >= p->local_count)
         return 0;
-    return tx_drain_iface(&p->locals[local_idx], src, p->frame_size,
+    sent = tx_drain_iface(&p->locals[local_idx], src, p->frame_size,
                           ne_frame_max_pkt_len(p), NULL);
+    if (sent > 0)
+        g_ne_stat.tx_local += (uint64_t)sent;
+    return sent;
 }
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
@@ -914,6 +960,8 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
     depth = ne_ring_count(src);
     sent = tx_drain_iface(&p->wans[wan_idx], src, p->frame_size,
                           ne_frame_max_pkt_len(p), ifname);
+    if (sent > 0)
+        g_ne_stat.tx_wan += (uint64_t)sent;
     if (depth > 0 && sent == 0) {
         fprintf(stderr, "[WAN-TX] %s: %u pkts queued, sent 0\n", ifname, depth);
         fflush(stderr);
