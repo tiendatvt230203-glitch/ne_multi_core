@@ -8,15 +8,6 @@
 /* "!" + "255.255.255.255/32" + NUL */
 #define DIAG_CIDR_LEN  24
 
-static void fmt_mac(char *out, size_t outsz, const uint8_t mac[6]) {
-    int zero = !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]);
-    if (zero)
-        snprintf(out, outsz, "(waiting)");
-    else
-        snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 static void tbl_hline(const int *w, int n) {
     fputc('+', stderr);
     for (int i = 0; i < n; i++) {
@@ -152,18 +143,6 @@ static void print_iface_table(const struct app_config *cfg) {
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
         snprintf(c2, sizeof(c2), "%s", subnet);
         snprintf(c3, sizeof(c3), "remote subnet");
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
-        tbl_row(w, 4, row);
-    }
-    for (int i = 0; i < cfg->wan_count; i++) {
-        const struct wan_config *wan = &cfg->wans[i];
-        char c0[32], c1[32], c2[32], c3[32];
-        char peer[32];
-        fmt_mac(peer, sizeof(peer), wan->dst_mac);
-        snprintf(c0, sizeof(c0), "%s", wan->dataplane ? "wan-traffic" : "wan-handshake");
-        snprintf(c1, sizeof(c1), "%s", wan->ifname);
-        snprintf(c2, sizeof(c2), "%s", peer);
-        snprintf(c3, sizeof(c3), "%s", wan->dataplane ? "dataplane" : "PQC only");
         const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
         tbl_row(w, 4, row);
     }
