@@ -8,13 +8,23 @@
 
 #define NE_RING        8192u
 #define NE_FRAME       2048u
-/* UMEM headroom; keep 0 for zerocopy TX/RX addr alignment on all drivers. */
 #define NE_FRAME_HEADROOM 0u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
-#define NE_CPU_LOC     0u
-#define NE_CPU_MID     3u
-#define NE_CPU_WAN     11u
+#define NE_PIPELINE_COUNT 2u
+
+/* Pipeline A: even queues (0,2,4...) */
+#define NE_CPU_LOC_A   0u
+#define NE_CPU_MID_A   3u
+#define NE_CPU_WAN_A   11u
+/* Pipeline B: odd queues (1,3,5...) */
+#define NE_CPU_LOC_B   1u
+#define NE_CPU_MID_B   4u
+#define NE_CPU_WAN_B   10u
+
+#define NE_CPU_LOC     NE_CPU_LOC_A
+#define NE_CPU_MID     NE_CPU_MID_A
+#define NE_CPU_WAN     NE_CPU_WAN_A
 
 struct bpf_object;
 
@@ -113,7 +123,8 @@ struct ne_pair {
     size_t bufsize;
     uint32_t frame_size;
     uint32_t frame_headroom;
-    uint16_t xsk_bind_flags;
+    uint8_t shard_id;
+    uint8_t owns_xdp;
     uint32_t n_frames;
     struct xsk_umem *umem;
     struct ne_iface locals[MAX_INTERFACES];
@@ -136,6 +147,8 @@ int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt);
 int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt);
 uint32_t ne_ring_count(const struct ne_ring *r);
 
+int ne_pairs_open(struct ne_pair pairs[NE_PIPELINE_COUNT], const struct app_config *cfg);
+void ne_pairs_close(struct ne_pair pairs[NE_PIPELINE_COUNT]);
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg);
 void ne_pair_close(struct ne_pair *p);
 
@@ -164,14 +177,5 @@ void interface_ip_xdp_off_config(const struct app_config *cfg);
 void interface_promisc_off_config(const struct app_config *cfg);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
-
-/* Always prints [NE] counters every 5s while forwarder threads call this. */
-void ne_stat_tick(const struct ne_pair *p, uint32_t lan_q_depth, uint32_t wan_q_depth,
-                  uint64_t mid_drop);
-void ne_stat_bump_wan_tx_full(void);
-void ne_stat_bump_lan_fwd_drop(void);
-void ne_stat_bump_wan_ring_drop(void);
-void ne_stat_bump_wan_mid_drop(void);
-uint32_t ne_pool_avail(const struct ne_pair *p);
 
 #endif

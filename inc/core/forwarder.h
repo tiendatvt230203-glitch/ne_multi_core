@@ -4,6 +4,17 @@
 #include "interface.h"
 #include "flow_table.h"
 
+struct ne_pipeline {
+    struct ne_pair pair;
+    struct ne_ring local_to_mid;
+    struct ne_ring wan_to_mid;
+    struct ne_ring mid_to_wan[MAX_INTERFACES];
+    struct ne_ring mid_to_local[MAX_INTERFACES];
+    pthread_t local_thread;
+    pthread_t mid_thread;
+    pthread_t wan_thread;
+};
+
 struct forwarder {
     struct app_config *cfg;
 
@@ -13,15 +24,7 @@ struct forwarder {
     int wan_count;
     int wan_cfg_idx[MAX_INTERFACES]; /* dataplane slot -> cfg->wans[] index */
 
-    struct ne_pair pair;
-    struct ne_ring local_to_mid;
-    struct ne_ring wan_to_mid;
-    struct ne_ring mid_to_wan[MAX_INTERFACES];
-    struct ne_ring mid_to_local[MAX_INTERFACES];
-
-    pthread_t local_thread;
-    pthread_t mid_thread;
-    pthread_t wan_thread;
+    struct ne_pipeline pipes[NE_PIPELINE_COUNT];
     int threads_started;
 
     uint64_t wan_tx_stuck[MAX_INTERFACES];

@@ -19,13 +19,26 @@
 static atomic_int running = 1;
 struct forwarder *g_active_fwd;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_local_mid_drop;
 
-static void learn_lan_rx_batch(struct forwarder *fwd, struct ne_packet *batch, int n)
+struct pipe_thread_ctx {
+    struct forwarder *fwd;
+    struct ne_pipeline *pl;
+    unsigned cpu_loc;
+    unsigned cpu_mid;
+    unsigned cpu_wan;
+};
+
+static const unsigned g_pipe_cpus[NE_PIPELINE_COUNT][3] = {
+    { NE_CPU_LOC_A, NE_CPU_MID_A, NE_CPU_WAN_A },
+    { NE_CPU_LOC_B, NE_CPU_MID_B, NE_CPU_WAN_B },
+};
+
+static void learn_lan_rx_batch(struct forwarder *fwd, struct ne_pipeline *pl,
+                               struct ne_packet *batch, int n)
 {
     for (int i = 0; i < n; i++) {
         int li = batch[i].local_idx < fwd->local_count ? (int)batch[i].local_idx : 0;
-        uint8_t *pkt = ne_packet_data(&fwd->pair, batch[i].addr);
+        uint8_t *pkt = ne_packet_data(&pl->pair, batch[i].addr);
 
         if (!pkt || batch[i].len < 14)
             continue;
@@ -35,41 +48,27 @@ static void learn_lan_rx_batch(struct forwarder *fwd, struct ne_packet *batch, i
     }
 }
 
-static void tx_drain_local_burst(struct forwarder *fwd, int li)
+static void tx_drain_local_burst(struct forwarder *fwd, struct ne_pipeline *pl, int li)
 {
     for (int n = 0; n < 512; n++) {
-        if (ne_ring_count(&fwd->mid_to_local[li]) == 0)
+        if (ne_ring_count(&pl->mid_to_local[li]) == 0)
             break;
-        if (ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li) <= 0)
+        if (ne_tx_drain_local(&pl->pair, &pl->mid_to_local[li], li) <= 0)
             break;
     }
 }
 
-static void tx_drain_wan_burst(struct forwarder *fwd, int wi)
+static void tx_drain_wan_burst(struct forwarder *fwd, struct ne_pipeline *pl, int wi)
 {
     if (fwd_wan_is_stopped(wi))
         return;
     for (int n = 0; n < 512; n++) {
-        if (ne_ring_count(&fwd->mid_to_wan[wi]) == 0)
+        if (ne_ring_count(&pl->mid_to_wan[wi]) == 0)
             break;
-        if (ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi) <= 0)
+        if (ne_tx_drain_wan(&pl->pair, &pl->mid_to_wan[wi], wi) <= 0)
             break;
         fwd->wan_tx_stuck[wi] = 0;
     }
-}
-
-static void stat_tick(struct forwarder *fwd)
-{
-    uint32_t lan_q = 0;
-    uint32_t wan_q = 0;
-
-    if (!fwd)
-        return;
-    for (int li = 0; li < fwd->local_count; li++)
-        lan_q += ne_ring_count(&fwd->mid_to_local[li]);
-    for (int wi = 0; wi < fwd->wan_count; wi++)
-        wan_q += ne_ring_count(&fwd->mid_to_wan[wi]);
-    ne_stat_tick(&fwd->pair, lan_q, wan_q, g_local_mid_drop);
 }
 
 static void pin_cpu(unsigned int cpu)
@@ -82,7 +81,7 @@ static void pin_cpu(unsigned int cpu)
 
 void forwarder_pin_cpu(void)
 {
-    pin_cpu(NE_CPU_LOC);
+    pin_cpu(NE_CPU_LOC_A);
 }
 
 static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
@@ -103,55 +102,53 @@ static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
 
 static void *local_core_thread(void *arg)
 {
-    struct forwarder *fwd = arg;
+    struct pipe_thread_ctx *ctx = arg;
+    struct forwarder *fwd = ctx->fwd;
+    struct ne_pipeline *pl = ctx->pl;
     struct ne_packet batch[NE_BATCH_SIZE];
-    pin_cpu(NE_CPU_LOC);
+
+    pin_cpu(ctx->cpu_loc);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        ne_drain_cq_burst(&fwd->pair, 8);
-        ne_refill_fq_local(&fwd->pair);
+        ne_drain_cq_local(&pl->pair);
+        ne_refill_fq_local(&pl->pair);
         for (int li = 0; li < fwd->local_count; li++)
-            tx_drain_local_burst(fwd, li);
+            tx_drain_local_burst(fwd, pl, li);
 
-        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
+        int rcvd = ne_recv_local(&pl->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
-            stat_tick(fwd);
             sched_yield();
             continue;
         }
-        learn_lan_rx_batch(fwd, batch, rcvd);
+        learn_lan_rx_batch(fwd, pl, batch, rcvd);
         for (int i = 0; i < rcvd; i++) {
-            if (ne_ring_try_push(&fwd->local_to_mid, &batch[i]) != 0) {
-                g_local_mid_drop++;
-                fprintf(stderr, "[NE] local_to_mid full, drop len=%u\n", batch[i].len);
-                fflush(stderr);
-                ne_frame_free(&fwd->pair, batch[i].addr);
-            }
+            if (ne_ring_try_push(&pl->local_to_mid, &batch[i]) != 0)
+                ne_frame_free(&pl->pair, batch[i].addr);
         }
-        ne_recv_release_local(&fwd->pair);
-        stat_tick(fwd);
+        ne_recv_release_local(&pl->pair);
     }
     return NULL;
 }
 
 static void *wan_core_thread(void *arg)
 {
-    struct forwarder *fwd = arg;
+    struct pipe_thread_ctx *ctx = arg;
+    struct forwarder *fwd = ctx->fwd;
+    struct ne_pipeline *pl = ctx->pl;
     struct ne_packet batch[NE_BATCH_SIZE];
-    pin_cpu(NE_CPU_WAN);
+
+    pin_cpu(ctx->cpu_wan);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        ne_drain_cq_burst(&fwd->pair, 8);
-        ne_refill_fq_wan(&fwd->pair);
+        ne_drain_cq_wan(&pl->pair);
+        ne_refill_fq_wan(&pl->pair);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
             if (fwd->wan_tx_cooldown[wi] > 0)
                 fwd->wan_tx_cooldown[wi]--;
-            tx_drain_wan_burst(fwd, wi);
+            tx_drain_wan_burst(fwd, pl, wi);
         }
 
-        stat_tick(fwd);
-
-        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
+        int rcvd = ne_recv_wan(&pl->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             sched_yield();
             continue;
@@ -159,75 +156,113 @@ static void *wan_core_thread(void *arg)
 
         for (int i = 0; i < rcvd; i++) {
             if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
+                ne_frame_free(&pl->pair, batch[i].addr);
                 continue;
             }
-            if (ne_ring_try_push(&fwd->wan_to_mid, &batch[i]) != 0) {
-                ne_stat_bump_wan_ring_drop();
-                ne_frame_free(&fwd->pair, batch[i].addr);
-            }
+            if (ne_ring_try_push(&pl->wan_to_mid, &batch[i]) != 0)
+                ne_frame_free(&pl->pair, batch[i].addr);
         }
-        ne_recv_release_wan(&fwd->pair);
+        ne_recv_release_wan(&pl->pair);
     }
     return NULL;
 }
 
+static void mid_process_batches(struct forwarder *fwd, struct ne_pipeline *pl)
+{
+    struct ne_packet job;
+
+    for (int round = 0; round < 16; round++) {
+        int round_work = 0;
+        for (int n = 0; n < NE_BATCH_SIZE; n++) {
+            if (ne_ring_try_pop(&pl->wan_to_mid, &job) != 0)
+                break;
+            dataplane_process_wan(fwd, pl, job);
+            round_work = 1;
+        }
+        for (int n = 0; n < NE_BATCH_SIZE; n++) {
+            if (ne_ring_try_pop(&pl->local_to_mid, &job) != 0)
+                break;
+            dataplane_process_local(fwd, pl, job);
+            round_work = 1;
+        }
+        if (!round_work)
+            break;
+    }
+}
+
 static void *middle_core_thread(void *arg)
 {
-    struct forwarder *fwd = arg;
-    struct ne_packet job;
+    struct pipe_thread_ctx *ctx = arg;
+    struct forwarder *fwd = ctx->fwd;
+    struct ne_pipeline *pl = ctx->pl;
     uint32_t gc_tick = 0;
-    pin_cpu(NE_CPU_MID);
+    int is_primary = (pl->pair.shard_id == 0);
+
+    pin_cpu(ctx->cpu_mid);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
 
-        if (pthread_mutex_trylock(&runtime_lock) != 0) {
-            if (!atomic_load_explicit(&running, memory_order_acquire))
-                break;
-            sched_yield();
-            continue;
-        }
-        if (!atomic_load_explicit(&running, memory_order_acquire)) {
-            pthread_mutex_unlock(&runtime_lock);
-            break;
-        }
-        if (fwd_reload_apply_if_pending()) {
-            pthread_mutex_unlock(&runtime_lock);
-            continue;
-        }
-        fwd_crypto_maybe_expire_prev_grace();
-        fwd_wan_drain_tick(fwd);
-        fwd_wan_weight_blend_tick();
-        fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
-        for (int round = 0; round < 16; round++) {
-            int round_work = 0;
-            for (int n = 0; n < NE_BATCH_SIZE; n++) {
-                if (ne_ring_try_pop(&fwd->wan_to_mid, &job) != 0)
+        if (is_primary) {
+            if (pthread_mutex_trylock(&runtime_lock) != 0) {
+                if (!atomic_load_explicit(&running, memory_order_acquire))
                     break;
-                dataplane_process_wan(fwd, job);
-                round_work = 1;
+                mid_process_batches(fwd, pl);
+                sched_yield();
+                continue;
             }
-            for (int n = 0; n < NE_BATCH_SIZE; n++) {
-                if (ne_ring_try_pop(&fwd->local_to_mid, &job) != 0)
-                    break;
-                dataplane_process_local(fwd, job);
-                round_work = 1;
-            }
-            if (!round_work)
+            if (!atomic_load_explicit(&running, memory_order_acquire)) {
+                pthread_mutex_unlock(&runtime_lock);
                 break;
+            }
+            if (fwd_reload_apply_if_pending()) {
+                pthread_mutex_unlock(&runtime_lock);
+                continue;
+            }
+            fwd_crypto_maybe_expire_prev_grace();
+            fwd_wan_drain_tick(fwd);
+            fwd_wan_weight_blend_tick();
+            fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
+            mid_process_batches(fwd, pl);
+            did_work = 1;
+            if (++gc_tick >= 8192) {
+                fwd_crypto_frag_gc_tick();
+                gc_tick = 0;
+            }
+            pthread_mutex_unlock(&runtime_lock);
+        } else {
+            mid_process_batches(fwd, pl);
             did_work = 1;
         }
-        if (++gc_tick >= 8192) {
-            fwd_crypto_frag_gc_tick();
-            gc_tick = 0;
-        }
-        pthread_mutex_unlock(&runtime_lock);
 
         if (!did_work)
             sched_yield();
     }
     return NULL;
+}
+
+static int pipeline_init_rings(struct ne_pipeline *pl)
+{
+    if (ne_ring_init(&pl->local_to_mid, NE_RING) != 0 ||
+        ne_ring_init(&pl->wan_to_mid, NE_RING) != 0)
+        return -1;
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        if (ne_ring_init(&pl->mid_to_local[i], NE_RING) != 0)
+            return -1;
+        if (ne_ring_init(&pl->mid_to_wan[i], NE_RING) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static void pipeline_destroy_rings(struct ne_pipeline *pl)
+{
+    ne_ring_destroy(&pl->local_to_mid);
+    ne_ring_destroy(&pl->wan_to_mid);
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        ne_ring_destroy(&pl->mid_to_wan[i]);
+        ne_ring_destroy(&pl->mid_to_local[i]);
+    }
 }
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
@@ -276,28 +311,21 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd_crypto_ensure_profile_slots(cfg) != 0)
         return -1;
 
-    /* PQC wire path uses HARDCODED_KEY in crypto_pqc_layer.h; HS optional for later. */
-    if (ne_pair_open(&fwd->pair, cfg) != 0)
+    struct ne_pair pairs[NE_PIPELINE_COUNT];
+    if (ne_pairs_open(pairs, cfg) != 0)
         return -1;
     if (forwarder_should_stop()) {
-        forwarder_cleanup(fwd);
+        ne_pairs_close(pairs);
         return -1;
     }
 
-    if (ne_ring_init(&fwd->local_to_mid, NE_RING) != 0 ||
-        ne_ring_init(&fwd->wan_to_mid, NE_RING) != 0) {
-        forwarder_cleanup(fwd);
-        return -1;
-    }
-    for (int i = 0; i < fwd->local_count; i++) {
-        if (ne_ring_init(&fwd->mid_to_local[i], NE_RING) != 0) {
-            forwarder_cleanup(fwd);
-            return -1;
-        }
-    }
-    for (int i = 0; i < fwd->wan_count; i++) {
-        if (ne_ring_init(&fwd->mid_to_wan[i], NE_RING) != 0) {
-            forwarder_cleanup(fwd);
+    for (uint32_t p = 0; p < NE_PIPELINE_COUNT; p++) {
+        fwd->pipes[p].pair = pairs[p];
+        if (pipeline_init_rings(&fwd->pipes[p]) != 0) {
+            for (uint32_t j = 0; j <= p; j++)
+                pipeline_destroy_rings(&fwd->pipes[j]);
+            ne_pairs_close(pairs);
+            memset(fwd, 0, sizeof(*fwd));
             return -1;
         }
     }
@@ -313,43 +341,60 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
-    ne_ring_destroy(&fwd->local_to_mid);
-    ne_ring_destroy(&fwd->wan_to_mid);
-    for (int i = 0; i < MAX_INTERFACES; i++)
-        ne_ring_destroy(&fwd->mid_to_wan[i]);
-    for (int i = 0; i < MAX_INTERFACES; i++)
-        ne_ring_destroy(&fwd->mid_to_local[i]);
+    for (uint32_t p = 0; p < NE_PIPELINE_COUNT; p++) {
+        pipeline_destroy_rings(&fwd->pipes[p]);
+        ne_pair_close(&fwd->pipes[p].pair);
+    }
     fwd_crypto_cleanup_all_profile_slots();
-    ne_pair_close(&fwd->pair);
 }
 
 void forwarder_run(struct forwarder *fwd)
 {
+    struct pipe_thread_ctx ctx[NE_PIPELINE_COUNT];
+    pthread_t threads[NE_PIPELINE_COUNT * 3];
+    int n_threads = 0;
+
     if (!fwd || forwarder_should_stop())
         return;
 
     g_active_fwd = fwd;
 
-    if (pthread_create(&fwd->local_thread, NULL, local_core_thread, fwd) != 0)
-        return;
-    if (pthread_create(&fwd->mid_thread, NULL, middle_core_thread, fwd) != 0) {
-        atomic_store_explicit(&running, 0, memory_order_release);
-        pthread_join(fwd->local_thread, NULL);
-        return;
-    }
-    if (pthread_create(&fwd->wan_thread, NULL, wan_core_thread, fwd) != 0) {
-        atomic_store_explicit(&running, 0, memory_order_release);
-        pthread_join(fwd->local_thread, NULL);
-        pthread_join(fwd->mid_thread, NULL);
-        return;
+    for (uint32_t p = 0; p < NE_PIPELINE_COUNT; p++) {
+        ctx[p].fwd = fwd;
+        ctx[p].pl = &fwd->pipes[p];
+        ctx[p].cpu_loc = g_pipe_cpus[p][0];
+        ctx[p].cpu_mid = g_pipe_cpus[p][1];
+        ctx[p].cpu_wan = g_pipe_cpus[p][2];
+
+        if (pthread_create(&threads[n_threads++], NULL, local_core_thread, &ctx[p]) != 0)
+            goto fail;
+        fwd->pipes[p].local_thread = threads[n_threads - 1];
+
+        if (pthread_create(&threads[n_threads++], NULL, middle_core_thread, &ctx[p]) != 0)
+            goto fail;
+        fwd->pipes[p].mid_thread = threads[n_threads - 1];
+
+        if (pthread_create(&threads[n_threads++], NULL, wan_core_thread, &ctx[p]) != 0)
+            goto fail;
+        fwd->pipes[p].wan_thread = threads[n_threads - 1];
     }
 
     fwd->threads_started = 1;
     if (fwd->cfg)
         main_diag_log_dataplane_ready(fwd->cfg);
-    pthread_join(fwd->local_thread, NULL);
-    pthread_join(fwd->mid_thread, NULL);
-    pthread_join(fwd->wan_thread, NULL);
+
+    for (int i = 0; i < n_threads; i++)
+        pthread_join(threads[i], NULL);
+
+    fwd->threads_started = 0;
+    if (g_active_fwd == fwd)
+        g_active_fwd = NULL;
+    return;
+
+fail:
+    atomic_store_explicit(&running, 0, memory_order_release);
+    for (int i = 0; i < n_threads; i++)
+        pthread_join(threads[i], NULL);
     fwd->threads_started = 0;
     if (g_active_fwd == fwd)
         g_active_fwd = NULL;

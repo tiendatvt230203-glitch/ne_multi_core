@@ -155,10 +155,11 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     return 0;
 }
 
-static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
+static int decrypt_wan(struct forwarder *fwd, struct ne_pipeline *pl,
+                       struct ne_packet *job)
 {
     uint8_t scratch[8192];
-    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
+    uint8_t *pkt = ne_packet_data(&pl->pair, job->addr);
     uint32_t len = job->len;
     uint16_t pid = 0;
     uint8_t fidx = 0;
@@ -221,30 +222,29 @@ static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
     return config_find_local_for_ip(fwd->cfg, dest_ip);
 }
 
-void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
+void dataplane_process_wan(struct forwarder *fwd, struct ne_pipeline *pl,
+                            struct ne_packet job)
 {
-    uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
+    uint8_t *pkt = ne_packet_data(&pl->pair, job.addr);
     int li;
     int dec;
     int needs_csum = 0;
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
         needs_csum = 1;
-        dec = decrypt_wan(fwd, &job);
+        dec = decrypt_wan(fwd, pl, &job);
         if (dec == 1) {
-            ne_frame_free(&fwd->pair, job.addr);
+            ne_frame_free(&pl->pair, job.addr);
             return;
         }
         if (dec != 0)
             goto drop;
-        pkt = ne_packet_data(&fwd->pair, job.addr);
+        pkt = ne_packet_data(&pl->pair, job.addr);
     }
 
     li = pick_local(fwd, pkt, job.len);
-    if (li < 0 || li >= fwd->local_count) {
-        ne_stat_bump_wan_mid_drop();
+    if (li < 0 || li >= fwd->local_count)
         goto drop;
-    }
 
     if (needs_csum) {
         uint32_t dest_ip = dp_dest_ipv4(pkt, job.len);
@@ -266,10 +266,9 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    if (dp_ring_push(fwd, &fwd->mid_to_local[li], &job) != 0)
-        ne_stat_bump_wan_mid_drop();
+    (void)dp_ring_push(fwd, pl, &pl->mid_to_local[li], &job);
     return;
 
 drop:
-    ne_frame_free(&fwd->pair, job.addr);
+    ne_frame_free(&pl->pair, job.addr);
 }

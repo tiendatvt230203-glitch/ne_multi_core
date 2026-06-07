@@ -141,7 +141,6 @@ struct app_config {
     int policy_count;
 };
 
-/* WAN rows without dst_ip: transparent L2 inter-SEP links (no MAC rewrite). */
 static inline int config_wan_bridge_mode(const struct app_config *cfg)
 {
     if (!cfg || cfg->wan_count <= 0)
