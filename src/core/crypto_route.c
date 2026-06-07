@@ -5,6 +5,7 @@
 #include "../../inc/core/fragment.h"
 #include "../../inc/crypto/crypto_layer2.h"
 
+#include <arpa/inet.h>
 #include <stddef.h>
 
 static const uint8_t ne_crypto_cpus[NE_CRYPTO_WORKERS] = {
@@ -24,13 +25,6 @@ void dp_crypto_worker_bind(int worker_idx)
 int dp_crypto_current_worker_idx(void)
 {
     return tls_crypto_worker_idx;
-}
-
-static uint32_t flow_hash_mix(uint32_t h, uint32_t v)
-{
-    h ^= v;
-    h *= 0x01000193u;
-    return h;
 }
 
 uint8_t dp_crypto_worker_cpu(int worker_idx)
@@ -54,22 +48,25 @@ int dp_crypto_pick_local_worker(const uint8_t *pkt, uint32_t len)
     uint32_t src_ip = 0, dst_ip = 0;
     uint16_t src_port = 0, dst_port = 0;
     uint8_t proto = 0;
-    uint32_t h = 0x811c9dc5u;
+    uint32_t key;
 
-    if (pkt && len >= 14 && dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
-                                          &src_port, &dst_port, &proto) == 0) {
-        h = flow_hash_mix(h, src_ip);
-        h = flow_hash_mix(h, dst_ip);
-        h = flow_hash_mix(h, (uint32_t)src_port | ((uint32_t)dst_port << 16));
-        h = flow_hash_mix(h, proto);
-    } else if (pkt && len > 0) {
-        uint32_t n = len < 14 ? len : 14;
-        for (uint32_t i = 0; i < n; i++)
-            h = flow_hash_mix(h, pkt[i]);
-        h = flow_hash_mix(h, len);
+    if (!pkt || len < 14)
+        return 0;
+
+    if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
+                      &src_port, &dst_port, &proto) != 0) {
+        /* Không parse được 5-tuple: dùng byte L2 + len, tránh MAC-only cố định. */
+        key = len;
+        for (uint32_t i = 0; i < 14 && i < len; i++)
+            key = key * 31u + pkt[i];
+        return (int)((key >> 8) % NE_CRYPTO_WORKERS);
     }
 
-    return (int)(h % NE_CRYPTO_WORKERS);
+    /* src^dst đổi theo connection: forward (src đổi) và return (dst đổi). */
+    key = (uint32_t)(src_port ^ dst_port);
+    key ^= ntohl(src_ip) ^ ntohl(dst_ip) ^ (uint32_t)proto;
+    key *= 0x9E3779B1u;
+    return (int)((key >> 15) % NE_CRYPTO_WORKERS);
 }
 
 int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
