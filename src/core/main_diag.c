@@ -39,8 +39,10 @@ static const char *policy_action_name(int action) {
 static const char *policy_proto_str(uint8_t proto) {
     if (proto == POLICY_PROTO_ANY) return "any";
     if (proto == POLICY_PROTO_TCP_UDP) return "tcp/udp";
+    if (proto == 1) return "icmp";
     if (proto == 6) return "tcp";
     if (proto == 17) return "udp";
+    if (proto == 89) return "ospf";
     return "?";
 }
 

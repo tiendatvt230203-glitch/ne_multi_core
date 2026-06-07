@@ -289,6 +289,19 @@ uint32_t ne_frame_max_pkt_len(const struct ne_pair *p)
 
 #define NE_XSK_BIND_FLAGS ((uint16_t)(XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP))
 
+static void xsk_ring_wakeup(struct xsk_socket *xsk, struct xsk_ring_prod *ring)
+{
+    if (xsk && ring && xsk_ring_prod__needs_wakeup(ring))
+        (void)sendto(xsk_socket__fd(xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+}
+
+static uint64_t ne_frame_base_addr(uint64_t addr, uint32_t frame_size)
+{
+    if (!frame_size)
+        return addr;
+    return addr & ~((uint64_t)frame_size - 1U);
+}
+
 static void close_all_xsk_sockets(struct ne_pair *p)
 {
     if (!p)
@@ -432,6 +445,7 @@ static void prefill_queue(struct ne_pair *p, struct ne_xsk_queue *slot, uint32_t
         for (uint32_t i = 0; i < got; i++)
             *xsk_ring_prod__fill_addr(&slot->fq, idx + i) = addrs[i];
         xsk_ring_prod__submit(&slot->fq, got);
+        xsk_ring_wakeup(slot->xsk, &slot->fq);
         want -= got;
     }
 }
@@ -707,7 +721,8 @@ void ne_recv_release_wan(struct ne_pair *p)
     }
 }
 
-static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
+static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool,
+                           uint32_t frame_size)
 {
     uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
@@ -715,7 +730,8 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
 
     while ((n = xsk_ring_cons__peek(&slot->cq, NE_BATCH_SIZE, &idx)) > 0) {
         for (uint32_t i = 0; i < n; i++)
-            addrs[i] = *xsk_ring_cons__comp_addr(&slot->cq, idx + i);
+            addrs[i] = ne_frame_base_addr(
+                *xsk_ring_cons__comp_addr(&slot->cq, idx + i), frame_size);
         xsk_ring_cons__release(&slot->cq, n);
         (void)pool_push(pool, addrs, n);
         if (n < NE_BATCH_SIZE) {
@@ -724,22 +740,23 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     }
 }
 
-static void drain_cq_iface(struct ne_iface *iface, struct ne_pool *pool)
+static void drain_cq_iface(struct ne_iface *iface, struct ne_pool *pool,
+                           uint32_t frame_size)
 {
     for (int q = 0; q < iface->queue_count; q++)
-        drain_cq_queue(&iface->queues[q], pool);
+        drain_cq_queue(&iface->queues[q], pool, frame_size);
 }
 
 void ne_drain_cq_local(struct ne_pair *p)
 {
     for (int i = 0; i < p->local_count; i++)
-        drain_cq_iface(&p->locals[i], &p->pool);
+        drain_cq_iface(&p->locals[i], &p->pool, p->frame_size);
 }
 
 void ne_drain_cq_wan(struct ne_pair *p)
 {
     for (int i = 0; i < p->wan_count; i++)
-        drain_cq_iface(&p->wans[i], &p->pool);
+        drain_cq_iface(&p->wans[i], &p->pool, p->frame_size);
 }
 
 static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
@@ -760,6 +777,7 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     for (uint32_t i = 0; i < got; i++)
         *xsk_ring_prod__fill_addr(&slot->fq, idx + i) = addrs[i];
     xsk_ring_prod__submit(&slot->fq, got);
+    xsk_ring_wakeup(slot->xsk, &slot->fq);
 }
 
 static void refill_fq_iface(struct ne_iface *iface, struct ne_pool *pool)
@@ -781,7 +799,8 @@ void ne_refill_fq_wan(struct ne_pair *p)
 }
 
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
-                          uint32_t max_pkt_len, uint64_t *tx_no_free)
+                          uint32_t max_pkt_len, uint32_t frame_headroom,
+                          uint64_t *tx_no_free)
 {
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
@@ -789,9 +808,7 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
         if (tx_no_free)
             (*tx_no_free)++;
         
-        if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
-            (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-        }
+        xsk_ring_wakeup(slot->xsk, &slot->tx);
         return 0;
     }
 
@@ -819,24 +836,24 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src,
 
     for (uint32_t i = 0; i < popped; i++) {
         struct xdp_desc *d = xsk_ring_prod__tx_desc(&slot->tx, idx + i);
-        d->addr = jobs[i].addr;
+        d->addr = jobs[i].addr + frame_headroom;
         d->len = jobs[i].len;
     }
-    
+
     xsk_ring_prod__submit(&slot->tx, popped);
-    if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
-        (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-    }
+    xsk_ring_wakeup(slot->xsk, &slot->tx);
     
     return (int)popped;
 }
 
 
-static int tx_drain_iface(struct ne_iface *iface, struct ne_ring *src, uint32_t max_pkt_len)
+static int tx_drain_iface(struct ne_iface *iface, struct ne_ring *src,
+                          uint32_t max_pkt_len, uint32_t frame_headroom)
 {
     int sent = 0;
     int q = iface->tx_queue_rr % iface->queue_count;
-    sent += tx_drain_queue(&iface->queues[q], src, max_pkt_len, &iface->tx_no_free);
+    sent += tx_drain_queue(&iface->queues[q], src, max_pkt_len, frame_headroom,
+                           &iface->tx_no_free);
     iface->tx_queue_rr = (q + 1) % iface->queue_count;
     return sent;
 }
@@ -845,13 +862,15 @@ int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx)
 {
     if (!p || local_idx < 0 || local_idx >= p->local_count)
         return 0;
-    return tx_drain_iface(&p->locals[local_idx], src, ne_frame_max_pkt_len(p));
+    return tx_drain_iface(&p->locals[local_idx], src, ne_frame_max_pkt_len(p),
+                          p->frame_headroom);
 }
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
 {
     if (!p || wan_idx < 0 || wan_idx >= p->wan_count)
         return 0;
-    return tx_drain_iface(&p->wans[wan_idx], src, ne_frame_max_pkt_len(p));
+    return tx_drain_iface(&p->wans[wan_idx], src, ne_frame_max_pkt_len(p),
+                          p->frame_headroom);
 }
 
