@@ -17,8 +17,8 @@ struct forwarder {
     struct ne_pair pair;
     struct ne_ring local_to_mid[NE_CRYPTO_WORKERS];
     struct ne_ring wan_to_mid[NE_CRYPTO_WORKERS];
-    struct ne_ring mid_to_wan[MAX_INTERFACES];
-    struct ne_ring mid_to_local[MAX_INTERFACES];
+    struct ne_ring mid_to_wan[MAX_INTERFACES][NE_CRYPTO_WORKERS];
+    struct ne_ring mid_to_local[MAX_INTERFACES][NE_CRYPTO_WORKERS];
 
     pthread_t local_thread;
     pthread_t crypto_threads[NE_CRYPTO_WORKERS];
@@ -28,6 +28,16 @@ struct forwarder {
     uint64_t wan_tx_stuck[MAX_INTERFACES];
     uint32_t wan_tx_cooldown[MAX_INTERFACES];
 };
+
+static inline uint32_t fwd_mid_to_wan_depth(const struct forwarder *fwd, int wan_dp)
+{
+    uint32_t d = 0;
+    if (!fwd || wan_dp < 0)
+        return 0;
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+        d += ne_ring_count(&fwd->mid_to_wan[wan_dp][w]);
+    return d;
+}
 
 void forwarder_pin_cpu(void);
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg);

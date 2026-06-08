@@ -169,6 +169,11 @@ int ne_ring_init(struct ne_ring *r, uint32_t cap)
         return -1;
     r->cap = cap;
     r->mask = cap - 1;
+    if (pthread_spin_init(&r->push_lock, PTHREAD_PROCESS_PRIVATE) != 0) {
+        free(r->buf);
+        memset(r, 0, sizeof(*r));
+        return -1;
+    }
     return 0;
 }
 
@@ -176,18 +181,28 @@ void ne_ring_destroy(struct ne_ring *r)
 {
     if (!r)
         return;
+    pthread_spin_destroy(&r->push_lock);
     free(r->buf);
     memset(r, 0, sizeof(*r));
 }
 
 int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt)
 {
-    uint32_t head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
-    uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
-    if ((uint32_t)(head - tail) >= r->cap)
+    uint32_t head, tail;
+
+    if (!r || !pkt)
         return -1;
+
+    pthread_spin_lock(&r->push_lock);
+    head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
+    tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+    if ((uint32_t)(head - tail) >= r->cap) {
+        pthread_spin_unlock(&r->push_lock);
+        return -1;
+    }
     r->buf[head & r->mask] = *pkt;
     __atomic_store_n(&r->head, head + 1, __ATOMIC_RELEASE);
+    pthread_spin_unlock(&r->push_lock);
     return 0;
 }
 

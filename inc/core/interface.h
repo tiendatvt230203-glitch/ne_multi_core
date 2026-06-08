@@ -78,6 +78,7 @@ struct ne_ring {
     uint32_t mask;
     __attribute__((aligned(64))) volatile uint32_t head;
     __attribute__((aligned(64))) volatile uint32_t tail;
+    pthread_spinlock_t push_lock; /* mid_to_wan/mid_to_local: 2 crypto workers push */
 };
 
 struct ne_pool {

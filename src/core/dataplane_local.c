@@ -17,15 +17,17 @@
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
+    int wi = dp_crypto_current_worker_idx();
+
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
-    return dp_ring_push(fwd, &fwd->mid_to_wan[wan_dp], job);
+    return dp_ring_push(fwd, &fwd->mid_to_wan[wan_dp][wi], job);
 }
 
 static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
                              uint32_t l1, const uint8_t *f2, uint32_t l2, int wan_dp)
 {
-    struct ne_ring *tx = &fwd->mid_to_wan[wan_dp];
+    struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
     if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap)
         return -1;
     if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)

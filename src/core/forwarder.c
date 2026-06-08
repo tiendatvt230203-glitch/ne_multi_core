@@ -61,8 +61,10 @@ static void *local_core_thread(void *arg)
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
         for (int li = 0; li < fwd->local_count; li++) {
-            int tx = ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
-            dbg_perf_local_tx(tx);
+            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+                int tx = ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li][w], li);
+                dbg_perf_local_tx(tx);
+            }
         }
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
@@ -101,16 +103,18 @@ static void *wan_core_thread(void *arg)
                 continue;
             if (fwd->wan_tx_cooldown[wi] > 0)
                 fwd->wan_tx_cooldown[wi]--;
-            uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
+            uint32_t before = fwd_mid_to_wan_depth(fwd, wi);
             uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
-            int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
+            int sent = 0;
+            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+                sent += ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi][w], wi);
             dbg_perf_wan_tx(sent);
             if (sent > 0) {
                 fwd->wan_tx_stuck[wi] = 0;
             } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
                 dbg_perf_wan_tx_stuck();
                 uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
-                if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
+                if (before >= NE_RING * (uint32_t)NE_CRYPTO_WORKERS && stuck >= 1024) {
                     (void)fwd_wan_flush_queue(fwd, wi);
                     fwd->wan_tx_cooldown[wi] = 65535;
                     fwd->wan_tx_stuck[wi] = 0;
@@ -207,7 +211,6 @@ static void *crypto_worker_thread(void *arg)
                 continue;
             }
             crypto_worker_tick(fwd, 1);
-            dbg_perf_tick(fwd);
         }
 
         if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
@@ -227,6 +230,9 @@ static void *crypto_worker_thread(void *arg)
         }
         if (is_primary)
             pthread_mutex_unlock(&runtime_lock);
+
+        if (is_primary)
+            dbg_perf_tick(fwd);
 
         if (!did_work)
             dbg_perf_mid_idle(ctx->worker_idx);
@@ -298,15 +304,19 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         }
     }
     for (int i = 0; i < fwd->local_count; i++) {
-        if (ne_ring_init(&fwd->mid_to_local[i], NE_RING) != 0) {
-            forwarder_cleanup(fwd);
-            return -1;
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+            if (ne_ring_init(&fwd->mid_to_local[i][w], NE_RING) != 0) {
+                forwarder_cleanup(fwd);
+                return -1;
+            }
         }
     }
     for (int i = 0; i < fwd->wan_count; i++) {
-        if (ne_ring_init(&fwd->mid_to_wan[i], NE_RING) != 0) {
-            forwarder_cleanup(fwd);
-            return -1;
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+            if (ne_ring_init(&fwd->mid_to_wan[i][w], NE_RING) != 0) {
+                forwarder_cleanup(fwd);
+                return -1;
+            }
         }
     }
 
@@ -325,10 +335,14 @@ void forwarder_cleanup(struct forwarder *fwd)
         ne_ring_destroy(&fwd->local_to_mid[w]);
         ne_ring_destroy(&fwd->wan_to_mid[w]);
     }
-    for (int i = 0; i < MAX_INTERFACES; i++)
-        ne_ring_destroy(&fwd->mid_to_wan[i]);
-    for (int i = 0; i < MAX_INTERFACES; i++)
-        ne_ring_destroy(&fwd->mid_to_local[i]);
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+            ne_ring_destroy(&fwd->mid_to_wan[i][w]);
+    }
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+            ne_ring_destroy(&fwd->mid_to_local[i][w]);
+    }
     fwd_crypto_cleanup_all_profile_slots();
     ne_pair_close(&fwd->pair);
 }

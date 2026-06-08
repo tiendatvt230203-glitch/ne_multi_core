@@ -8,7 +8,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DBG_LOG_DEFAULT "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log"
+#define DBG_LOG_DEFAULT "/tmp/ne-debug-dfdcf7.log"
 #define DBG_SESSION     "dfdcf7"
 
 static int perf_on = -1;
@@ -237,9 +237,11 @@ void dbg_perf_tick(struct forwarder *fwd)
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         w2m0 += ne_ring_count(&fwd->wan_to_mid[w]);
     for (int wi = 0; wi < fwd->wan_count; wi++)
-        m2w += ne_ring_count(&fwd->mid_to_wan[wi]);
-    for (int li = 0; li < fwd->local_count; li++)
-        m2l += ne_ring_count(&fwd->mid_to_local[li]);
+        m2w += fwd_mid_to_wan_depth(fwd, wi);
+    for (int li = 0; li < fwd->local_count; li++) {
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+            m2l += ne_ring_count(&fwd->mid_to_local[li][w]);
+    }
 
     loc_rx_pps = loc_rx * 1000 / dt;
     wan_tx_pps = wan_tx * 1000 / dt;
