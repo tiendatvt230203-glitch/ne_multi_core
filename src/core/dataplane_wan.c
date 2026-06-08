@@ -13,6 +13,8 @@
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
 #include "../../inc/core/crypto_trace.h"
+#include "../../inc/core/debug_perf.h"
+#include "../../inc/core/crypto_route.h"
 
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
@@ -266,6 +268,9 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (dec != 0)
             goto drop;
         pkt = ne_packet_data(&fwd->pair, job.addr);
+        dbg_perf_mid_wan(dp_crypto_current_worker_idx(), 1, 0);
+    } else {
+        dbg_perf_mid_wan(dp_crypto_current_worker_idx(), 0, 1);
     }
 
     li = pick_local(fwd, pkt, job.len);

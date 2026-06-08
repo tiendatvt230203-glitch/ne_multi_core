@@ -10,6 +10,7 @@
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_trace.h"
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/debug_perf.h"
 #include "../../inc/crypto/crypto_layer2.h"
 
 #include <string.h>
@@ -193,6 +194,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {
+        dbg_perf_mid_local(dp_crypto_current_worker_idx(), 1, 0);
         (void)push_to_wan(fwd, &job, wan_dp);
         return;
     }
@@ -212,8 +214,11 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                          src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
     if (enc < 0)
         goto drop;
-    if (enc > 0)
+    if (enc > 0) {
+        dbg_perf_mid_local(dp_crypto_current_worker_idx(), 0, 1);
         return;
+    }
+    dbg_perf_mid_local(dp_crypto_current_worker_idx(), 0, 1);
     trace_encrypt_flow(cp, pkt, job.len, src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
     (void)push_to_wan(fwd, &job, wan_dp);
     return;

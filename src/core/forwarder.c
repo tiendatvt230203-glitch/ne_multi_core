@@ -10,6 +10,7 @@
 #include "../../inc/core/interface.h"
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/core/crypto_trace.h"
+#include "../../inc/core/debug_perf.h"
 
 #include <net/if.h>
 #include <pthread.h>
@@ -59,20 +60,27 @@ static void *local_core_thread(void *arg)
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         ne_drain_cq_local(&fwd->pair);
         ne_refill_fq_local(&fwd->pair);
-        for (int li = 0; li < fwd->local_count; li++)
-            (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
+        for (int li = 0; li < fwd->local_count; li++) {
+            int tx = ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li], li);
+            dbg_perf_local_tx(tx);
+        }
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
+            dbg_perf_local_idle();
             sched_yield();
             continue;
         }
+        dbg_perf_local_recv_call();
+        dbg_perf_local_rx(rcvd);
 
         for (int i = 0; i < rcvd; i++) {
             int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
                                                  batch[i].len);
-            if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0)
+            if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
+                dbg_perf_local_push_fail();
                 ne_frame_free(&fwd->pair, batch[i].addr);
+            }
         }
         ne_recv_release_local(&fwd->pair);
     }
@@ -96,9 +104,11 @@ static void *wan_core_thread(void *arg)
             uint32_t before = ne_ring_count(&fwd->mid_to_wan[wi]);
             uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
             int sent = ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi], wi);
+            dbg_perf_wan_tx(sent);
             if (sent > 0) {
                 fwd->wan_tx_stuck[wi] = 0;
             } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
+                dbg_perf_wan_tx_stuck();
                 uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
                 if (before >= fwd->mid_to_wan[wi].cap && stuck >= 1024) {
                     (void)fwd_wan_flush_queue(fwd, wi);
@@ -110,9 +120,12 @@ static void *wan_core_thread(void *arg)
 
         int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
+            dbg_perf_wan_idle();
             sched_yield();
             continue;
         }
+        dbg_perf_wan_recv_call();
+        dbg_perf_wan_rx(rcvd);
 
         for (int i = 0; i < rcvd; i++) {
             int wi;
@@ -124,8 +137,10 @@ static void *wan_core_thread(void *arg)
             }
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
             wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
-            if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0)
+            if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
+                dbg_perf_wan_push_fail();
                 ne_frame_free(&fwd->pair, batch[i].addr);
+            }
         }
         ne_recv_release_wan(&fwd->pair);
     }
@@ -168,13 +183,17 @@ static void *crypto_worker_thread(void *arg)
                 if (!atomic_load_explicit(&running, memory_order_acquire))
                     break;
                 if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
+                    dbg_perf_mid_pop_wan();
                     dataplane_process_wan(fwd, job);
                     did_work = 1;
                 }
                 if (ne_ring_try_pop(&fwd->local_to_mid[ctx->worker_idx], &job) == 0) {
+                    dbg_perf_mid_pop_local();
                     dataplane_process_local(fwd, job);
                     did_work = 1;
                 }
+                if (!did_work)
+                    dbg_perf_mid_idle(ctx->worker_idx);
                 if (!did_work)
                     sched_yield();
                 continue;
@@ -188,13 +207,16 @@ static void *crypto_worker_thread(void *arg)
                 continue;
             }
             crypto_worker_tick(fwd, 1);
+            dbg_perf_tick(fwd);
         }
 
         if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
+            dbg_perf_mid_pop_wan();
             dataplane_process_wan(fwd, job);
             did_work = 1;
         }
         if (ne_ring_try_pop(&fwd->local_to_mid[ctx->worker_idx], &job) == 0) {
+            dbg_perf_mid_pop_local();
             dataplane_process_local(fwd, job);
             did_work = 1;
         }
@@ -206,6 +228,8 @@ static void *crypto_worker_thread(void *arg)
         if (is_primary)
             pthread_mutex_unlock(&runtime_lock);
 
+        if (!did_work)
+            dbg_perf_mid_idle(ctx->worker_idx);
         if (!did_work)
             sched_yield();
     }
