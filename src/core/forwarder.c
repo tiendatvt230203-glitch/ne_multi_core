@@ -33,6 +33,44 @@ void forwarder_pin_cpu(void)
     pin_cpu(NE_CPU_LOC);
 }
 
+#define IO_BURST_ROUNDS   8
+#define WAN_TX_BURST_MAX  64
+
+static void io_burst_refill_local(struct forwarder *fwd)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_refill_fq_local(&fwd->pair);
+}
+
+static void io_burst_refill_wan(struct forwarder *fwd)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_refill_fq_wan(&fwd->pair);
+}
+
+static void io_burst_drain_cq_local(struct forwarder *fwd)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_drain_cq_local(&fwd->pair);
+}
+
+static void io_burst_drain_cq_wan(struct forwarder *fwd)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_drain_cq_wan(&fwd->pair);
+}
+
+static void io_burst_tx_wan(struct forwarder *fwd, int wan_idx)
+{
+    for (int burst = 0; burst < WAN_TX_BURST_MAX; burst++) {
+        int sent = 0;
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+            sent += ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wan_idx][w], wan_idx);
+        if (sent <= 0)
+            break;
+    }
+}
+
 static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
                             const uint8_t src_mac[MAC_LEN],
                             const uint8_t dst_mac[MAC_LEN])
@@ -56,11 +94,16 @@ static void *local_core_thread(void *arg)
     pin_cpu(NE_CPU_LOC);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        ne_drain_cq_local(&fwd->pair);
-        ne_refill_fq_local(&fwd->pair);
+        io_burst_drain_cq_local(fwd);
+        io_burst_refill_local(fwd);
         for (int li = 0; li < fwd->local_count; li++) {
-            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-                (void)ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li][w], li);
+            for (int burst = 0; burst < WAN_TX_BURST_MAX; burst++) {
+                int sent = 0;
+                for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+                    sent += ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li][w], li);
+                if (sent <= 0)
+                    break;
+            }
         }
 
         int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
@@ -87,28 +130,14 @@ static void *wan_core_thread(void *arg)
     pin_cpu(NE_CPU_WAN);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        ne_drain_cq_wan(&fwd->pair);
-        ne_refill_fq_wan(&fwd->pair);
+        io_burst_drain_cq_wan(fwd);
+        io_burst_refill_wan(fwd);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
             if (fwd_wan_is_stopped(wi))
                 continue;
-            if (fwd->wan_tx_cooldown[wi] > 0)
-                fwd->wan_tx_cooldown[wi]--;
-            uint32_t before = fwd_mid_to_wan_depth(fwd, wi);
-            uint64_t no_free_before = fwd->pair.wans[wi].tx_no_free;
-            int sent = 0;
-            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-                sent += ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi][w], wi);
-            if (sent > 0) {
+            io_burst_tx_wan(fwd, wi);
+            if (fwd_mid_to_wan_depth(fwd, wi) == 0)
                 fwd->wan_tx_stuck[wi] = 0;
-            } else if (before > 0 && fwd->pair.wans[wi].tx_no_free != no_free_before) {
-                uint64_t stuck = __sync_add_and_fetch(&fwd->wan_tx_stuck[wi], 1);
-                if (before >= NE_RING * (uint32_t)NE_CRYPTO_WORKERS && stuck >= 1024) {
-                    (void)fwd_wan_flush_queue(fwd, wi);
-                    fwd->wan_tx_cooldown[wi] = 65535;
-                    fwd->wan_tx_stuck[wi] = 0;
-                }
-            }
         }
 
         int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
@@ -127,6 +156,10 @@ static void *wan_core_thread(void *arg)
             }
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
             wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
+            if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
+                ne_frame_free(&fwd->pair, batch[i].addr);
+                continue;
+            }
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
@@ -201,7 +234,7 @@ static void *crypto_worker_thread(void *arg)
             dataplane_process_local(fwd, job);
             did_work = 1;
         }
-        if (is_primary && ++gc_tick >= 8192) {
+        if (is_primary && ++gc_tick >= 256) {
             fwd_crypto_frag_gc_tick();
             gc_tick = 0;
         }

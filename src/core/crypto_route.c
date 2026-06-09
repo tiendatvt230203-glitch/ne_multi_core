@@ -9,8 +9,8 @@
 #include <stddef.h>
 
 static const uint8_t ne_crypto_cpus[NE_CRYPTO_WORKERS] = {
-    NE_CPU_MID,
-    NE_CPU_CRYPTO_AUX,
+    NE_CPU_MID1,
+    NE_CPU_MID2,
 };
 
 static __thread int tls_crypto_worker_idx;
@@ -30,7 +30,7 @@ int dp_crypto_current_worker_idx(void)
 uint8_t dp_crypto_worker_cpu(int worker_idx)
 {
     if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
-        return NE_CPU_MID;
+        return NE_CPU_MID1;
     return ne_crypto_cpus[worker_idx];
 }
 
@@ -86,11 +86,13 @@ int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_
         !fwd_crypto_has_l2_marker(pkt, len))
         return 0;
 
+    /* L2 crypto: must land on the worker that owns frag_table for this core_id.
+     * Fallback to worker 0 caused intermittent decrypt/reassembly hangs. */
     if (crypto_layer2_read_core_id(pkt, len, &core_id) != 0)
-        return 0;
+        return -1;
 
     wi = dp_crypto_worker_idx_for_cpu(core_id);
     if (wi < 0)
-        return 0;
+        return -1;
     return wi;
 }

@@ -381,6 +381,7 @@ void fwd_crypto_frag_gc_tick(void)
     for (int s = 0; s < MAX_PROFILES; s++) {
         if (!profile_flow_table_ready[s])
             continue;
+        flow_table_gc(&profile_flow_tables[s]);
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
             frag_table_gc(&profile_frag_l2[s][w]);
         frag_table_gc(&profile_frag_l3[s]);

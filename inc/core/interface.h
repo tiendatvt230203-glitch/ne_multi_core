@@ -10,10 +10,23 @@
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
-#define NE_CPU_LOC     0u
-#define NE_CPU_MID     3u
-#define NE_CPU_WAN     11u
-/* NE_CPU_CRYPTO_AUX / NE_CRYPTO_WORKERS: inc/core/crypto_route.h */
+
+/*
+ * Dataplane CPU map — 4 pinned threads:
+ *
+ *   NE_CPU_LOC    (0)   local I/O:     XDP RX local + TX return
+ *   NE_CPU_MID1   (3)   crypto mid 1:  worker[0] encrypt / decrypt / frag / bypass
+ *   NE_CPU_MID2   (4)   crypto mid 2:  worker[1] same as mid 1 (parallel)
+ *   NE_CPU_WAN    (11)  wan I/O:       XDP TX WAN + RX return
+ *
+ * Worker index 0 = mid 1 (CPU 3), worker index 1 = mid 2 (CPU 4).
+ * Wire core_id carries CPU 3 or 4 for decrypt routing (crypto_route.c).
+ */
+#define NE_CPU_LOC        0u
+#define NE_CPU_MID1       3u
+#define NE_CPU_MID2       4u
+#define NE_CPU_WAN        11u
+#define NE_CRYPTO_WORKERS 2u
 
 struct bpf_object;
 
