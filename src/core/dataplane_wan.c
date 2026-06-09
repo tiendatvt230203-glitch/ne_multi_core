@@ -12,9 +12,6 @@
 
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
-#include "../../inc/core/crypto_trace.h"
-#include "../../inc/core/debug_perf.h"
-#include "../../inc/core/crypto_route.h"
 
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
@@ -154,20 +151,6 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     return 0;
 }
 
-static void trace_decrypt_flow(uint8_t *pkt, uint32_t len, const char *layer,
-                               uint8_t wire_core_id)
-{
-    uint32_t src_ip = 0, dst_ip = 0;
-    uint16_t src_port = 0, dst_port = 0;
-    uint8_t proto = 0;
-    uint8_t handler_core = crypto_layer2_worker_core_id();
-
-    if (dp_parse_flow(pkt, len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) != 0)
-        return;
-    crypto_trace_decrypt(layer, src_ip, dst_ip, src_port, dst_port, proto,
-                         wire_core_id, handler_core);
-}
-
 static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 {
     uint8_t scratch[8192];
@@ -177,16 +160,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     uint8_t fidx = 0;
     uint8_t pol = 0;
     int pending = 0;
-    int had_l2 = 0;
-    uint8_t wire_core_id = 0;
     struct crypto_dispatch_ctx dctx;
-
-    if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx) ||
-        fwd_crypto_has_l2_marker(pkt, len)) {
-        had_l2 = 1;
-        if (crypto_layer2_read_core_id(pkt, len, &wire_core_id) != 0)
-            wire_core_id = dp_crypto_worker_cpu(dp_crypto_current_worker_idx());
-    }
 
     if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
         if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
@@ -231,16 +205,6 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     if (pending)
         return 1;
 
-    if (had_l2) {
-        trace_decrypt_flow(pkt, len, "L2", wire_core_id);
-    } else if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) == 0) {
-        uint8_t hc = dp_crypto_worker_cpu(dp_crypto_current_worker_idx());
-        trace_decrypt_flow(pkt, len, "L3", hc);
-    } else if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, len, &pol) == 0) {
-        uint8_t hc = dp_crypto_worker_cpu(dp_crypto_current_worker_idx());
-        trace_decrypt_flow(pkt, len, "L4", hc);
-    }
-
     job->len = len;
     return 0;
 }
@@ -268,9 +232,6 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (dec != 0)
             goto drop;
         pkt = ne_packet_data(&fwd->pair, job.addr);
-        dbg_perf_mid_wan(dp_crypto_current_worker_idx(), 1, 0);
-    } else {
-        dbg_perf_mid_wan(dp_crypto_current_worker_idx(), 0, 1);
     }
 
     li = pick_local(fwd, pkt, job.len);

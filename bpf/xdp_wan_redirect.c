@@ -19,8 +19,10 @@ struct {
     __type(value, __u16);
 } wan_config_map SEC(".maps");
 
+#define IPPROTO_ICMP_VAL 1
 #define IPPROTO_TCP_VAL 6
 #define IPPROTO_UDP_VAL 17
+#define IPPROTO_OSPF_VAL 89
 #define IPPROTO_CUSTOM_VAL 99
 
 SEC("xdp")
@@ -44,7 +46,9 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 
-        if (ip->protocol == IPPROTO_TCP_VAL || ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_CUSTOM_VAL) {
+        if (ip->protocol == IPPROTO_ICMP_VAL || ip->protocol == IPPROTO_TCP_VAL ||
+            ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_OSPF_VAL ||
+            ip->protocol == IPPROTO_CUSTOM_VAL) {
             goto redirect;
         }
 
