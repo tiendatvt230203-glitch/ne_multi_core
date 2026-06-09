@@ -9,8 +9,6 @@
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
-#include "../../inc/core/agent_debug.h"
-#include "../../inc/crypto/crypto_layer2.h"
 
 #include <net/if.h>
 #include <pthread.h>
@@ -159,9 +157,6 @@ static void *wan_core_thread(void *arg)
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
             wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
             if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
-                // #region agent log
-                ne_dbg_inc("X");
-                // #endregion
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 continue;
             }
@@ -243,8 +238,6 @@ static void *crypto_worker_thread(void *arg)
         }
         if (++gc_tick >= 2048) {
             fwd_crypto_frag_gc_worker_tick(ctx->worker_idx);
-            if (is_primary)
-                ne_agent_debug_flush_tick(gc_tick);
             gc_tick = 0;
         }
         if (is_primary)

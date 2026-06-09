@@ -9,8 +9,6 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
-#include "../../inc/crypto/packet_crypto.h"
-#include "../../inc/core/agent_debug.h"
 
 #include <string.h>
 
@@ -83,14 +81,6 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
         if (n < 0)
             return -1;
         job->len = (uint32_t)n;
-        if (cp->action == POLICY_ACTION_ENCRYPT_L2 && cp->crypto_mode == CRYPTO_MODE_PQC) {
-            uint8_t core_id = 0;
-            (void)crypto_layer2_read_core_id(pkt, job->len, &core_id);
-            // #region agent log
-            (void)core_id;
-            ne_dbg_inc("A");
-            // #endregion
-        }
         return 0;
     }
 
