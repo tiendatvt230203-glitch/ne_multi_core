@@ -246,16 +246,18 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             policy_index_by_action_id[cp->action][(uint8_t)cp->id] = i;
 
         int reused = 0;
-        if (cp->crypto_mode != CRYPTO_MODE_PQC && cp->id >= 0 && cp->id <= 255) {
+        if (cp->id >= 0 && cp->id <= 255) {
             int old_i = old_policy_index_by_action_id[cp->action][(uint8_t)cp->id];
             if (old_i >= 0 && old_i < old_active_policy_count && old_policy_crypto_ready[old_i]) {
                 const struct crypto_policy *old_cp = &old_active_policies[old_i];
                 if (old_cp->crypto_mode == cp->crypto_mode &&
-                    old_cp->aes_bits == cp->aes_bits &&
-                    memcmp(old_cp->key, cp->key, AES_KEY_LEN) == 0) {
-                    policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
-                    policy_crypto_ready[i] = 1;
-                    reused = 1;
+                    old_cp->aes_bits == cp->aes_bits) {
+                    if (cp->crypto_mode == CRYPTO_MODE_PQC ||
+                        memcmp(old_cp->key, cp->key, AES_KEY_LEN) == 0) {
+                        policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
+                        policy_crypto_ready[i] = 1;
+                        reused = 1;
+                    }
                 }
             }
         }
@@ -266,7 +268,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             memset(&policy_crypto_ctx[i], 0, sizeof(policy_crypto_ctx[i]));
             policy_crypto_ctx[i].initialized = true;
             policy_crypto_ctx[i].crypto_mode = CRYPTO_MODE_PQC;
-            policy_crypto_ctx[i].policy_id = cp->id;
+            policy_crypto_ctx[i].policy_id = cp->db_id;
             policy_crypto_ready[i] = 1;
             continue;
         }
@@ -297,7 +299,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             }
             if (cp->crypto_mode == CRYPTO_MODE_PQC && policy_crypto_ready[pi]) {
                 policy_crypto_ctx[pi].profile_id = p->id;
-                policy_crypto_ctx[pi].policy_id = cp->id;
+                policy_crypto_ctx[pi].policy_id = cp->db_id;
             }
         }
     }

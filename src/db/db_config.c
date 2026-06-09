@@ -9,6 +9,7 @@
 #include <libpq-fe.h>
 #include <strings.h>
 #include <openssl/sha.h>
+#include "../inc/crypto/pqc_handshake.h"
 
 static int str_is_any(const char *v) {
     if (!v) return 1;
@@ -307,6 +308,28 @@ static int find_wan_index_by_ifname(const struct app_config *cfg, const char *if
     return -1;
 }
 
+/* ne_wan row có dst_ip = WAN dùng PQC handshake. */
+static int db_pick_handshake_wan(const struct app_config *cfg,
+                                 char peer_ip[64], char *wan_ifname, size_t wan_sz)
+{
+    if (!cfg || !peer_ip || !wan_ifname || wan_sz == 0)
+        return -1;
+    peer_ip[0] = '\0';
+    wan_ifname[0] = '\0';
+    for (int i = 0; i < cfg->wan_count; i++) {
+        const struct wan_config *w = &cfg->wans[i];
+        if (w->dst_ip == 0)
+            continue;
+        struct in_addr addr;
+        addr.s_addr = w->dst_ip;
+        inet_ntop(AF_INET, &addr, peer_ip, 64);
+        strncpy(wan_ifname, w->ifname, wan_sz - 1);
+        wan_ifname[wan_sz - 1] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
 static void profile_append_wans_from_rows(struct app_config *cfg,
                                             struct profile_config *p,
                                             PGresult *res) {
@@ -323,8 +346,6 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
         const char *ifname = PQgetvalue(res, r, ifn_col);
         int wi = find_wan_index_by_ifname(cfg, ifname);
         int weight = 1;
-        if (wi >= 0 && wan_is_handshake_only(&cfg->wans[wi]))
-            continue;
         if (wi >= 0) {
             if (wcol >= 0 && !PQgetisnull(res, r, wcol)) {
                 const char *wstr = PQgetvalue(res, r, wcol);
@@ -455,18 +476,81 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         } else {
             (void)ne_parse_method(method_txt, method_null, &cp_base.crypto_mode, &cp_base.aes_bits);
             if (cp_base.crypto_mode == CRYPTO_MODE_PQC) {
-                cp_base.aes_bits = 256;
+                    char peer_ip[64];
+                    char wan_ifname[IF_NAMESIZE];
+                    if (db_pick_handshake_wan(cfg, peer_ip, wan_ifname, sizeof(wan_ifname)) != 0) {
+                        fprintf(stderr,
+                                "[DB-PQC] ERROR: Policy %d — no ne_wan row with dst_ip for handshake\n",
+                                db_policy_id);
+                    }
 
-                int wire_id = ne_wire_id_for_encrypt_key(
-                    key_wire_map, NE_KEY_WIRE_MAP_MAX, wire_id_used,
-                    NULL, 0, db_policy_id
-                );
-                if (wire_id < 0) {
-                    fprintf(stderr, "[DB CRYPTO] no free wire policy id (max 255 policies)\n");
-                    PQclear(res);
-                    return -1;
-                }
-                cp_base.id = wire_id;
+                    char policy_id_str[32];
+                    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
+                    const char *pqc_params[1] = { policy_id_str };
+                    PGresult *peer_res = PQexecParams(conn,
+                        "SELECT local_identity_fingerprint, peer_pub, peer_fingerprint, is_initiator "
+                        "FROM pqc_identities WHERE policy_id = $1",
+                        1, NULL, pqc_params, NULL, NULL, 0);
+
+                    if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
+                        const char *local_fg = PQgetvalue(peer_res, 0, 0);
+                        const char *peer_pub = PQgetvalue(peer_res, 0, 1);
+                        const char *peer_fg = (PQnfields(peer_res) > 2) ? PQgetvalue(peer_res, 0, 2) : NULL;
+                        const char *is_init_str = (PQnfields(peer_res) > 3) ? PQgetvalue(peer_res, 0, 3) : NULL;
+                        bool is_init = true;
+                        if (is_init_str) {
+                            is_init = (is_init_str[0] == 't' || is_init_str[0] == '1' || is_init_str[0] == 'T');
+                        }
+
+                        int role_mode = PQC_ROLE_RESPONDER;
+                        if (PQC_USE_DYNAMIC_ROLE) {
+                            role_mode = PQC_ROLE_DYNAMIC;
+                        } else {
+                            role_mode = is_init ? PQC_ROLE_INITIATOR : PQC_ROLE_RESPONDER;
+                        }
+
+                        bool valid = true;
+                        if (!local_fg || strlen(local_fg) == 0) {
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d missing local_identity_fingerprint\n", db_policy_id);
+                            valid = false;
+                        }
+                        if (!peer_pub || strlen(peer_pub) == 0) {
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d missing peer_pub\n", db_policy_id);
+                            valid = false;
+                        }
+
+                        char *found_priv = NULL;
+                        char *found_pub = NULL;
+                        if (valid) {
+                            sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
+                            if (!found_priv || !found_pub) {
+                                fprintf(stderr, "[DB-PQC] ERROR: Policy %d keys not in registry [%s]\n",
+                                        db_policy_id, local_fg);
+                                valid = false;
+                            }
+                        }
+                        if (valid && wan_ifname[0] != '\0' && peer_ip[0] != '\0') {
+                            int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
+                            if (wire_id < 0) {
+                                fprintf(stderr, "[DB CRYPTO] no free wire policy id for PQC policy %d\n",
+                                        db_policy_id);
+                                PQclear(peer_res);
+                                PQclear(res);
+                                return -1;
+                            }
+                            cp_base.id = wire_id;
+                            cp_base.aes_bits = 256;
+                            memset(cp_base.key, 0, sizeof(cp_base.key));
+                            sig_pqc_bind_policy(db_policy_id, p->id, role_mode, peer_ip,
+                                                local_fg, peer_fg, wan_ifname,
+                                                found_priv, found_pub, peer_pub);
+                        } else if (valid) {
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d missing handshake WAN/IP\n", db_policy_id);
+                        }
+                    } else {
+                        fprintf(stderr, "[DB-PQC] ERROR: No pqc_identities for policy %d\n", db_policy_id);
+                    }
+                    PQclear(peer_res);
             }
             else {
                 if (cp_base.aes_bits != 256)
@@ -553,26 +637,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         }
     }
     PQclear(res);
-
-    {
-        PGresult *id_res = PQexecParams(conn,
-            "SELECT peer_pub, peer_fingerprint, is_initiator "
-            "FROM pqc_identities WHERE profile_id = $1",
-            1, NULL, params, NULL, NULL, 0);
-        if (PQresultStatus(id_res) == PGRES_TUPLES_OK && PQntuples(id_res) > 0) {
-            const char *peer_pub = PQgetvalue(id_res, 0, 0);
-            const char *peer_fp = PQgetvalue(id_res, 0, 1);
-            const char *initiator = PQgetvalue(id_res, 0, 2);
-            p->has_pqc_identity = 1;
-            p->pqc_is_initiator = (initiator && (initiator[0] == 't' || initiator[0] == 'T')) ? 1 : 0;
-            if (peer_fp && peer_fp[0] != '\0')
-                strncpy(p->peer_fingerprint, peer_fp, sizeof(p->peer_fingerprint) - 1);
-            if (peer_pub && peer_pub[0] != '\0')
-                strncpy(p->pqc_peer_pub, peer_pub, sizeof(p->pqc_peer_pub) - 1);
-            fprintf(stderr, "[DB] pqc_identities loaded for profile %d\n", p->id);
-        }
-        PQclear(id_res);
-    }
 
     return 0;
 }

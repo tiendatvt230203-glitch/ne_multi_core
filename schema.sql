@@ -112,8 +112,10 @@ CREATE TABLE ne_wan (
     updated_at      TIMESTAMP       NULL,
     updated_by      VARCHAR(100)    NULL
 );
+
 CREATE TABLE IF NOT EXISTS pqc_identities (
-    profile_id INT PRIMARY KEY REFERENCES ne_profiles(id) ON DELETE CASCADE,
+    policy_id INT PRIMARY KEY REFERENCES ne_policies(id) ON DELETE CASCADE,
+    local_identity_fingerprint VARCHAR(16) NOT NULL,
     peer_pub TEXT NOT NULL,
     peer_fingerprint VARCHAR(16),
     is_initiator BOOLEAN NOT NULL DEFAULT TRUE

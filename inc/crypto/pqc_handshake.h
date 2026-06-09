@@ -20,11 +20,20 @@ struct pqc_hs_msg {
     uint32_t magic;
     uint8_t  msg_type;
     uint32_t session_id;
+    uint32_t policy_id;
     uint16_t sig_len;  // Length of the ML-DSA signature
     uint16_t data_len; // Length of the KEM payload
     uint8_t  payload[0]; // data[data_len] followed by signature[sig_len]
 };
 #pragma pack(pop)
+
+#define PQC_USE_DYNAMIC_ROLE 1
+
+typedef enum {
+    PQC_ROLE_RESPONDER = 0,
+    PQC_ROLE_INITIATOR = 1,
+    PQC_ROLE_DYNAMIC = 2
+} pqc_role_mode_t;
 
 /**
  * Initializes the underlying Handshake system.
@@ -50,27 +59,50 @@ bool sig_pqc_is_key_ready(void);
 int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]);
 
 /**
- * Sets the peer's identity public key (loaded from global DB).
+ * Sets the global identity for this system (RAM-only).
  */
-void sig_pqc_set_peer_identity(const char *pub, const char *peer_fingerprint);
+void sig_pqc_set_global_identity(const char *priv, const char *pub);
+
+// /**
+//  * Sets the peer's identity public key (loaded from global DB).
+//  */
+// void sig_pqc_set_peer_identity(const char *pub, const char *peer_fingerprint);
 
 /**
  * Adds an identity keypair to the RAM Registry.
  */
 void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const char *pub);
 
+/**
+ * Diversifies the master key of a profile for a specific policy using HMAC-SHA256.
+ * @param profile_id The ID of the profile.
+ * @param policy_id The ID of the policy to diversify.
+ * @param out_policy_key 32-byte array to store the derived policy-specific key.
+ * @return 0 on success, -1 if the master key is not ready.
+ */
 int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key);
 
-/**
- * Configures the handshake for a specific profile.
- */
-void sig_pqc_set_handshake_config(int profile_id, bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname);
+// /**
+//  * Configures the handshake for a specific profile.
+//  */
+// void sig_pqc_set_handshake_config(int profile_id, bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname);
 bool sig_pqc_has_identity(const char *fingerprint);
-void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub, const char *peer_fingerprint);
-int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub);
+// void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub, const char *peer_fingerprint);
+// int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub);
+void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
+                         const char *peer_ip, const char *local_fg,
+                         const char *peer_fg, const char *wan_ifname,
+                         const char *local_priv, const char *local_pub, const char *peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);
 
+/**
+ * Feed a received PQC handshake packet (UDP payload only) into the handshake module.
+ * Called by the forwarder WAN RX thread when it detects a UDP packet to port PQC_HS_PORT.
+ * @param udp_payload Pointer to the UDP payload (after UDP header).
+ * @param payload_len Length of the UDP payload.
+ */
 void sig_pqc_feed_rx_packet(const uint8_t *udp_payload, int payload_len);
 
 #endif
+

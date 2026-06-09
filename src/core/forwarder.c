@@ -8,6 +8,7 @@
 #include "../../inc/core/local_hwaddr.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
+#include "../../inc/crypto/pqc_l2_handshake.h"
 #include "../../inc/crypto/crypto_layer2.h"
 
 #include <net/if.h>
@@ -293,7 +294,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd_crypto_ensure_profile_slots(cfg) != 0)
         return -1;
 
-    /* PQC wire path uses HARDCODED_KEY in crypto_pqc_layer.h; HS optional for later. */
+    pqc_handshake_start_all_profiles(cfg);
+
     if (ne_pair_open(&fwd->pair, cfg) != 0)
         return -1;
     if (forwarder_should_stop()) {

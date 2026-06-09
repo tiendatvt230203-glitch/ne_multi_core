@@ -3,6 +3,7 @@
 
 #include "packet_crypto.h"
 #include "traffic_crypto.h"
+#include "pqc_handshake.h"
 #include "scrypt.h"
 
 static inline int crypto_mode_is_pqc(void) {
@@ -20,23 +21,18 @@ typedef struct crypto_pqc_sess {
     int aad_len;
 } crypto_pqc_sess_t;
 
-/* NE debug path: fixed PQC key/AAD (both ends must use the same values). */
-static const byte HARDCODED_KEY[] = {
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20
-};
-
 static const byte HARDCODED_AAD[] = {
     0x54, 0x45, 0x53, 0x54, 0x5f, 0x41, 0x41, 0x44
 };
 
 static inline int crypto_pqc_sess_load(struct packet_crypto_ctx *ctx, crypto_pqc_sess_t *sess) {
-    (void)ctx;
-    if (!sess)
+    if (!ctx || !sess)
         return -1;
-    sess->key = HARDCODED_KEY;
+    packet_crypto_update_keys(ctx);
+    const byte *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+    if (!key)
+        return -1;
+    sess->key = key;
     sess->aad = HARDCODED_AAD;
     sess->aad_len = 12;
     return 0;
