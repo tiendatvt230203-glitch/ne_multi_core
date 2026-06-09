@@ -19,7 +19,7 @@ void fwd_crypto_maybe_expire_prev_grace(void);
 void fwd_crypto_clear_grace(void);
 void fwd_crypto_sync_flow_table_windows(struct forwarder *fwd);
 void fwd_crypto_cleanup_stale_profile_slots(const struct app_config *cfg);
-void fwd_crypto_frag_gc_tick(void);
+void fwd_crypto_frag_gc_worker_tick(int worker_idx);
 
 int fwd_crypto_profile_slot_for_id(int profile_id);
 int fwd_crypto_flow_table_ready(int slot);

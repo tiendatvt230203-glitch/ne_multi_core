@@ -467,10 +467,18 @@ void flow_table_add_bytes(struct flow_table *ft,
     pthread_mutex_unlock(&ft->locks[idx_ip]);
 }
 
-void flow_table_gc(struct flow_table *ft) {
-    uint64_t now = get_time_sec();
+void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets)
+{
+    uint64_t now;
+    int start, i, n;
 
-    for (int i = 0; i < FLOW_TABLE_SIZE; i++) {
+    if (!ft || !bucket_cursor || buckets <= 0)
+        return;
+
+    now = get_time_sec();
+    start = *bucket_cursor;
+    for (n = 0; n < buckets; n++) {
+        i = (start + n) % FLOW_TABLE_SIZE;
         pthread_mutex_lock(&ft->locks[i]);
 
         struct flow_entry **pp = &ft->buckets[i];
@@ -486,4 +494,12 @@ void flow_table_gc(struct flow_table *ft) {
 
         pthread_mutex_unlock(&ft->locks[i]);
     }
+    *bucket_cursor = (start + buckets) % FLOW_TABLE_SIZE;
+}
+
+void flow_table_gc(struct flow_table *ft)
+{
+    int cursor = 0;
+
+    flow_table_gc_slice(ft, &cursor, FLOW_TABLE_SIZE);
 }

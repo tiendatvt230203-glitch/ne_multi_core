@@ -160,6 +160,9 @@ static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
 
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC)
         return;
+    /* Key already in ctx (post-handshake); avoid g_key_mutex on every packet. */
+    if (key_has_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
+        return;
     if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
         return;
     if (memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) == 0)
@@ -172,6 +175,19 @@ static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
 
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
     check_and_update_pqc_key(ctx);
+}
+
+void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
+{
+    uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
+
+    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC)
+        return;
+    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
+        return;
+    memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
+    memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
+    memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
 }
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot) {

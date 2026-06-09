@@ -9,6 +9,7 @@
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
+#include "../../inc/core/agent_debug.h"
 #include "../../inc/crypto/crypto_layer2.h"
 
 #include <net/if.h>
@@ -158,6 +159,9 @@ static void *wan_core_thread(void *arg)
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
             wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
             if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
+                // #region agent log
+                ne_dbg_inc("X");
+                // #endregion
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 continue;
             }
@@ -191,6 +195,7 @@ static void *crypto_worker_thread(void *arg)
     struct forwarder *fwd = ctx->fwd;
     struct ne_packet job;
     uint32_t gc_tick = 0;
+    uint32_t maint_tick = 0;
     int is_primary = (ctx->worker_idx == 0);
 
     pin_cpu(ctx->cpu_id);
@@ -224,7 +229,8 @@ static void *crypto_worker_thread(void *arg)
                 pthread_mutex_unlock(&runtime_lock);
                 continue;
             }
-            crypto_worker_tick(fwd, 1);
+            if ((++maint_tick & 1023u) == 0)
+                crypto_worker_tick(fwd, 1);
         }
 
         if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
@@ -235,8 +241,10 @@ static void *crypto_worker_thread(void *arg)
             dataplane_process_local(fwd, job);
             did_work = 1;
         }
-        if (is_primary && ++gc_tick >= 256) {
-            fwd_crypto_frag_gc_tick();
+        if (++gc_tick >= 2048) {
+            fwd_crypto_frag_gc_worker_tick(ctx->worker_idx);
+            if (is_primary)
+                ne_agent_debug_flush_tick(gc_tick);
             gc_tick = 0;
         }
         if (is_primary)

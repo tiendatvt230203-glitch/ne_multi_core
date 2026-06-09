@@ -25,13 +25,12 @@ static uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-void frag_table_gc(struct frag_table *ft) {
-    uint64_t now = get_time_ns();
+void frag_table_gc_at(struct frag_table *ft, uint64_t now)
+{
     for (int i = 0; i < FRAG_TABLE_SIZE; i++) {
         if ((ft->entries[i].got_first || ft->entries[i].got_second) &&
-            (now - ft->entries[i].timestamp_ns) > FRAG_TIMEOUT_NS) {
+            (now - ft->entries[i].timestamp_ns) > FRAG_TIMEOUT_NS)
             memset(&ft->entries[i], 0, sizeof(ft->entries[i]));
-        }
     }
 }
 
@@ -313,28 +312,36 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
 int frag_is_fragment_l2(const struct app_config *cfg,
                         const uint8_t *pkt_data, uint32_t pkt_len,
                         uint16_t *pkt_id, uint8_t *frag_index) {
-    if (!cfg)
-        return 0;
-    if (pkt_len < (uint32_t)(ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN +
-                             4 + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
+    int ns, tag_off;
+    uint16_t fake_ipv4;
+    uint16_t et;
+    uint8_t wire_pol;
+
+    if (!cfg || !pkt_id || !frag_index)
         return 0;
 
-    uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
+    ns = PACKET_CRYPTO_NONCE_BYTES;
+    tag_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
+    if (pkt_len < (uint32_t)(tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
+        return 0;
+
+    fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
     if (!fake_ipv4)
         return 0;
-    uint16_t et = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
+    et = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
     if (et != fake_ipv4)
         return 0;
 
+    /* Non-frag L2 crypto hits this on every WAN packet — bail before policy scan. */
+    if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
+        return 0;
+
+    wire_pol = pkt_data[CRYPTO_L2_POLICY_OFF];
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L2)
             continue;
-        int ns = PACKET_CRYPTO_NONCE_BYTES;
-        int tag_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
-        if (tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE > (int)pkt_len)
-            continue;
-        if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
+        if ((uint8_t)cp->id != wire_pol)
             continue;
         frag_read_hdr(pkt_data + tag_off + 1, pkt_id, frag_index);
         if (*frag_index > 1)

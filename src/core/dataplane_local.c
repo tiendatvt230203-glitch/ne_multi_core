@@ -10,26 +10,9 @@
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
 #include "../../inc/crypto/packet_crypto.h"
+#include "../../inc/core/agent_debug.h"
 
-#include <stdio.h>
 #include <string.h>
-#include <time.h>
-
-// #region agent log
-static void ne_dbg_log(const char *hypothesis_id, const char *location,
-                       const char *message, int data_a, int data_b, int data_c)
-{
-    FILE *f = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
-    if (!f)
-        return;
-    fprintf(f,
-            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-            "\"message\":\"%s\",\"data\":{\"a\":%d,\"b\":%d,\"c\":%d},\"timestamp\":%lld}\n",
-            hypothesis_id, location, message, data_a, data_b, data_c,
-            (long long)time(NULL) * 1000LL);
-    fclose(f);
-}
-// #endregion
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
@@ -104,9 +87,8 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
             uint8_t core_id = 0;
             (void)crypto_layer2_read_core_id(pkt, job->len, &core_id);
             // #region agent log
-            ne_dbg_log("A", "dataplane_local.c:encrypt_to_wan", "pqc_l2_encrypt",
-                       dp_crypto_current_worker_idx(), (int)core_id,
-                       (int)pkt[CRYPTO_L2_POLICY_OFF]);
+            (void)core_id;
+            ne_dbg_inc("A");
             // #endregion
         }
         return 0;

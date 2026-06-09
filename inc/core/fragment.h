@@ -37,7 +37,7 @@ uint16_t frag_next_pkt_id(void);
 
 void frag_table_init(struct frag_table *ft);
 
-void frag_table_gc(struct frag_table *ft);
+void frag_table_gc_at(struct frag_table *ft, uint64_t now_ns);
 
 
 static inline int frag_need_split(uint32_t pkt_len) {

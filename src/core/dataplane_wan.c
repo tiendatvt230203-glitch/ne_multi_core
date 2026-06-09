@@ -12,26 +12,9 @@
 
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/agent_debug.h"
 
-#include <stdio.h>
 #include <string.h>
-#include <time.h>
-
-// #region agent log
-static void ne_dbg_log(const char *hypothesis_id, const char *location,
-                       const char *message, int data_a, int data_b, int data_c)
-{
-    FILE *f = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
-    if (!f)
-        return;
-    fprintf(f,
-            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-            "\"message\":\"%s\",\"data\":{\"a\":%d,\"b\":%d,\"c\":%d},\"timestamp\":%lld}\n",
-            hypothesis_id, location, message, data_a, data_b, data_c,
-            (long long)time(NULL) * 1000LL);
-    fclose(f);
-}
-// #endregion
 
 static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fwd, uint8_t wire_id)
 {
@@ -218,30 +201,36 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
         wan_apply_l2_policy(fwd, pkt);
         if (len > (uint32_t)mark_off)
             frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
-        (void)crypto_layer2_read_core_id(pkt, len, &core_id);
+        if (crypto_layer2_read_core_id(pkt, len, &core_id) == 0) {
+            // #region agent log
+            if (core_id == dp_crypto_worker_cpu(dp_crypto_current_worker_idx()))
+                ne_dbg_inc("M");
+            else
+                ne_dbg_inc("X");
+            // #endregion
+        }
 
-        if (orig_len <= sizeof(scratch))
+        int need_backup = frag_mark ||
+            frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
+        if (need_backup && orig_len <= sizeof(scratch))
             memcpy(scratch, pkt, orig_len);
         if (decrypt_l2(pkt, &len) == 0 && wan_l2_plain_ipv4(pkt, len)) {
             // #region agent log
-            ne_dbg_log("B", "dataplane_wan.c:decrypt_wan", "pqc_l2_nonfrag_ok",
-                       dp_crypto_current_worker_idx(), (int)core_id,
-                       (int)pkt[CRYPTO_L2_POLICY_OFF]);
+            ne_dbg_inc("B");
             // #endregion
         } else {
-            memcpy(pkt, scratch, orig_len);
+            if (need_backup)
+                memcpy(pkt, scratch, orig_len);
             len = orig_len;
             if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
                 // #region agent log
-                ne_dbg_log("D", "dataplane_wan.c:decrypt_wan", "pqc_l2_frag_path",
-                           dp_crypto_current_worker_idx(), (int)core_id, frag_mark);
+                ne_dbg_inc("D");
                 // #endregion
                 if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
                     return -1;
             } else {
                 // #region agent log
-                ne_dbg_log("E", "dataplane_wan.c:decrypt_wan", "pqc_l2_decrypt_fail",
-                           dp_crypto_current_worker_idx(), (int)core_id, frag_mark);
+                ne_dbg_inc("E");
                 // #endregion
                 return -1;
             }

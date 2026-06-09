@@ -82,9 +82,11 @@ int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_
     if (!fwd->cfg || !fwd->cfg->crypto_enabled)
         return 0;
 
-    if (!frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx) &&
-        !fwd_crypto_has_l2_marker(pkt, len))
-        return 0;
+    /* Fast path: almost all L2 crypto has fake ethertype + policy byte. */
+    if (!fwd_crypto_has_l2_marker(pkt, len)) {
+        if (!frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx))
+            return 0;
+    }
 
     /* L2 crypto: must land on the worker that owns frag_table for this core_id.
      * Fallback to worker 0 caused intermittent decrypt/reassembly hangs. */

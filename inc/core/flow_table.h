@@ -36,6 +36,8 @@ struct flow_table {
     uint32_t wan_window_sizes[MAX_INTERFACES]; 
 };
 
+void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets);
+
 void flow_table_init(struct flow_table *ft, const uint32_t *wan_window_sizes, int wan_count);
 void flow_table_cleanup(struct flow_table *ft);
 

@@ -38,6 +38,7 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx,
                        const uint8_t master_key[AES_MAX_KEY_SIZE]);
 
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx);
+void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx);
 
 uint32_t packet_crypto_next_counter(void);
 void packet_crypto_reset_counter(void);
