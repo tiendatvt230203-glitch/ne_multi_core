@@ -21,7 +21,8 @@
  *
  * Worker index 0 = mid 1 (CPU 3), worker index 1 = mid 2 (CPU 4).
  * Wire core_id carries CPU 3 or 4 for decrypt routing (crypto_route.c).
- */
+ */// 
+
 #define NE_CPU_LOC        0u
 #define NE_CPU_MID1       3u
 #define NE_CPU_MID2       4u
