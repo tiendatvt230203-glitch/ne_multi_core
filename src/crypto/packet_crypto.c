@@ -5,7 +5,10 @@
 #include "../../inc/crypto/crypto_layer4.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include <openssl/evp.h>
+#include <openssl/err.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdatomic.h>
@@ -21,6 +24,8 @@ static __thread int g_aes_bits = 128;
 static __thread uint8_t g_policy_id = 0;
 
 static atomic_uint_fast32_t g_nonce_counter = 0;
+static atomic_uint_fast32_t g_gcm_epoch = 1;
+static atomic_uint_fast64_t g_gcm_auth_burst_bump_ms;
 
 static __thread EVP_CIPHER_CTX *tls_ctx = NULL;
 static __thread EVP_CIPHER_CTX *tls_gcm_enc_ctx = NULL;
@@ -36,16 +41,15 @@ static __thread int tls_dec_cached_nonce_len = 0;
 static __thread uint8_t tls_ctr_cached_key[AES_MAX_KEY_SIZE];
 static __thread int tls_ctr_key_cached = 0;
 
-const uint8_t g_pqc_test_key[32] = {
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20
-};
+static __thread uint32_t tls_gcm_enc_epoch = 0;
+static __thread uint32_t tls_gcm_dec_epoch = 0;
 
-const uint8_t g_pqc_test_aad[12] = {
-    0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f, 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xd1
-};
+/* Encrypt idle before new iperf session (~2s matches observed recovery time). */
+#define GCM_SESSION_GAP_MS 2000u
+/* Stale TCP ctrl burst → one global epoch bump (debounced), not per packet. */
+#define GCM_AUTH_BURST_COUNT 3u
+#define GCM_AUTH_BURST_MS  80u
+#define GCM_AUTH_BURST_COOLDOWN_MS 1000u
 
 static int key_has_nonzero(const uint8_t *key, size_t len) {
     if (!key)
@@ -160,7 +164,6 @@ static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
 
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC)
         return;
-    /* Key already in ctx (post-handshake); avoid g_key_mutex on every packet. */
     if (key_has_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
         return;
     if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
@@ -193,28 +196,6 @@ void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot) {
     if (!ctx || slot < 0 || slot >= KEY_SLOT_COUNT) return NULL;
     return ctx->keys[slot];
-}
-
-const uint8_t *packet_crypto_get_pqc_test_aad(void) {
-    return g_pqc_test_aad;
-}
-
-int packet_crypto_get_pqc_test_aad_len(void) {
-    return (int)sizeof(g_pqc_test_aad);
-}
-
-const uint8_t *packet_crypto_get_pqc_key_for_ctx(struct packet_crypto_ctx *ctx) {
-    if (!ctx || !ctx->initialized)
-        return NULL;
-
-    packet_crypto_update_keys(ctx);
-    const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
-    if (key_has_nonzero(key, 32))
-        return key;
-
-    if (packet_crypto_init(ctx, g_pqc_test_key) != 0)
-        return NULL;
-    return packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
 }
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,
@@ -266,6 +247,9 @@ void packet_crypto_cleanup(struct packet_crypto_ctx *ctx) {
     tls_key_cached = 0;
     tls_dec_key_cached = 0;
     tls_ctr_key_cached = 0;
+    tls_gcm_enc_epoch = 0;
+    tls_gcm_dec_epoch = 0;
+    (void)atomic_fetch_add_explicit(&g_gcm_epoch, 1u, memory_order_release);
 }
 
 int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
@@ -300,51 +284,849 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
     return 0;
 }
 
+// int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
+//     if (__builtin_expect(len <= 0, 0)) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
+//     if (__builtin_expect(!evp, 0)) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+
+//     int key_changed = !tls_key_cached ||
+//                       memcmp(tls_cached_key, key, key_size) != 0 ||
+//                       tls_cached_nonce_len != nonce_len;
+
+//     if (__builtin_expect(key_changed, 0)) {
+
+//         if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+//             return -1;
+
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+//             return -1;
+
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
+//             return -1;
+
+//         memcpy(tls_cached_key, key, key_size);
+//         tls_key_cached = 1;
+//         tls_cached_nonce_len = nonce_len;
+//     } else {
+
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
+//             return -1;
+//     }
+
+//     if (__builtin_expect(EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1, 0))
+//         return -1;
+
+//     if (__builtin_expect(EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
+//         return -1;
+
+//     if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1, 0))
+//         return -1;
+
+//     return 0;
+// }
+
+// int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
+//     if (!evp || !key || !nonce || !data || !tag_out) return -1;
+
+//     int out_len = 0;
+
+//     if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+
+//     if (EVP_EncryptInit_ex(evp, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) return -1;
+
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+
+//     if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//     if (EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+
+//     if (EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1) return -1;
+
+//     return 0;
+// }
+
+
+// int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
+//     if (__builtin_expect(len <= 0, 0)) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
+//     if (__builtin_expect(!evp, 0)) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+
+//     int key_changed = !tls_dec_key_cached ||
+//                       memcmp(tls_dec_cached_key, key, key_size) != 0 ||
+//                       tls_dec_cached_nonce_len != nonce_len;
+
+//     if (__builtin_expect(key_changed, 0)) {
+
+//         if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+//             return -1;
+
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+//             return -1;
+
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
+//             return -1;
+
+//         memcpy(tls_dec_cached_key, key, key_size);
+//         tls_dec_key_cached = 1;
+//         tls_dec_cached_nonce_len = nonce_len;
+//     } else {
+
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
+//             return -1;
+//     }
+
+//     if (__builtin_expect(EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1, 0))
+//         return -1;
+
+//     if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE,
+//                                              (void *)tag) != 1, 0))
+//         return -1;
+
+//     if (__builtin_expect(EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
+//         return -1;
+
+//     return 0;
+// }
+// int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
+//     if (!evp || !key || !nonce || !data || !tag) return -1;
+
+//     int out_len = 0;
+
+//     if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+
+//     if (EVP_DecryptInit_ex(evp, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) return -1;
+
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+
+//     if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//     if (EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag) != 1) return -1;
+
+//     if (EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+
+//     return 0;
+// }
+
+// V1
+// int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
+//     if (!evp || !key || !nonce || !data || !tag_out) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_key_cached ||
+//                       memcmp(tls_cached_key, key, key_size) != 0 ||
+//                       tls_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_cached_key, key, key_size);
+//         tls_key_cached = 1;
+//         tls_cached_nonce_len = nonce_len;
+//     } else {
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1) return -1;
+
+//     return 0;
+// }
+
+// int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
+//     if (!evp || !key || !nonce || !data || !tag) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_dec_key_cached ||
+//                       memcmp(tls_dec_cached_key, key, key_size) != 0 ||
+//                       tls_dec_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_dec_cached_key, key, key_size);
+//         tls_dec_key_cached = 1;
+//         tls_dec_cached_nonce_len = nonce_len;
+//     } else {
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag) != 1) return -1;
+//     if (EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+
+//     return 0;
+// }
+
+// V2
+// int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
+//     if (!evp || !key || !nonce || !data || !tag_out) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_key_cached ||
+//                       memcmp(tls_cached_key, key, key_size) != 0 ||
+//                       tls_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_cached_key, key, key_size);
+//         tls_key_cached = 1;
+//         tls_cached_nonce_len = nonce_len;
+//     } else {
+//         // Làm sạch hoàn toàn trạng thái kẹt của cú Ctrl+C trước đó trong 1 nano-giây,
+//         // sau đó nạp luôn Nonce mới để CPU chạy thẳng bằng phần cứng AES-NI.
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1) return -1;
+
+//     return 0;
+// }
+
+// int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
+//     if (!evp || !key || !nonce || !data || !tag) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_dec_key_cached ||
+//                       memcmp(tls_dec_cached_key, key, key_size) != 0 ||
+//                       tls_dec_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_dec_cached_key, key, key_size);
+//         tls_dec_key_cached = 1;
+//         tls_dec_cached_nonce_len = nonce_len;
+//     } else {
+//         // Tương tự cho phần giải mã, dọn sạch bộ đệm lỗi của phiên iperf3 cũ bị đóng đột ngột.
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag) != 1) return -1;
+//     if (EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+
+//     return 0;
+// }
+
+// V3
+// int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
+//     if (!evp || !key || !nonce || !data || !tag_out) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_key_cached ||
+//                       memcmp(tls_cached_key, key, key_size) != 0 ||
+//                       tls_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_cached_key, key, key_size);
+//         tls_key_cached = 1;
+//         tls_cached_nonce_len = nonce_len;
+//     } else {
+//         // CƠ CHẾ TIÊU CỰC: Gọi 3 lần liên tiếp để phá vỡ cấu trúc kẹt phần cứng.
+//         // Lần 1: Ép hủy trạng thái xác thực cũ.
+//         EVP_EncryptInit_ex(evp, NULL, NULL, NULL, NULL); 
+//         // Lần 2: Ép giải phóng độ dài IV cũ ngay lập tức.
+//         EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL);
+//         // Lần 3: Đập thẳng Nonce thật vào rãnh phần cứng sạch.
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1) return -1;
+
+//     return 0;
+// }
+
+// int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
+//     if (!evp || !key || !nonce || !data || !tag) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_dec_key_cached ||
+//                       memcmp(tls_dec_cached_key, key, key_size) != 0 ||
+//                       tls_dec_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_dec_cached_key, key, key_size);
+//         tls_dec_key_cached = 1;
+//         tls_dec_cached_nonce_len = nonce_len;
+//     } else {
+//         // Tương tự cho phần giải mã: Ép chip xả cặn lỗi dở dang của cú Ctrl+C mạng Layer 2.
+//         EVP_DecryptInit_ex(evp, NULL, NULL, NULL, NULL);
+//         EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL);
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag) != 1) return -1;
+//     if (EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+
+//     return 0;
+// }
+
+// V4
+// int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
+//     if (!evp || !key || !nonce || !data || !tag_out) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_key_cached ||
+//                       memcmp(tls_cached_key, key, key_size) != 0 ||
+//                       tls_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_cached_key, key, key_size);
+//         tls_key_cached = 1;
+//         tls_cached_nonce_len = nonce_len;
+//     } else {
+//         // CƠ CHẾ TIÊU CỰC TỐI THƯỢNG: Phá hủy sâu trạng thái phần cứng của phiên cũ.
+//         // Đập tan hoàn toàn mọi cấu trúc kẹt, giải phóng thanh ghi lệnh phần cứng nhưng GIỮ KEY TRONG CACHE.
+//         EVP_CIPHER_CTX_reset(evp); 
+        
+//         // Ép OpenSSL nạp lại cấu trúc Cipher gốc trong 1 nano-giây.
+//         EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL);
+//         EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL);
+        
+//         // Nạp thẳng Key đang lưu từ RAM (tls_cached_key) và Nonce mới.
+//         //CPU KHÔNG PHẢI TÌM LẠI KHÓA TỪ ĐẦU, BĂNG THÔNG GIỮ NGUYÊN 2G.
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, tls_cached_key, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1) return -1;
+
+//     return 0;
+// }
+
+// int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
+//     if (!evp || !key || !nonce || !data || !tag) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_dec_key_cached ||
+//                       memcmp(tls_dec_cached_key, key, key_size) != 0 ||
+//                       tls_dec_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_CIPHER_CTX_reset(evp) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_dec_cached_key, key, key_size);
+//         tls_dec_key_cached = 1;
+//         tls_dec_cached_nonce_len = nonce_len;
+//     } else {
+//         // Tương tự cho phần giải mã: Dọn sạch rác bằng bạo lực bộ nhớ, nạp lại Key từ bản Cache trong RAM.
+//         EVP_CIPHER_CTX_reset(evp);
+//         EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL);
+//         EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL);
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, tls_dec_cached_key, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag) != 1) return -1;
+//     if (EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+
+//     return 0;
+// }
+
+
+//V5
+
+// int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
+//     if (!evp || !key || !nonce || !data || !tag_out) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_key_cached ||
+//                       memcmp(tls_cached_key, key, key_size) != 0 ||
+//                       tls_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_cached_key, key, key_size);
+//         tls_key_cached = 1;
+//         tls_cached_nonce_len = nonce_len;
+//     } else {
+//         // CƠ CHẾ TIÊU CỰC TỐI THƯỢNG: ĐÁNH LỪA PHẦN CỨNG (CIPHER FLIPPING)
+//         // Dùng 1 byte đầu tiên của Key gốc, đảo bit nó đi để tạo ra một cái Key giả (Fake Key)
+//         uint8_t fake_key[AES_MAX_KEY_SIZE];
+//         memcpy(fake_key, tls_cached_key, key_size);
+//         fake_key[0] ^= 0xFF; 
+
+//         // Bước 1: Nạp Key giả kèm Nonce rỗng -> Ép chip phần cứng tự động xả sạch bộ đếm lỗi cũ trong 1 chu kỳ máy.
+//         EVP_EncryptInit_ex(evp, NULL, NULL, fake_key, NULL);
+
+//         // Bước 2: Nạp lại Nonce thật của gói tin này vào cấu trúc đã sạch.
+//         // Vì Key rác vừa rồi chỉ chạy trên RAM, cấu trúc Lịch trình khóa phần cứng (AES-NI) lập tức được đồng bộ lại với Key thật.
+//         if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1) return -1;
+
+//     return 0;
+// }
+
+// int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
+//                            const uint8_t *nonce, int nonce_len,
+//                            uint8_t *data, int len,
+//                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
+//     if (len <= 0) return 0;
+
+//     EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
+//     if (!evp || !key || !nonce || !data || !tag) return -1;
+
+//     int out_len;
+//     int key_size = get_key_size();
+
+//     int key_changed = !tls_dec_key_cached ||
+//                       memcmp(tls_dec_cached_key, key, key_size) != 0 ||
+//                       tls_dec_cached_nonce_len != nonce_len;
+
+//     if (key_changed) {
+//         if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1) return -1;
+//         if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1) return -1;
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1) return -1;
+
+//         memcpy(tls_dec_cached_key, key, key_size);
+//         tls_dec_key_cached = 1;
+//         tls_dec_cached_nonce_len = nonce_len;
+//     } else {
+//         // Tương tự cho phần giải mã: Dùng chiêu lừa Key giả để ép xả cặn kẹt của iperf3 cũ.
+//         uint8_t fake_key[AES_MAX_KEY_SIZE];
+//         memcpy(fake_key, tls_dec_cached_key, key_size);
+//         fake_key[0] ^= 0xFF;
+
+//         EVP_DecryptInit_ex(evp, NULL, NULL, fake_key, NULL);
+//         if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1) return -1;
+//     }
+
+//     if (EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1) return -1;
+//     if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag) != 1) return -1;
+//     if (EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1) return -1;
+
+//     return 0;
+// }
+
+
+// #region agent log
+static const char *ne_dbg_log_path(void)
+{
+    const char *p = getenv("NE_DBG_LOG");
+
+    if (p && p[0])
+        return p;
+    return "./debug-dfdcf7.log";
+}
+
+static uint32_t ne_gcm_bump_epoch(void)
+{
+    return (uint32_t)atomic_fetch_add_explicit(&g_gcm_epoch, 1u, memory_order_release) + 1u;
+}
+
+static uint32_t ne_gcm_current_epoch(void)
+{
+    return (uint32_t)atomic_load_explicit(&g_gcm_epoch, memory_order_acquire);
+}
+
+static uint64_t ne_dbg_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static void ne_dbg_gcm_log(const char *hypothesisId, const char *location, const char *message,
+                           int enc, int step, int rv, int len, int nonce_len,
+                           unsigned long ossl_err, uint64_t gap_ms,
+                           uint64_t ok_since_gap, uint64_t fail_since_gap)
+{
+    FILE *f = fopen(ne_dbg_log_path(), "a");
+
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
+            "\"message\":\"%s\",\"data\":{\"enc\":%d,\"step\":%d,\"rv\":%d,\"len\":%d,"
+            "\"nonce_len\":%d,\"ossl_err\":%lu,\"gap_ms\":%llu,\"ok_since_gap\":%llu,"
+            "\"fail_since_gap\":%llu},\"timestamp\":%llu}\n",
+            hypothesisId, location, message, enc, step, rv, len, nonce_len, ossl_err,
+            (unsigned long long)gap_ms, (unsigned long long)ok_since_gap,
+            (unsigned long long)fail_since_gap, (unsigned long long)ne_dbg_ms());
+    fclose(f);
+}
+
+static __thread uint64_t dbg_gcm_last_ms;
+static __thread uint64_t dbg_gcm_ok_gap;
+static __thread uint64_t dbg_gcm_fail_gap;
+static __thread uint64_t dbg_gcm_total_ok;
+static __thread uint64_t dbg_gcm_total_fail;
+
+static void ne_gcm_note_session_gap(int enc, int len, int nonce_len)
+{
+    uint64_t now = ne_dbg_ms();
+    uint64_t gap = dbg_gcm_last_ms ? (now - dbg_gcm_last_ms) : 0;
+
+    /*
+     * Bump epoch only on encrypt idle — reverse-path ctrl pkts (~1s apart)
+     * must not invalidate encrypt fast path (was causing ~1.2G cap).
+     */
+    if (enc && gap > GCM_SESSION_GAP_MS) {
+        uint32_t ep = ne_gcm_bump_epoch();
+
+        ne_dbg_gcm_log("H8", "packet_crypto.c:gcm_gap", "iperf_session_gap",
+                       enc, (int)ep, 0, len, nonce_len, 0, gap,
+                       dbg_gcm_ok_gap, dbg_gcm_fail_gap);
+        dbg_gcm_ok_gap = 0;
+        dbg_gcm_fail_gap = 0;
+    }
+    dbg_gcm_last_ms = now;
+}
+
+static void gcm_enc_poison_ctx(EVP_CIPHER_CTX *evp)
+{
+    if (evp)
+        EVP_CIPHER_CTX_reset(evp);
+    tls_gcm_enc_epoch = 0;
+    tls_key_cached = 0;
+}
+
+static void gcm_dec_poison_ctx(EVP_CIPHER_CTX *evp)
+{
+    if (evp)
+        EVP_CIPHER_CTX_reset(evp);
+    tls_gcm_dec_epoch = 0;
+    tls_dec_key_cached = 0;
+}
+
+static void ne_gcm_maybe_bump_auth_burst(int len)
+{
+    static __thread uint64_t burst_first_ms;
+    static __thread unsigned burst_count;
+    uint64_t now = ne_dbg_ms();
+    uint64_t prev;
+
+    if (len > 80)
+        return;
+
+    if (!burst_first_ms || (now - burst_first_ms) > GCM_AUTH_BURST_MS) {
+        burst_first_ms = now;
+        burst_count = 1;
+        return;
+    }
+    burst_count++;
+    if (burst_count < GCM_AUTH_BURST_COUNT)
+        return;
+
+    burst_first_ms = 0;
+    burst_count = 0;
+
+    prev = atomic_load_explicit(&g_gcm_auth_burst_bump_ms, memory_order_acquire);
+    if ((now - prev) < GCM_AUTH_BURST_COOLDOWN_MS)
+        return;
+    if (!atomic_compare_exchange_weak_explicit(
+            &g_gcm_auth_burst_bump_ms, &prev, now,
+            memory_order_release, memory_order_acquire))
+        return;
+
+    {
+        uint32_t ep = ne_gcm_bump_epoch();
+
+        ne_dbg_gcm_log("H11", "packet_crypto.c:gcm_burst", "auth_burst_epoch",
+                       0, (int)ep, 0, len, PACKET_CRYPTO_NONCE_BYTES, 0, 0,
+                       dbg_gcm_ok_gap, dbg_gcm_fail_gap);
+    }
+}
+
+static void ne_dbg_gcm_fail(int enc, int step, int rv, int len, int nonce_len)
+{
+    unsigned long ossl_err = ERR_get_error();
+    const char *msg = "evp_step_fail";
+
+    dbg_gcm_fail_gap++;
+    dbg_gcm_total_fail++;
+    if (enc) {
+        ne_gcm_bump_epoch();
+        gcm_enc_poison_ctx(get_gcm_enc_ctx());
+    } else if (step == 5 && len <= 80) {
+        msg = "decrypt_auth_reject";
+        gcm_dec_poison_ctx(get_gcm_dec_ctx());
+        ne_gcm_maybe_bump_auth_burst(len);
+    } else if (step >= 3) {
+        gcm_dec_poison_ctx(get_gcm_dec_ctx());
+    }
+    ne_dbg_gcm_log(enc ? "H1" : "H3", "packet_crypto.c:gcm_op", msg,
+                   enc, step, rv, len, nonce_len, ossl_err, 0,
+                   dbg_gcm_ok_gap, dbg_gcm_fail_gap);
+}
+
+static void ne_dbg_gcm_ok(int enc, int len, int nonce_len)
+{
+    dbg_gcm_ok_gap++;
+    dbg_gcm_total_ok++;
+    if (nonce_len != PACKET_CRYPTO_NONCE_BYTES)
+        ne_dbg_gcm_log("H2", "packet_crypto.c:gcm_op", "unexpected_nonce_len",
+                       enc, 0, 0, len, nonce_len, 0, 0, dbg_gcm_ok_gap, dbg_gcm_fail_gap);
+    if ((dbg_gcm_total_ok % 50000ull) == 0)
+        ne_dbg_gcm_log("H4", "packet_crypto.c:gcm_op", "periodic_ok",
+                       enc, 0, 0, len, nonce_len, 0, 0,
+                       dbg_gcm_ok_gap, dbg_gcm_fail_gap);
+}
+// #endregion
+
+static int gcm_enc_prepare_ctx(EVP_CIPHER_CTX *evp, const uint8_t *key, int nonce_len)
+{
+    int key_size = get_key_size();
+    uint32_t epoch = ne_gcm_current_epoch();
+    int key_changed = !tls_key_cached ||
+                      memcmp(tls_cached_key, key, (size_t)key_size) != 0;
+
+    if (tls_gcm_enc_epoch == epoch && !key_changed)
+        return 0;
+
+    if (EVP_CIPHER_CTX_reset(evp) != 1)
+        return -1;
+    if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+        return -1;
+    if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+        return -1;
+    if (EVP_EncryptInit_ex(evp, NULL, NULL, key, NULL) != 1)
+        return -1;
+
+    memcpy(tls_cached_key, key, (size_t)key_size);
+    tls_key_cached = 1;
+    tls_cached_nonce_len = nonce_len;
+    tls_gcm_enc_epoch = epoch;
+    return 0;
+}
+
+static int gcm_dec_prepare_ctx(EVP_CIPHER_CTX *evp, const uint8_t *key, int nonce_len)
+{
+    int key_size = get_key_size();
+    uint32_t epoch = ne_gcm_current_epoch();
+    int key_changed = !tls_dec_key_cached ||
+                      memcmp(tls_dec_cached_key, key, (size_t)key_size) != 0;
+
+    if (tls_gcm_dec_epoch == epoch && !key_changed)
+        return 0;
+
+    if (EVP_CIPHER_CTX_reset(evp) != 1)
+        return -1;
+    if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
+        return -1;
+    if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
+        return -1;
+    if (EVP_DecryptInit_ex(evp, NULL, NULL, key, NULL) != 1)
+        return -1;
+
+    memcpy(tls_dec_cached_key, key, (size_t)key_size);
+    tls_dec_key_cached = 1;
+    tls_dec_cached_nonce_len = nonce_len;
+    tls_gcm_dec_epoch = epoch;
+    return 0;
+}
+
 int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
                            uint8_t tag_out[AES_GCM_TAG_SIZE]) {
-    if (__builtin_expect(len <= 0, 0)) return 0;
-
-    EVP_CIPHER_CTX *evp = get_gcm_enc_ctx();
-    if (__builtin_expect(!evp, 0)) return -1;
-
     int out_len;
-    int key_size = get_key_size();
+    int rv;
+    EVP_CIPHER_CTX *evp;
 
+    if (len <= 0) return 0;
 
-    int key_changed = !tls_key_cached ||
-                      memcmp(tls_cached_key, key, key_size) != 0 ||
-                      tls_cached_nonce_len != nonce_len;
+    evp = get_gcm_enc_ctx();
+    if (!evp || !key || !nonce || !data || !tag_out) return -1;
 
-    if (__builtin_expect(key_changed, 0)) {
+    // #region agent log
+    ne_gcm_note_session_gap(1, len, nonce_len);
+    // #endregion
 
-        if (EVP_EncryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
-            return -1;
-
-        if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
-            return -1;
-
-        if (EVP_EncryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
-            return -1;
-
-        memcpy(tls_cached_key, key, key_size);
-        tls_key_cached = 1;
-        tls_cached_nonce_len = nonce_len;
-    } else {
-
-        if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
-            return -1;
+    if (gcm_enc_prepare_ctx(evp, key, nonce_len) != 0) {
+        // #region agent log
+        ne_dbg_gcm_fail(1, 1, 0, len, nonce_len);
+        // #endregion
+        return -1;
     }
 
-    if (__builtin_expect(EVP_EncryptUpdate(evp, data, &out_len, data, len) != 1, 0))
+    rv = EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(1, 2, rv, len, nonce_len);
+        // #endregion
         return -1;
+    }
 
-    if (__builtin_expect(EVP_EncryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
+    rv = EVP_EncryptUpdate(evp, data, &out_len, data, len);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(1, 3, rv, len, nonce_len);
+        // #endregion
         return -1;
+    }
 
-    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out) != 1, 0))
+    rv = EVP_EncryptFinal_ex(evp, data + out_len, &out_len);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(1, 4, rv, len, nonce_len);
+        // #endregion
         return -1;
+    }
+
+    rv = EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(1, 5, rv, len, nonce_len);
+        // #endregion
+        return -1;
+    }
+
+    // #region agent log
+    ne_dbg_gcm_ok(1, len, nonce_len);
+    // #endregion
 
     return 0;
 }
@@ -353,52 +1135,69 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
                            const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len,
                            const uint8_t tag[AES_GCM_TAG_SIZE]) {
-    if (__builtin_expect(len <= 0, 0)) return 0;
-
-    EVP_CIPHER_CTX *evp = get_gcm_dec_ctx();
-    if (__builtin_expect(!evp, 0)) return -1;
-
     int out_len;
-    int key_size = get_key_size();
+    int rv;
+    EVP_CIPHER_CTX *evp;
 
+    if (len <= 0) return 0;
 
-    int key_changed = !tls_dec_key_cached ||
-                      memcmp(tls_dec_cached_key, key, key_size) != 0 ||
-                      tls_dec_cached_nonce_len != nonce_len;
+    evp = get_gcm_dec_ctx();
+    if (!evp || !key || !nonce || !data || !tag) return -1;
 
-    if (__builtin_expect(key_changed, 0)) {
+    // #region agent log
+    ne_gcm_note_session_gap(0, len, nonce_len);
+    // #endregion
 
-        if (EVP_DecryptInit_ex(evp, get_gcm_cipher(), NULL, NULL, NULL) != 1)
-            return -1;
-
-        if (EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_IVLEN, nonce_len, NULL) != 1)
-            return -1;
-
-        if (EVP_DecryptInit_ex(evp, NULL, NULL, key, nonce) != 1)
-            return -1;
-
-        memcpy(tls_dec_cached_key, key, key_size);
-        tls_dec_key_cached = 1;
-        tls_dec_cached_nonce_len = nonce_len;
-    } else {
-
-        if (EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce) != 1)
-            return -1;
+    if (gcm_dec_prepare_ctx(evp, key, nonce_len) != 0) {
+        // #region agent log
+        ne_dbg_gcm_fail(0, 1, 0, len, nonce_len);
+        // #endregion
+        gcm_dec_poison_ctx(evp);
+        return -1;
     }
 
-    if (__builtin_expect(EVP_DecryptUpdate(evp, data, &out_len, data, len) != 1, 0))
+    rv = EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(0, 2, rv, len, nonce_len);
+        // #endregion
+        gcm_dec_poison_ctx(evp);
         return -1;
+    }
 
-    if (__builtin_expect(EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE,
-                                             (void *)tag) != 1, 0))
+    rv = EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(0, 3, rv, len, nonce_len);
+        // #endregion
+        gcm_dec_poison_ctx(evp);
         return -1;
+    }
 
-    if (__builtin_expect(EVP_DecryptFinal_ex(evp, data + out_len, &out_len) != 1, 0))
+    rv = EVP_DecryptUpdate(evp, data, &out_len, data, len);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(0, 4, rv, len, nonce_len);
+        // #endregion
+        gcm_dec_poison_ctx(evp);
         return -1;
+    }
+
+    rv = EVP_DecryptFinal_ex(evp, data + out_len, &out_len);
+    if (rv != 1) {
+        // #region agent log
+        ne_dbg_gcm_fail(0, 5, rv, len, nonce_len);
+        // #endregion
+        gcm_dec_poison_ctx(evp);
+        return -1;
+    }
+
+    // #region agent log
+    ne_dbg_gcm_ok(0, len, nonce_len);
+    // #endregion
 
     return 0;
 }
-
 
 static __thread uint8_t tls_nonce_salt[16];
 static __thread int tls_salt_initialized = 0;
