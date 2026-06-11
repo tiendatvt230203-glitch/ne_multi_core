@@ -21,7 +21,9 @@ struct forwarder {
     struct ne_ring mid_to_local[MAX_INTERFACES][NE_CRYPTO_WORKERS];
 
     pthread_t local_thread;
+    pthread_t local_tx_thread;
     pthread_t crypto_threads[NE_CRYPTO_WORKERS];
+    pthread_t wan_tx_thread;
     pthread_t wan_thread;
     int threads_started;
 

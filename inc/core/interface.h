@@ -12,20 +12,24 @@
 #define NE_BATCH_SIZE  64u
 
 /*
- * Dataplane CPU map — 4 pinned threads:
+ * Dataplane CPU map — 6 pinned threads:
  *
- *   NE_CPU_LOC    (0)   local I/O:     XDP RX local + TX return
- *   NE_CPU_MID1   (3)   crypto mid 1:  worker[0] encrypt / decrypt / frag / bypass
- *   NE_CPU_MID2   (4)   crypto mid 2:  worker[1] same as mid 1 (parallel)
- *   NE_CPU_WAN    (11)  wan I/O:       XDP TX WAN + RX return
+ *   NE_CPU_LOC       (0)   local RX:  AF_XDP recv + FQ refill → local_to_mid
+ *   NE_CPU_LOC_TX    (1)   local TX:  mid_to_local → AF_XDP send + CQ drain
+ *   NE_CPU_MID1      (3)   crypto worker[0]: encrypt / decrypt / frag
+ *   NE_CPU_MID2      (4)   crypto worker[1]: same as mid 1 (parallel)
+ *   NE_CPU_WAN_TX    (10)  wan TX:    mid_to_wan → AF_XDP send + CQ drain
+ *   NE_CPU_WAN       (11)  wan RX:    AF_XDP recv + FQ refill → wan_to_mid
  *
  * Worker index 0 = mid 1 (CPU 3), worker index 1 = mid 2 (CPU 4).
  * Wire core_id carries CPU 3 or 4 for decrypt routing (crypto_route.c).
- */// 
+ */
 
 #define NE_CPU_LOC        0u
+#define NE_CPU_LOC_TX     1u
 #define NE_CPU_MID1       3u
 #define NE_CPU_MID2       4u
+#define NE_CPU_WAN_TX     10u
 #define NE_CPU_WAN        11u
 #define NE_CRYPTO_WORKERS 2u
 
