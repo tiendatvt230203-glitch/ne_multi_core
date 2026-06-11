@@ -271,7 +271,7 @@ int dp_try_bypass_wan_to_local(struct forwarder *fwd, struct ne_packet *job)
     int li;
     int wi;
 
-    if (wan_has_crypto(fwd, pkt, job->len))
+    if (!fwd->io_bypass_only && wan_has_crypto(fwd, pkt, job->len))
         return 0;
 
     li = pick_local(fwd, pkt, job->len);

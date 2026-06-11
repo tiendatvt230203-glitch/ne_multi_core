@@ -781,10 +781,12 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
     uint32_t free_slots = xsk_prod_nb_free(&slot->fq, NE_BATCH_SIZE);
-    if (free_slots < NE_BATCH_SIZE)
+
+    if (!free_slots)
         return;
 
-    uint32_t got = pool_pop(pool, addrs, NE_BATCH_SIZE);
+    uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    uint32_t got = pool_pop(pool, addrs, want);
     if (!got)
         return;
     if (xsk_ring_prod__reserve(&slot->fq, got, &idx) != got) {
@@ -829,13 +831,12 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 {
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
+
     if (!free_slots) {
         if (tx_no_free)
             (*tx_no_free)++;
-        
-        if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
+        if (xsk_ring_prod__needs_wakeup(&slot->tx))
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-        }
         return 0;
     }
 

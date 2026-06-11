@@ -35,8 +35,11 @@ void forwarder_pin_cpu(void)
     pin_cpu(NE_CPU_LOC);
 }
 
-#define IO_BURST_ROUNDS      16
-#define IO_TX_BURST_MAX      64
+#define IO_REFILL_ROUNDS     2u
+#define IO_RX_BATCH          256u
+#define IO_RX_DRAIN_ROUNDS   32u
+#define IO_TX_BURST_MAX      256u
+#define IO_IDLE_SPIN_ITERS   128u
 #define POOL_LOW_WATERMARK   8192u
 
 // #region agent log
@@ -62,75 +65,103 @@ static void io_dbg_log(const char *hypothesis_id, const char *location, const ch
 // #endregion
 
 static atomic_uint_fast64_t g_bypass_fast_total;
+static atomic_uint_fast64_t g_wan_rx_pkts;
+static atomic_uint_fast64_t g_local_rx_pkts;
+static atomic_uint_fast64_t g_io_yield_rx;
+static atomic_uint_fast64_t g_io_pps_last_ts;
+static atomic_uint_fast64_t g_io_pps_last_wan_rx;
+
+static void io_idle_backoff(void)
+{
+    for (uint32_t i = 0; i < IO_IDLE_SPIN_ITERS; i++)
+        __builtin_ia32_pause();
+    sched_yield();
+}
+
+static int fwd_detect_bypass_only(struct forwarder *fwd)
+{
+    int saw_bypass = 0;
+
+    if (!fwd || !fwd->cfg)
+        return 0;
+    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+        const struct profile_config *prof = &fwd->cfg->profiles[pi];
+
+        if (!prof->enabled)
+            continue;
+        for (int i = 0; i < prof->policy_count; i++) {
+            int pol_idx = prof->policy_indices[i];
+
+            if (pol_idx < 0 || pol_idx >= fwd->cfg->policy_count)
+                continue;
+            if (fwd->cfg->policies[pol_idx].action == POLICY_ACTION_BYPASS)
+                saw_bypass = 1;
+            else
+                return 0;
+        }
+    }
+    return saw_bypass;
+}
 
 static void io_burst_refill_local(struct forwarder *fwd, int rx_worker)
 {
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+    for (uint32_t i = 0; i < IO_REFILL_ROUNDS; i++)
         ne_refill_fq_local_worker(&fwd->pair, rx_worker);
 }
 
 static void io_burst_refill_wan(struct forwarder *fwd, int rx_worker)
 {
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+    for (uint32_t i = 0; i < IO_REFILL_ROUNDS; i++)
         ne_refill_fq_wan_worker(&fwd->pair, rx_worker);
 }
 
 static void io_burst_drain_cq_local(struct forwarder *fwd, int tx_worker)
 {
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+    for (uint32_t i = 0; i < IO_REFILL_ROUNDS; i++)
         ne_drain_cq_local(&fwd->pair, tx_worker);
 }
 
 static void io_burst_drain_cq_wan(struct forwarder *fwd, int tx_worker)
 {
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+    for (uint32_t i = 0; i < IO_REFILL_ROUNDS; i++)
         ne_drain_cq_wan(&fwd->pair, tx_worker);
 }
 
-static void io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_worker)
+static void io_maybe_log_pps(struct forwarder *fwd)
 {
-    int nq = fwd->pair.locals[local_idx].queue_count;
-    int ring_lo = tx_worker;
-    int ring_hi = tx_worker + 1;
+    struct timespec ts;
+    uint64_t now_ms;
+    uint64_t wan_rx = atomic_load_explicit(&g_wan_rx_pkts, memory_order_relaxed);
+    uint64_t last_ts = atomic_load_explicit(&g_io_pps_last_ts, memory_order_relaxed);
+    uint64_t last_rx = atomic_load_explicit(&g_io_pps_last_wan_rx, memory_order_relaxed);
 
-    if (nq > 0 && nq < (int)NE_CRYPTO_WORKERS) {
-        if (tx_worker != 0)
-            return;
-        ring_lo = 0;
-        ring_hi = (int)NE_CRYPTO_WORKERS;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+    if (last_ts == 0 || now_ms <= last_ts + 999)
+        return;
+    atomic_store_explicit(&g_io_pps_last_ts, now_ms, memory_order_relaxed);
+    atomic_store_explicit(&g_io_pps_last_wan_rx, wan_rx, memory_order_relaxed);
+    // #region agent log
+    {
+        uint64_t dt = now_ms - last_ts;
+        uint64_t pps = dt ? ((wan_rx - last_rx) * 1000ULL) / dt : 0;
+        FILE *f = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
+        if (f) {
+            fprintf(f,
+                    "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"F\",\"location\":"
+                    "\"forwarder.c:io_maybe_log_pps\",\"message\":\"wan_rx_pps\","
+                    "\"data\":{\"pps\":%llu,\"pool_free\":%u,\"yields\":%llu,"
+                    "\"bypass_fast\":%llu},\"timestamp\":%llu}\n",
+                    (unsigned long long)pps, ne_pool_free_count(&fwd->pair),
+                    (unsigned long long)atomic_load_explicit(&g_io_yield_rx,
+                                                               memory_order_relaxed),
+                    (unsigned long long)atomic_load_explicit(&g_bypass_fast_total,
+                                                             memory_order_relaxed),
+                    (unsigned long long)now_ms);
+            fclose(f);
+        }
     }
-
-    for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
-        int sent = 0;
-        for (int w = ring_lo; w < ring_hi; w++)
-            sent += ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[local_idx][w],
-                                      local_idx, tx_worker);
-        if (sent <= 0)
-            break;
-    }
-}
-
-static void io_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_worker)
-{
-    int nq = fwd->pair.wans[wan_idx].queue_count;
-    int ring_lo = tx_worker;
-    int ring_hi = tx_worker + 1;
-
-    if (nq > 0 && nq < (int)NE_CRYPTO_WORKERS) {
-        if (tx_worker != 0)
-            return;
-        ring_lo = 0;
-        ring_hi = (int)NE_CRYPTO_WORKERS;
-    }
-
-    for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
-        int sent = 0;
-        for (int w = ring_lo; w < ring_hi; w++)
-            sent += ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wan_idx][w],
-                                    wan_idx, tx_worker);
-        if (sent <= 0)
-            break;
-    }
+    // #endregion
 }
 
 struct io_worker_ctx {
@@ -191,37 +222,47 @@ static void *local_rx_thread(void *arg)
     struct io_worker_ctx *ctx = arg;
     struct forwarder *fwd = ctx->fwd;
     int rx_worker = ctx->worker_idx;
-    struct ne_packet batch[NE_BATCH_SIZE];
+    struct ne_packet batch[IO_RX_BATCH];
 
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        int did_work = 0;
+
         io_burst_refill_local(fwd, rx_worker);
         io_maybe_log_pool_low(fwd, "forwarder.c:local_rx_thread");
 
-        int rcvd = ne_recv_local_worker(&fwd->pair, batch, NE_BATCH_SIZE, rx_worker);
-        if (rcvd <= 0) {
-            ne_kick_rx_wakeup_local_worker(&fwd->pair, rx_worker);
-            sched_yield();
-            continue;
+        for (uint32_t drain = 0; drain < IO_RX_DRAIN_ROUNDS; drain++) {
+            int rcvd = ne_recv_local_worker(&fwd->pair, batch, IO_RX_BATCH, rx_worker);
+            if (rcvd <= 0)
+                break;
+
+            did_work = 1;
+            atomic_fetch_add_explicit(&g_local_rx_pkts, (uint64_t)rcvd, memory_order_relaxed);
+
+            for (int i = 0; i < rcvd; i++) {
+                int bp = dp_try_bypass_local_to_wan(fwd, &batch[i]);
+                if (bp == 1) {
+                    atomic_fetch_add_explicit(&g_bypass_fast_total, 1, memory_order_relaxed);
+                    continue;
+                }
+                if (bp < 0) {
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                    continue;
+                }
+                int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
+                                                     batch[i].len);
+                if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0)
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+            }
+            ne_recv_release_local_worker(&fwd->pair, rx_worker);
         }
 
-        for (int i = 0; i < rcvd; i++) {
-            int bp = dp_try_bypass_local_to_wan(fwd, &batch[i]);
-            if (bp == 1) {
-                atomic_fetch_add_explicit(&g_bypass_fast_total, 1, memory_order_relaxed);
-                continue;
-            }
-            if (bp < 0) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
-                continue;
-            }
-            int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
-                                                 batch[i].len);
-            if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0)
-                ne_frame_free(&fwd->pair, batch[i].addr);
+        if (!did_work) {
+            ne_kick_rx_wakeup_local_worker(&fwd->pair, rx_worker);
+            atomic_fetch_add_explicit(&g_io_yield_rx, 1, memory_order_relaxed);
+            io_idle_backoff();
         }
-        ne_recv_release_local_worker(&fwd->pair, rx_worker);
     }
     return NULL;
 }
@@ -235,10 +276,32 @@ static void *local_tx_thread(void *arg)
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        int did_work = 0;
+
         io_burst_drain_cq_local(fwd, tx_worker);
-        for (int li = 0; li < fwd->local_count; li++)
-            io_burst_tx_local(fwd, li, tx_worker);
-        sched_yield();
+        for (int li = 0; li < fwd->local_count; li++) {
+            int nq = fwd->pair.locals[li].queue_count;
+            int ring_lo = tx_worker;
+            int ring_hi = tx_worker + 1;
+
+            if (nq > 0 && nq < (int)NE_CRYPTO_WORKERS) {
+                if (tx_worker != 0)
+                    continue;
+                ring_lo = 0;
+                ring_hi = (int)NE_CRYPTO_WORKERS;
+            }
+            for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
+                int sent = 0;
+                for (int w = ring_lo; w < ring_hi; w++)
+                    sent += ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li][w],
+                                              li, tx_worker);
+                if (sent <= 0)
+                    break;
+                did_work = 1;
+            }
+        }
+        if (!did_work)
+            io_idle_backoff();
     }
     return NULL;
 }
@@ -248,49 +311,62 @@ static void *wan_rx_thread(void *arg)
     struct io_worker_ctx *ctx = arg;
     struct forwarder *fwd = ctx->fwd;
     int rx_worker = ctx->worker_idx;
-    struct ne_packet batch[NE_BATCH_SIZE];
+    struct ne_packet batch[IO_RX_BATCH];
 
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        int did_work = 0;
+
         io_burst_refill_wan(fwd, rx_worker);
         io_maybe_log_pool_low(fwd, "forwarder.c:wan_rx_thread");
 
-        int rcvd = ne_recv_wan_worker(&fwd->pair, batch, NE_BATCH_SIZE, rx_worker);
-        if (rcvd <= 0) {
+        for (uint32_t drain = 0; drain < IO_RX_DRAIN_ROUNDS; drain++) {
+            int rcvd = ne_recv_wan_worker(&fwd->pair, batch, IO_RX_BATCH, rx_worker);
+            if (rcvd <= 0)
+                break;
+
+            did_work = 1;
+            atomic_fetch_add_explicit(&g_wan_rx_pkts, (uint64_t)rcvd, memory_order_relaxed);
+
+            for (int i = 0; i < rcvd; i++) {
+                int wi;
+                int bp;
+                const uint8_t *pkt;
+
+                if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                    continue;
+                }
+                bp = dp_try_bypass_wan_to_local(fwd, &batch[i]);
+                if (bp == 1) {
+                    atomic_fetch_add_explicit(&g_bypass_fast_total, 1, memory_order_relaxed);
+                    continue;
+                }
+                if (bp < 0) {
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                    continue;
+                }
+                pkt = ne_packet_data(&fwd->pair, batch[i].addr);
+                wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
+                if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                    continue;
+                }
+                if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0)
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+            }
+            ne_recv_release_wan_worker(&fwd->pair, rx_worker);
+        }
+
+        if (rx_worker == 0)
+            io_maybe_log_pps(fwd);
+
+        if (!did_work) {
             ne_kick_rx_wakeup_wan_worker(&fwd->pair, rx_worker);
-            sched_yield();
-            continue;
+            atomic_fetch_add_explicit(&g_io_yield_rx, 1, memory_order_relaxed);
+            io_idle_backoff();
         }
-
-        for (int i = 0; i < rcvd; i++) {
-            int wi;
-            int bp;
-            const uint8_t *pkt;
-
-            if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
-                continue;
-            }
-            bp = dp_try_bypass_wan_to_local(fwd, &batch[i]);
-            if (bp == 1) {
-                atomic_fetch_add_explicit(&g_bypass_fast_total, 1, memory_order_relaxed);
-                continue;
-            }
-            if (bp < 0) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
-                continue;
-            }
-            pkt = ne_packet_data(&fwd->pair, batch[i].addr);
-            wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
-            if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
-                continue;
-            }
-            if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0)
-                ne_frame_free(&fwd->pair, batch[i].addr);
-        }
-        ne_recv_release_wan_worker(&fwd->pair, rx_worker);
     }
     return NULL;
 }
@@ -305,14 +381,42 @@ static void *wan_tx_thread(void *arg)
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        int did_work = 0;
+
         io_burst_drain_cq_wan(fwd, tx_worker);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
+            int nq;
+            int ring_lo;
+            int ring_hi;
+            int burst;
+
             if (fwd_wan_is_stopped(wi))
                 continue;
-            io_burst_tx_wan(fwd, wi, tx_worker);
+            nq = fwd->pair.wans[wi].queue_count;
+            ring_lo = tx_worker;
+            ring_hi = tx_worker + 1;
+            if (nq > 0 && nq < (int)NE_CRYPTO_WORKERS) {
+                if (tx_worker != 0)
+                    continue;
+                ring_lo = 0;
+                ring_hi = (int)NE_CRYPTO_WORKERS;
+            }
+            for (burst = 0; burst < IO_TX_BURST_MAX; burst++) {
+                int sent = 0;
+                int w;
+
+                for (w = ring_lo; w < ring_hi; w++)
+                    sent += ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi][w], wi, tx_worker);
+                if (sent <= 0)
+                    break;
+                did_work = 1;
+            }
             if (tx_worker == 0 && fwd_mid_to_wan_depth(fwd, wi) == 0)
                 fwd->wan_tx_stuck[wi] = 0;
         }
+        if (!did_work)
+            io_idle_backoff();
+
         if (tx_worker == 0 && (++stat_tick & 8191u) == 0) {
             uint32_t w0 = 0, w1 = 0, l0 = 0, l1 = 0;
             int qcount = fwd->wan_count > 0 ? fwd->pair.wans[0].queue_count : 0;
@@ -328,7 +432,6 @@ static void *wan_tx_thread(void *arg)
                        atomic_load_explicit(&g_bypass_fast_total, memory_order_relaxed));
             // #endregion
         }
-        sched_yield();
     }
     return NULL;
 }
@@ -502,6 +605,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     (void)local_hwaddr_install(fwd);
     fwd_wan_reset_on_init(fwd);
+    fwd->io_bypass_only = fwd_detect_bypass_only(fwd);
+    fwd->io_default_wan_dp = fwd->wan_count > 0 ? 0 : -1;
 
     atomic_store_explicit(&running, 1, memory_order_release);
     return 0;

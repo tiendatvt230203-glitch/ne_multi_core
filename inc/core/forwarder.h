@@ -29,6 +29,9 @@ struct forwarder {
 
     uint64_t wan_tx_stuck[MAX_INTERFACES];
     uint32_t wan_tx_cooldown[MAX_INTERFACES];
+
+    int io_bypass_only;
+    int io_default_wan_dp;
 };
 
 static inline uint32_t fwd_mid_to_wan_depth(const struct forwarder *fwd, int wan_dp)
