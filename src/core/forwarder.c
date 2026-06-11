@@ -40,6 +40,8 @@ void forwarder_pin_cpu(void)
 #define IO_RX_DRAIN_ROUNDS   32u
 #define IO_TX_BURST_MAX      256u
 #define IO_IDLE_SPIN_ITERS   128u
+#define IO_HOT_IDLE_MS       500u
+#define IO_RECOVERY_ROUNDS   16u
 #define POOL_LOW_WATERMARK   8192u
 
 // #region agent log
@@ -70,6 +72,58 @@ static atomic_uint_fast64_t g_local_rx_pkts;
 static atomic_uint_fast64_t g_io_yield_rx;
 static atomic_uint_fast64_t g_io_pps_last_ts;
 static atomic_uint_fast64_t g_io_pps_last_wan_rx;
+static atomic_uint_fast64_t g_last_io_activity_ms;
+static atomic_uint_fast64_t g_bypass_ring_full;
+
+static uint64_t io_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void io_touch_activity(void)
+{
+    atomic_store_explicit(&g_last_io_activity_ms, io_monotonic_ms(), memory_order_relaxed);
+}
+
+static int io_recently_active(void)
+{
+    uint64_t now = io_monotonic_ms();
+    uint64_t last = atomic_load_explicit(&g_last_io_activity_ms, memory_order_relaxed);
+
+    return last > 0 && now > last && (now - last) < IO_HOT_IDLE_MS;
+}
+
+// #region agent log
+static void io_log_toggle_recovery(struct forwarder *fwd, const char *where, int got_pkts)
+{
+    uint32_t w0 = 0, w1 = 0;
+    FILE *f;
+
+    for (int wi = 0; wi < fwd->wan_count; wi++) {
+        w0 += ne_ring_count(&fwd->mid_to_wan[wi][0]);
+        w1 += ne_ring_count(&fwd->mid_to_wan[wi][1]);
+    }
+    f = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"G\",\"location\":\"%s\","
+            "\"message\":\"toggle_recovery\",\"data\":{\"got_pkts\":%d,\"pool_free\":%u,"
+            "\"mid_wan_w0\":%u,\"mid_wan_w1\":%u,\"ring_full\":%llu},\"timestamp\":%llu}\n",
+            where, got_pkts, ne_pool_free_count(&fwd->pair), w0, w1,
+            (unsigned long long)atomic_load_explicit(&g_bypass_ring_full, memory_order_relaxed),
+            (unsigned long long)io_monotonic_ms());
+    fclose(f);
+}
+// #endregion
+
+void fwd_io_note_bypass_ring_full(void)
+{
+    atomic_fetch_add_explicit(&g_bypass_ring_full, 1, memory_order_relaxed);
+}
 
 static void io_idle_backoff(void)
 {
@@ -238,6 +292,7 @@ static void *local_rx_thread(void *arg)
                 break;
 
             did_work = 1;
+            io_touch_activity();
             atomic_fetch_add_explicit(&g_local_rx_pkts, (uint64_t)rcvd, memory_order_relaxed);
 
             for (int i = 0; i < rcvd; i++) {
@@ -259,9 +314,52 @@ static void *local_rx_thread(void *arg)
         }
 
         if (!did_work) {
-            ne_kick_rx_wakeup_local_worker(&fwd->pair, rx_worker);
-            atomic_fetch_add_explicit(&g_io_yield_rx, 1, memory_order_relaxed);
-            io_idle_backoff();
+            int recovered = 0;
+
+            if (io_recently_active()) {
+                for (uint32_t r = 0; r < IO_RECOVERY_ROUNDS; r++) {
+                    ne_drain_cq_local_worker(&fwd->pair, rx_worker);
+                    ne_drain_cq_wan_worker(&fwd->pair, rx_worker);
+                    io_burst_refill_local(fwd, rx_worker);
+                    ne_kick_rx_wakeup_local_worker(&fwd->pair, rx_worker);
+                    recovered = ne_recv_local_worker(&fwd->pair, batch, IO_RX_BATCH, rx_worker);
+                    if (recovered > 0) {
+                        io_touch_activity();
+                        atomic_fetch_add_explicit(&g_local_rx_pkts, (uint64_t)recovered,
+                                                  memory_order_relaxed);
+                        for (int i = 0; i < recovered; i++) {
+                            int bp = dp_try_bypass_local_to_wan(fwd, &batch[i]);
+                            if (bp == 1) {
+                                atomic_fetch_add_explicit(&g_bypass_fast_total, 1,
+                                                          memory_order_relaxed);
+                                continue;
+                            }
+                            if (bp < 0) {
+                                ne_frame_free(&fwd->pair, batch[i].addr);
+                                continue;
+                            }
+                            int wi = dp_crypto_pick_local_worker(
+                                ne_packet_data(&fwd->pair, batch[i].addr), batch[i].len);
+                            if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0)
+                                ne_frame_free(&fwd->pair, batch[i].addr);
+                        }
+                        ne_recv_release_local_worker(&fwd->pair, rx_worker);
+                        did_work = 1;
+                        break;
+                    }
+                }
+                // #region agent log
+                if (!did_work)
+                    io_log_toggle_recovery(fwd, "forwarder.c:local_rx_thread", 0);
+                // #endregion
+            } else {
+                ne_drain_cq_local_worker(&fwd->pair, rx_worker);
+                ne_kick_rx_wakeup_local_worker(&fwd->pair, rx_worker);
+            }
+            if (!did_work) {
+                atomic_fetch_add_explicit(&g_io_yield_rx, 1, memory_order_relaxed);
+                io_idle_backoff();
+            }
         }
     }
     return NULL;
@@ -298,10 +396,41 @@ static void *local_tx_thread(void *arg)
                 if (sent <= 0)
                     break;
                 did_work = 1;
+                io_touch_activity();
             }
         }
-        if (!did_work)
-            io_idle_backoff();
+        if (!did_work) {
+            if (io_recently_active()) {
+                for (uint32_t r = 0; r < IO_RECOVERY_ROUNDS; r++) {
+                    io_burst_drain_cq_local(fwd, tx_worker);
+                    for (int li = 0; li < fwd->local_count; li++) {
+                        int nq = fwd->pair.locals[li].queue_count;
+                        int ring_lo = tx_worker;
+                        int ring_hi = tx_worker + 1;
+                        int sent;
+
+                        if (nq > 0 && nq < (int)NE_CRYPTO_WORKERS) {
+                            if (tx_worker != 0)
+                                continue;
+                            ring_lo = 0;
+                            ring_hi = (int)NE_CRYPTO_WORKERS;
+                        }
+                        sent = 0;
+                        for (int w = ring_lo; w < ring_hi; w++)
+                            sent += ne_tx_drain_local(&fwd->pair, &fwd->mid_to_local[li][w],
+                                                      li, tx_worker);
+                        if (sent > 0) {
+                            did_work = 1;
+                            io_touch_activity();
+                        }
+                    }
+                    if (did_work)
+                        break;
+                }
+            }
+            if (!did_work)
+                io_idle_backoff();
+        }
     }
     return NULL;
 }
@@ -327,6 +456,7 @@ static void *wan_rx_thread(void *arg)
                 break;
 
             did_work = 1;
+            io_touch_activity();
             atomic_fetch_add_explicit(&g_wan_rx_pkts, (uint64_t)rcvd, memory_order_relaxed);
 
             for (int i = 0; i < rcvd; i++) {
@@ -363,9 +493,65 @@ static void *wan_rx_thread(void *arg)
             io_maybe_log_pps(fwd);
 
         if (!did_work) {
-            ne_kick_rx_wakeup_wan_worker(&fwd->pair, rx_worker);
-            atomic_fetch_add_explicit(&g_io_yield_rx, 1, memory_order_relaxed);
-            io_idle_backoff();
+            int recovered = 0;
+
+            if (io_recently_active()) {
+                for (uint32_t r = 0; r < IO_RECOVERY_ROUNDS; r++) {
+                    ne_drain_cq_wan_worker(&fwd->pair, rx_worker);
+                    ne_drain_cq_local_worker(&fwd->pair, rx_worker);
+                    io_burst_refill_wan(fwd, rx_worker);
+                    ne_kick_rx_wakeup_wan_worker(&fwd->pair, rx_worker);
+                    recovered = ne_recv_wan_worker(&fwd->pair, batch, IO_RX_BATCH, rx_worker);
+                    if (recovered > 0) {
+                        io_touch_activity();
+                        atomic_fetch_add_explicit(&g_wan_rx_pkts, (uint64_t)recovered,
+                                                  memory_order_relaxed);
+                        for (int i = 0; i < recovered; i++) {
+                            int wi;
+                            int bp;
+                            const uint8_t *pkt;
+
+                            if (batch[i].wan_idx < MAX_INTERFACES &&
+                                fwd_wan_is_stopped(batch[i].wan_idx)) {
+                                ne_frame_free(&fwd->pair, batch[i].addr);
+                                continue;
+                            }
+                            bp = dp_try_bypass_wan_to_local(fwd, &batch[i]);
+                            if (bp == 1) {
+                                atomic_fetch_add_explicit(&g_bypass_fast_total, 1,
+                                                          memory_order_relaxed);
+                                continue;
+                            }
+                            if (bp < 0) {
+                                ne_frame_free(&fwd->pair, batch[i].addr);
+                                continue;
+                            }
+                            pkt = ne_packet_data(&fwd->pair, batch[i].addr);
+                            wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
+                            if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
+                                ne_frame_free(&fwd->pair, batch[i].addr);
+                                continue;
+                            }
+                            if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0)
+                                ne_frame_free(&fwd->pair, batch[i].addr);
+                        }
+                        ne_recv_release_wan_worker(&fwd->pair, rx_worker);
+                        did_work = 1;
+                        break;
+                    }
+                }
+                // #region agent log
+                if (!did_work)
+                    io_log_toggle_recovery(fwd, "forwarder.c:wan_rx_thread", 0);
+                // #endregion
+            } else {
+                ne_drain_cq_wan_worker(&fwd->pair, rx_worker);
+                ne_kick_rx_wakeup_wan_worker(&fwd->pair, rx_worker);
+            }
+            if (!did_work) {
+                atomic_fetch_add_explicit(&g_io_yield_rx, 1, memory_order_relaxed);
+                io_idle_backoff();
+            }
         }
     }
     return NULL;
@@ -410,9 +596,45 @@ static void *wan_tx_thread(void *arg)
                 if (sent <= 0)
                     break;
                 did_work = 1;
+                io_touch_activity();
             }
             if (tx_worker == 0 && fwd_mid_to_wan_depth(fwd, wi) == 0)
                 fwd->wan_tx_stuck[wi] = 0;
+        }
+        if (!did_work && io_recently_active()) {
+            for (uint32_t r = 0; r < IO_RECOVERY_ROUNDS; r++) {
+                int sent_any = 0;
+
+                io_burst_drain_cq_wan(fwd, tx_worker);
+                for (int wi = 0; wi < fwd->wan_count; wi++) {
+                    int nq;
+                    int ring_lo;
+                    int ring_hi;
+                    int w;
+                    int sent;
+
+                    if (fwd_wan_is_stopped(wi))
+                        continue;
+                    nq = fwd->pair.wans[wi].queue_count;
+                    ring_lo = tx_worker;
+                    ring_hi = tx_worker + 1;
+                    if (nq > 0 && nq < (int)NE_CRYPTO_WORKERS) {
+                        if (tx_worker != 0)
+                            continue;
+                        ring_lo = 0;
+                        ring_hi = (int)NE_CRYPTO_WORKERS;
+                    }
+                    sent = 0;
+                    for (w = ring_lo; w < ring_hi; w++)
+                        sent += ne_tx_drain_wan(&fwd->pair, &fwd->mid_to_wan[wi][w], wi, tx_worker);
+                    sent_any += sent;
+                }
+                if (sent_any > 0) {
+                    did_work = 1;
+                    io_touch_activity();
+                    break;
+                }
+            }
         }
         if (!did_work)
             io_idle_backoff();

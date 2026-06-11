@@ -169,6 +169,8 @@ void ne_recv_release_local_worker(struct ne_pair *p, int rx_worker);
 void ne_recv_release_wan_worker(struct ne_pair *p, int rx_worker);
 void ne_kick_rx_wakeup_local_worker(struct ne_pair *p, int rx_worker);
 void ne_kick_rx_wakeup_wan_worker(struct ne_pair *p, int rx_worker);
+void ne_drain_cq_local_worker(struct ne_pair *p, int io_worker);
+void ne_drain_cq_wan_worker(struct ne_pair *p, int io_worker);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_worker);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_worker);

@@ -149,8 +149,10 @@ int dp_try_bypass_local_to_wan(struct forwarder *fwd, struct ne_packet *job)
         if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
             return -1;
         if (ne_ring_count(&fwd->mid_to_wan[wan_dp][wi]) + NE_BATCH_SIZE >=
-            fwd->mid_to_wan[wan_dp][wi].cap)
+            fwd->mid_to_wan[wan_dp][wi].cap) {
+            fwd_io_note_bypass_ring_full();
             return -1;
+        }
         if (dp_apply_wan_l2(pkt, job->len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
             return -1;
         return push_to_wan(fwd, job, wan_dp) == 0 ? 1 : -1;
@@ -175,8 +177,10 @@ int dp_try_bypass_local_to_wan(struct forwarder *fwd, struct ne_packet *job)
     if (wan_dp < 0 || wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
         return -1;
     if (ne_ring_count(&fwd->mid_to_wan[wan_dp][wi]) + NE_BATCH_SIZE >=
-        fwd->mid_to_wan[wan_dp][wi].cap)
+        fwd->mid_to_wan[wan_dp][wi].cap) {
+        fwd_io_note_bypass_ring_full();
         return -1;
+    }
     if (dp_apply_wan_l2(pkt, job->len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         return -1;
     return push_to_wan(fwd, job, wan_dp) == 0 ? 1 : -1;

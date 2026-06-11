@@ -602,6 +602,17 @@ static void xsk_kick_fq_wakeup(struct ne_xsk_queue *slot)
         (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 }
 
+static void xsk_kick_socket_wakeup(struct ne_xsk_queue *slot)
+{
+    int fd;
+
+    if (!slot || !slot->xsk)
+        return;
+    fd = xsk_socket__fd(slot->xsk);
+    (void)recvfrom(fd, NULL, 0, MSG_DONTWAIT, NULL, NULL);
+    (void)sendto(fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+}
+
 static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t max,
                       uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
@@ -705,14 +716,15 @@ void ne_recv_release_wan_worker(struct ne_pair *p, int rx_worker)
     }
 }
 
-static void kick_iface_rx_worker(struct ne_iface *iface, int rx_worker)
+static void kick_iface_io_worker(struct ne_iface *iface, int io_worker)
 {
     int nq = iface->queue_count;
 
     for (int q = 0; q < nq; q++) {
-        if (!queue_owned_by_io_worker(q, rx_worker, nq))
+        if (!queue_owned_by_io_worker(q, io_worker, nq))
             continue;
         xsk_kick_fq_wakeup(&iface->queues[q]);
+        xsk_kick_socket_wakeup(&iface->queues[q]);
     }
 }
 
@@ -721,7 +733,7 @@ void ne_kick_rx_wakeup_local_worker(struct ne_pair *p, int rx_worker)
     if (!p || rx_worker < 0 || rx_worker >= (int)NE_CRYPTO_WORKERS)
         return;
     for (int i = 0; i < p->local_count; i++)
-        kick_iface_rx_worker(&p->locals[i], rx_worker);
+        kick_iface_io_worker(&p->locals[i], rx_worker);
 }
 
 void ne_kick_rx_wakeup_wan_worker(struct ne_pair *p, int rx_worker)
@@ -729,7 +741,7 @@ void ne_kick_rx_wakeup_wan_worker(struct ne_pair *p, int rx_worker)
     if (!p || rx_worker < 0 || rx_worker >= (int)NE_CRYPTO_WORKERS)
         return;
     for (int i = 0; i < p->wan_count; i++)
-        kick_iface_rx_worker(&p->wans[i], rx_worker);
+        kick_iface_io_worker(&p->wans[i], rx_worker);
 }
 
 static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
@@ -774,6 +786,22 @@ void ne_drain_cq_wan(struct ne_pair *p, int tx_worker)
         return;
     for (int i = 0; i < p->wan_count; i++)
         drain_cq_iface_worker(&p->wans[i], &p->pool, tx_worker);
+}
+
+void ne_drain_cq_local_worker(struct ne_pair *p, int io_worker)
+{
+    if (!p || io_worker < 0 || io_worker >= (int)NE_CRYPTO_WORKERS)
+        return;
+    for (int i = 0; i < p->local_count; i++)
+        drain_cq_iface_worker(&p->locals[i], &p->pool, io_worker);
+}
+
+void ne_drain_cq_wan_worker(struct ne_pair *p, int io_worker)
+{
+    if (!p || io_worker < 0 || io_worker >= (int)NE_CRYPTO_WORKERS)
+        return;
+    for (int i = 0; i < p->wan_count; i++)
+        drain_cq_iface_worker(&p->wans[i], &p->pool, io_worker);
 }
 
 static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)

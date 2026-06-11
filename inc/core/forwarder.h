@@ -54,6 +54,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg);
 int forwarder_reload_wan_removal(struct forwarder *fwd, struct app_config *cfg);
 void forwarder_cleanup(struct forwarder *fwd);
 void forwarder_run(struct forwarder *fwd);
+void fwd_io_note_bypass_ring_full(void);
 void forwarder_stop(void);
 void forwarder_shutdown_resources(void);
 int forwarder_should_stop(void);
