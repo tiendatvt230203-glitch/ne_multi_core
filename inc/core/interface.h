@@ -12,27 +12,30 @@
 #define NE_BATCH_SIZE  64u
 
 /*
- * Dataplane CPU map — 8 pinned threads:
+ * Dataplane CPU map — 10 pinned threads:
  *
- *   NE_CPU_LOC        (0)   local RX:  AF_XDP recv + FQ refill → local_to_mid
+ *   NE_CPU_LOC        (0)   local RX worker[0]: queues q%2==0 + FQ refill
+ *   NE_CPU_LOC_RX1    (7)   local RX worker[1]: queues q%2==1 + FQ refill
  *   NE_CPU_LOC_TX     (1)   local TX worker[0]: mid_to_local[*][0] + CQ q%2==0
  *   NE_CPU_LOC_TX1    (2)   local TX worker[1]: mid_to_local[*][1] + CQ q%2==1
  *   NE_CPU_MID1       (3)   crypto worker[0]: encrypt / decrypt / frag
  *   NE_CPU_MID2       (4)   crypto worker[1]: same as mid 1 (parallel)
+ *   NE_CPU_WAN_RX1    (8)   wan RX worker[1]:   queues q%2==1 + FQ refill
  *   NE_CPU_WAN_TX1    (9)   wan TX worker[1]: mid_to_wan[*][1] + CQ q%2==1
  *   NE_CPU_WAN_TX     (10)  wan TX worker[0]: mid_to_wan[*][0] + CQ q%2==0
- *   NE_CPU_WAN        (11)  wan RX:    AF_XDP recv + FQ refill → wan_to_mid
+ *   NE_CPU_WAN        (11)  wan RX worker[0]:   queues q%2==0 + FQ refill
  *
- * Worker index 0 = mid 1 (CPU 3), worker index 1 = mid 2 (CPU 4).
- * TX worker index matches crypto ring index and XSK queue (q % NE_CRYPTO_WORKERS).
+ * IO worker index matches crypto ring index and XSK queue (q % NE_CRYPTO_WORKERS).
  * Wire core_id carries CPU 3 or 4 for decrypt routing (crypto_route.c).
  */
 
 #define NE_CPU_LOC        0u
+#define NE_CPU_LOC_RX1    7u
 #define NE_CPU_LOC_TX     1u
 #define NE_CPU_LOC_TX1    2u
 #define NE_CPU_MID1       3u
 #define NE_CPU_MID2       4u
+#define NE_CPU_WAN_RX1    8u
 #define NE_CPU_WAN_TX1    9u
 #define NE_CPU_WAN_TX     10u
 #define NE_CPU_WAN        11u
@@ -160,21 +163,24 @@ uint32_t ne_ring_count(const struct ne_ring *r);
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg);
 void ne_pair_close(struct ne_pair *p);
 
-int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-void ne_recv_release_local(struct ne_pair *p);
-void ne_recv_release_wan(struct ne_pair *p);
+int ne_recv_local_worker(struct ne_pair *p, struct ne_packet *out, uint32_t max, int rx_worker);
+int ne_recv_wan_worker(struct ne_pair *p, struct ne_packet *out, uint32_t max, int rx_worker);
+void ne_recv_release_local_worker(struct ne_pair *p, int rx_worker);
+void ne_recv_release_wan_worker(struct ne_pair *p, int rx_worker);
+void ne_kick_rx_wakeup_local_worker(struct ne_pair *p, int rx_worker);
+void ne_kick_rx_wakeup_wan_worker(struct ne_pair *p, int rx_worker);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_worker);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_worker);
-void ne_refill_fq_local(struct ne_pair *p);
-void ne_refill_fq_wan(struct ne_pair *p);
+void ne_refill_fq_local_worker(struct ne_pair *p, int rx_worker);
+void ne_refill_fq_wan_worker(struct ne_pair *p, int rx_worker);
 int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx, int tx_worker);
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx, int tx_worker);
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
+uint32_t ne_pool_free_count(struct ne_pair *p);
 
 void interface_reset_redirect_maps(void);
 int interface_push_encrypt_filters(const struct app_config *cfg);

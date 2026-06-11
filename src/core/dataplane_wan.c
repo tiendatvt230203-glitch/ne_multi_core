@@ -265,6 +265,32 @@ static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
     return config_find_local_for_ip(fwd->cfg, dest_ip);
 }
 
+int dp_try_bypass_wan_to_local(struct forwarder *fwd, struct ne_packet *job)
+{
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
+    int li;
+    int wi;
+
+    if (wan_has_crypto(fwd, pkt, job->len))
+        return 0;
+
+    li = pick_local(fwd, pkt, job->len);
+    if (li < 0 || li >= fwd->local_count)
+        return -1;
+    if (dp_write_l2_src_only(pkt, job->len, fwd->locals[li].src_mac) != 0)
+        return -1;
+
+    wi = dp_crypto_pick_wan_worker(fwd, pkt, job->len);
+    if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
+        return -1;
+
+    job->dir = NE_DIR_LOCAL;
+    job->local_idx = (uint8_t)li;
+    if (dp_ring_push(fwd, &fwd->mid_to_local[li][wi], job) != 0)
+        return -1;
+    return 1;
+}
+
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
