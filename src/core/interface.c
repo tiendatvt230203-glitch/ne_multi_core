@@ -680,22 +680,34 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     }
 }
 
-static void drain_cq_iface(struct ne_iface *iface, struct ne_pool *pool)
+static int queue_owned_by_tx_worker(int q, int tx_worker)
 {
-    for (int q = 0; q < iface->queue_count; q++)
+    return (q % (int)NE_CRYPTO_WORKERS) == tx_worker;
+}
+
+static void drain_cq_iface_worker(struct ne_iface *iface, struct ne_pool *pool, int tx_worker)
+{
+    for (int q = 0; q < iface->queue_count; q++) {
+        if (!queue_owned_by_tx_worker(q, tx_worker))
+            continue;
         drain_cq_queue(&iface->queues[q], pool);
+    }
 }
 
-void ne_drain_cq_local(struct ne_pair *p)
+void ne_drain_cq_local(struct ne_pair *p, int tx_worker)
 {
+    if (!p || tx_worker < 0 || tx_worker >= (int)NE_CRYPTO_WORKERS)
+        return;
     for (int i = 0; i < p->local_count; i++)
-        drain_cq_iface(&p->locals[i], &p->pool);
+        drain_cq_iface_worker(&p->locals[i], &p->pool, tx_worker);
 }
 
-void ne_drain_cq_wan(struct ne_pair *p)
+void ne_drain_cq_wan(struct ne_pair *p, int tx_worker)
 {
+    if (!p || tx_worker < 0 || tx_worker >= (int)NE_CRYPTO_WORKERS)
+        return;
     for (int i = 0; i < p->wan_count; i++)
-        drain_cq_iface(&p->wans[i], &p->pool);
+        drain_cq_iface_worker(&p->wans[i], &p->pool, tx_worker);
 }
 
 static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
@@ -780,26 +792,34 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 }
 
 
-static int tx_drain_iface(struct ne_iface *iface, struct ne_ring *src, uint32_t max_frame)
+static int tx_drain_iface_worker(struct ne_iface *iface, struct ne_ring *src, uint32_t max_frame,
+                               int tx_worker)
 {
-    int sent = 0;
-    int q = iface->tx_queue_rr % iface->queue_count;
-    sent += tx_drain_queue(&iface->queues[q], src, max_frame, &iface->tx_no_free);
-    iface->tx_queue_rr = (q + 1) % iface->queue_count;
-    return sent;
+    for (int q = 0; q < iface->queue_count; q++) {
+        if (!queue_owned_by_tx_worker(q, tx_worker))
+            continue;
+        int sent = tx_drain_queue(&iface->queues[q], src, max_frame, &iface->tx_no_free);
+        if (sent > 0)
+            return sent;
+    }
+    return 0;
 }
 
-int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx)
+int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx, int tx_worker)
 {
     if (!p || local_idx < 0 || local_idx >= p->local_count)
         return 0;
-    return tx_drain_iface(&p->locals[local_idx], src, p->frame_size);
+    if (tx_worker < 0 || tx_worker >= (int)NE_CRYPTO_WORKERS)
+        return 0;
+    return tx_drain_iface_worker(&p->locals[local_idx], src, p->frame_size, tx_worker);
 }
 
-int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx)
+int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx, int tx_worker)
 {
     if (!p || wan_idx < 0 || wan_idx >= p->wan_count)
         return 0;
-    return tx_drain_iface(&p->wans[wan_idx], src, p->frame_size);
+    if (tx_worker < 0 || tx_worker >= (int)NE_CRYPTO_WORKERS)
+        return 0;
+    return tx_drain_iface_worker(&p->wans[wan_idx], src, p->frame_size, tx_worker);
 }
 
