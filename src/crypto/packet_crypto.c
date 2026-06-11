@@ -4,11 +4,8 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <time.h>
 #include <openssl/evp.h>
-#include <openssl/err.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdatomic.h>
@@ -850,16 +847,6 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
 // }
 
 
-// #region agent log
-static const char *ne_dbg_log_path(void)
-{
-    const char *p = getenv("NE_DBG_LOG");
-
-    if (p && p[0])
-        return p;
-    return "./debug-dfdcf7.log";
-}
-
 static uint32_t ne_gcm_bump_epoch(void)
 {
     return (uint32_t)atomic_fetch_add_explicit(&g_gcm_epoch, 1u, memory_order_release) + 1u;
@@ -870,7 +857,7 @@ static uint32_t ne_gcm_current_epoch(void)
     return (uint32_t)atomic_load_explicit(&g_gcm_epoch, memory_order_acquire);
 }
 
-static uint64_t ne_dbg_ms(void)
+static uint64_t ne_gcm_monotonic_ms(void)
 {
     struct timespec ts;
 
@@ -878,51 +865,23 @@ static uint64_t ne_dbg_ms(void)
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
-static void ne_dbg_gcm_log(const char *hypothesisId, const char *location, const char *message,
-                           int enc, int step, int rv, int len, int nonce_len,
-                           unsigned long ossl_err, uint64_t gap_ms,
-                           uint64_t ok_since_gap, uint64_t fail_since_gap)
-{
-    FILE *f = fopen(ne_dbg_log_path(), "a");
-
-    if (!f)
-        return;
-    fprintf(f,
-            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-            "\"message\":\"%s\",\"data\":{\"enc\":%d,\"step\":%d,\"rv\":%d,\"len\":%d,"
-            "\"nonce_len\":%d,\"ossl_err\":%lu,\"gap_ms\":%llu,\"ok_since_gap\":%llu,"
-            "\"fail_since_gap\":%llu},\"timestamp\":%llu}\n",
-            hypothesisId, location, message, enc, step, rv, len, nonce_len, ossl_err,
-            (unsigned long long)gap_ms, (unsigned long long)ok_since_gap,
-            (unsigned long long)fail_since_gap, (unsigned long long)ne_dbg_ms());
-    fclose(f);
-}
-
-static __thread uint64_t dbg_gcm_last_ms;
-static __thread uint64_t dbg_gcm_ok_gap;
-static __thread uint64_t dbg_gcm_fail_gap;
-static __thread uint64_t dbg_gcm_total_ok;
-static __thread uint64_t dbg_gcm_total_fail;
+static __thread uint64_t gcm_last_packet_ms;
 
 static void ne_gcm_note_session_gap(int enc, int len, int nonce_len)
 {
-    uint64_t now = ne_dbg_ms();
-    uint64_t gap = dbg_gcm_last_ms ? (now - dbg_gcm_last_ms) : 0;
+    uint64_t now = ne_gcm_monotonic_ms();
+    uint64_t gap = gcm_last_packet_ms ? (now - gcm_last_packet_ms) : 0;
+
+    (void)len;
+    (void)nonce_len;
 
     /*
      * Bump epoch only on encrypt idle — reverse-path ctrl pkts (~1s apart)
      * must not invalidate encrypt fast path (was causing ~1.2G cap).
      */
-    if (enc && gap > GCM_SESSION_GAP_MS) {
-        uint32_t ep = ne_gcm_bump_epoch();
-
-        ne_dbg_gcm_log("H8", "packet_crypto.c:gcm_gap", "iperf_session_gap",
-                       enc, (int)ep, 0, len, nonce_len, 0, gap,
-                       dbg_gcm_ok_gap, dbg_gcm_fail_gap);
-        dbg_gcm_ok_gap = 0;
-        dbg_gcm_fail_gap = 0;
-    }
-    dbg_gcm_last_ms = now;
+    if (enc && gap > GCM_SESSION_GAP_MS)
+        ne_gcm_bump_epoch();
+    gcm_last_packet_ms = now;
 }
 
 static void gcm_enc_poison_ctx(EVP_CIPHER_CTX *evp)
@@ -945,7 +904,7 @@ static void ne_gcm_maybe_bump_auth_burst(int len)
 {
     static __thread uint64_t burst_first_ms;
     static __thread unsigned burst_count;
-    uint64_t now = ne_dbg_ms();
+    uint64_t now = ne_gcm_monotonic_ms();
     uint64_t prev;
 
     if (len > 80)
@@ -971,50 +930,21 @@ static void ne_gcm_maybe_bump_auth_burst(int len)
             memory_order_release, memory_order_acquire))
         return;
 
-    {
-        uint32_t ep = ne_gcm_bump_epoch();
-
-        ne_dbg_gcm_log("H11", "packet_crypto.c:gcm_burst", "auth_burst_epoch",
-                       0, (int)ep, 0, len, PACKET_CRYPTO_NONCE_BYTES, 0, 0,
-                       dbg_gcm_ok_gap, dbg_gcm_fail_gap);
-    }
+    ne_gcm_bump_epoch();
 }
 
-static void ne_dbg_gcm_fail(int enc, int step, int rv, int len, int nonce_len)
+static void ne_gcm_on_fail(int enc, int step, int len)
 {
-    unsigned long ossl_err = ERR_get_error();
-    const char *msg = "evp_step_fail";
-
-    dbg_gcm_fail_gap++;
-    dbg_gcm_total_fail++;
     if (enc) {
         ne_gcm_bump_epoch();
         gcm_enc_poison_ctx(get_gcm_enc_ctx());
     } else if (step == 5 && len <= 80) {
-        msg = "decrypt_auth_reject";
         gcm_dec_poison_ctx(get_gcm_dec_ctx());
         ne_gcm_maybe_bump_auth_burst(len);
     } else if (step >= 3) {
         gcm_dec_poison_ctx(get_gcm_dec_ctx());
     }
-    ne_dbg_gcm_log(enc ? "H1" : "H3", "packet_crypto.c:gcm_op", msg,
-                   enc, step, rv, len, nonce_len, ossl_err, 0,
-                   dbg_gcm_ok_gap, dbg_gcm_fail_gap);
 }
-
-static void ne_dbg_gcm_ok(int enc, int len, int nonce_len)
-{
-    dbg_gcm_ok_gap++;
-    dbg_gcm_total_ok++;
-    if (nonce_len != PACKET_CRYPTO_NONCE_BYTES)
-        ne_dbg_gcm_log("H2", "packet_crypto.c:gcm_op", "unexpected_nonce_len",
-                       enc, 0, 0, len, nonce_len, 0, 0, dbg_gcm_ok_gap, dbg_gcm_fail_gap);
-    if ((dbg_gcm_total_ok % 50000ull) == 0)
-        ne_dbg_gcm_log("H4", "packet_crypto.c:gcm_op", "periodic_ok",
-                       enc, 0, 0, len, nonce_len, 0, 0,
-                       dbg_gcm_ok_gap, dbg_gcm_fail_gap);
-}
-// #endregion
 
 static int gcm_enc_prepare_ctx(EVP_CIPHER_CTX *evp, const uint8_t *key, int nonce_len)
 {
@@ -1081,52 +1011,36 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE],
     evp = get_gcm_enc_ctx();
     if (!evp || !key || !nonce || !data || !tag_out) return -1;
 
-    // #region agent log
     ne_gcm_note_session_gap(1, len, nonce_len);
-    // #endregion
 
     if (gcm_enc_prepare_ctx(evp, key, nonce_len) != 0) {
-        // #region agent log
-        ne_dbg_gcm_fail(1, 1, 0, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(1, 1, len);
         return -1;
     }
 
     rv = EVP_EncryptInit_ex(evp, NULL, NULL, NULL, nonce);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(1, 2, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(1, 2, len);
         return -1;
     }
 
     rv = EVP_EncryptUpdate(evp, data, &out_len, data, len);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(1, 3, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(1, 3, len);
         return -1;
     }
 
     rv = EVP_EncryptFinal_ex(evp, data + out_len, &out_len);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(1, 4, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(1, 4, len);
         return -1;
     }
 
     rv = EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_SIZE, tag_out);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(1, 5, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(1, 5, len);
         return -1;
     }
-
-    // #region agent log
-    ne_dbg_gcm_ok(1, len, nonce_len);
-    // #endregion
 
     return 0;
 }
@@ -1144,57 +1058,41 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE],
     evp = get_gcm_dec_ctx();
     if (!evp || !key || !nonce || !data || !tag) return -1;
 
-    // #region agent log
     ne_gcm_note_session_gap(0, len, nonce_len);
-    // #endregion
 
     if (gcm_dec_prepare_ctx(evp, key, nonce_len) != 0) {
-        // #region agent log
-        ne_dbg_gcm_fail(0, 1, 0, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(0, 1, len);
         gcm_dec_poison_ctx(evp);
         return -1;
     }
 
     rv = EVP_DecryptInit_ex(evp, NULL, NULL, NULL, nonce);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(0, 2, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(0, 2, len);
         gcm_dec_poison_ctx(evp);
         return -1;
     }
 
     rv = EVP_CIPHER_CTX_ctrl(evp, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, (void *)tag);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(0, 3, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(0, 3, len);
         gcm_dec_poison_ctx(evp);
         return -1;
     }
 
     rv = EVP_DecryptUpdate(evp, data, &out_len, data, len);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(0, 4, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(0, 4, len);
         gcm_dec_poison_ctx(evp);
         return -1;
     }
 
     rv = EVP_DecryptFinal_ex(evp, data + out_len, &out_len);
     if (rv != 1) {
-        // #region agent log
-        ne_dbg_gcm_fail(0, 5, rv, len, nonce_len);
-        // #endregion
+        ne_gcm_on_fail(0, 5, len);
         gcm_dec_poison_ctx(evp);
         return -1;
     }
-
-    // #region agent log
-    ne_dbg_gcm_ok(0, len, nonce_len);
-    // #endregion
 
     return 0;
 }

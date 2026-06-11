@@ -20,18 +20,15 @@ struct forwarder {
     struct ne_ring mid_to_wan[MAX_INTERFACES][NE_CRYPTO_WORKERS];
     struct ne_ring mid_to_local[MAX_INTERFACES][NE_CRYPTO_WORKERS];
 
-    pthread_t local_rx_threads[NE_CRYPTO_WORKERS];
-    pthread_t local_tx_threads[NE_CRYPTO_WORKERS];
+    pthread_t local_thread;
+    pthread_t local_tx_threads[NE_TX_SLOTS];
     pthread_t crypto_threads[NE_CRYPTO_WORKERS];
-    pthread_t wan_tx_threads[NE_CRYPTO_WORKERS];
-    pthread_t wan_rx_threads[NE_CRYPTO_WORKERS];
+    pthread_t wan_tx_threads[NE_TX_SLOTS];
+    pthread_t wan_thread;
     int threads_started;
 
     uint64_t wan_tx_stuck[MAX_INTERFACES];
     uint32_t wan_tx_cooldown[MAX_INTERFACES];
-
-    int io_bypass_only;
-    int io_default_wan_dp;
 };
 
 static inline uint32_t fwd_mid_to_wan_depth(const struct forwarder *fwd, int wan_dp)
@@ -54,7 +51,6 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg);
 int forwarder_reload_wan_removal(struct forwarder *fwd, struct app_config *cfg);
 void forwarder_cleanup(struct forwarder *fwd);
 void forwarder_run(struct forwarder *fwd);
-void fwd_io_note_bypass_ring_full(void);
 void forwarder_stop(void);
 void forwarder_shutdown_resources(void);
 int forwarder_should_stop(void);

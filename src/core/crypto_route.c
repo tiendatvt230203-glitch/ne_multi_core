@@ -11,6 +11,7 @@
 static const uint8_t ne_crypto_cpus[NE_CRYPTO_WORKERS] = {
     NE_CPU_MID1,
     NE_CPU_MID2,
+    NE_CPU_MID3,
 };
 
 static __thread int tls_crypto_worker_idx;

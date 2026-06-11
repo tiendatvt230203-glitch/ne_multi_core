@@ -14,9 +14,7 @@
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
-    int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, job->addr), job->len);
-    if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
-        return -1;
+    int wi = dp_crypto_current_worker_idx();
 
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
@@ -132,58 +130,6 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
     *profile_idx = best_pi;
     *cp = best;
     return 0;
-}
-
-int dp_try_bypass_local_to_wan(struct forwarder *fwd, struct ne_packet *job)
-{
-    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
-    int li = job->local_idx < fwd->local_count ? (int)job->local_idx : 0;
-    int wan_dp;
-    int wi;
-
-    if (fwd->io_bypass_only && fwd->wan_count > 0) {
-        wan_dp = fwd->io_default_wan_dp;
-        if (wan_dp < 0 || wan_dp >= fwd->wan_count)
-            return -1;
-        wi = dp_crypto_pick_local_worker(pkt, job->len);
-        if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
-            return -1;
-        if (ne_ring_count(&fwd->mid_to_wan[wan_dp][wi]) + NE_BATCH_SIZE >=
-            fwd->mid_to_wan[wan_dp][wi].cap) {
-            fwd_io_note_bypass_ring_full();
-            return -1;
-        }
-        if (dp_apply_wan_l2(pkt, job->len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
-            return -1;
-        return push_to_wan(fwd, job, wan_dp) == 0 ? 1 : -1;
-    }
-
-    uint32_t src_ip = 0, dst_ip = 0;
-    uint16_t src_port = 0, dst_port = 0;
-    uint8_t proto = 0;
-    int flow_ok = dp_parse_flow(pkt, job->len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0;
-    int profile_idx;
-    const struct crypto_policy *cp;
-
-    if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                            &profile_idx, &cp) != 0)
-        return -1;
-    if (cp->action != POLICY_ACTION_BYPASS)
-        return 0;
-
-    wi = dp_crypto_pick_local_worker(pkt, job->len);
-    wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
-                                    src_port, dst_port, proto, job->len);
-    if (wan_dp < 0 || wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
-        return -1;
-    if (ne_ring_count(&fwd->mid_to_wan[wan_dp][wi]) + NE_BATCH_SIZE >=
-        fwd->mid_to_wan[wan_dp][wi].cap) {
-        fwd_io_note_bypass_ring_full();
-        return -1;
-    }
-    if (dp_apply_wan_l2(pkt, job->len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
-        return -1;
-    return push_to_wan(fwd, job, wan_dp) == 0 ? 1 : -1;
 }
 
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
