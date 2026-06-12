@@ -17,6 +17,7 @@
 #include "forwarder.h"
 #include "interface.h"
 #include "main_diag.h"
+#include "frag_bench.h"
 #include "pqc_handshake.h"
 #include "traffic_crypto.h"
 #define NOTIFY_CHANNEL "xdp_start"
@@ -62,9 +63,28 @@ struct runtime_state {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s                    daemon, wait NOTIFY xdp_start\n"
-            "  %s -id <profile_id>   notify daemon (load / unload / reload)\n",
-            prog, prog);
+            "  %s [-frag-only]       daemon (L2 split bench: no encrypt)\n"
+            "  %s -id <profile_id>   notify daemon (load / unload / reload)\n"
+            "\n"
+            "  -frag-only only affects the daemon process, not -id notify client.\n"
+            "  Equivalent: NE_FRAG_ONLY=1 %s\n",
+            prog, prog, prog);
+}
+
+static int parse_daemon_options(int argc, char **argv, int *frag_only_out)
+{
+    int frag_only = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-frag-only") == 0) {
+            frag_only = 1;
+            continue;
+        }
+        fprintf(stderr, "[FATAL] unknown daemon option: %s\n", argv[i]);
+        return -1;
+    }
+    *frag_only_out = frag_only;
+    return 0;
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {
@@ -800,10 +820,15 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (argc > 1) {
-        fprintf(stderr, "[FATAL] unknown arguments (got %d)\n", argc - 1);
-        usage(argv[0]);
-        return 1;
+    {
+        int frag_only_cli = 0;
+
+        if (argc > 1 && parse_daemon_options(argc, argv, &frag_only_cli) != 0) {
+            usage(argv[0]);
+            return 1;
+        }
+        if (frag_only_cli)
+            ne_frag_only_enable();
     }
 
     if (load_ne_env() != 0) {
@@ -838,6 +863,8 @@ int main(int argc, char **argv) {
     PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
 
     fprintf(stderr, "[DAEMON] listening %s — use %s -id <id>\n", NOTIFY_CHANNEL, argv[0]);
+    if (ne_frag_only_active())
+        fprintf(stderr, "[DAEMON] FRAG_ONLY active on this process (L2 split, no crypto)\n");
 
     /* forwarder is ~585 KiB; keep runtime off the main-thread stack (avoids segfault on small stacks). */
     struct runtime_state *rt = calloc(1, sizeof(*rt));
