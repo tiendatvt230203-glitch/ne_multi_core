@@ -187,6 +187,14 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
+uint32_t ne_pool_avail(struct ne_pair *p);
+
+int ne_tx_bench_emit_wan(struct ne_pair *p, int wan_idx, int tx_slot,
+                         const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                         uint32_t pkt_len);
+int ne_tx_bench_emit_local(struct ne_pair *p, int local_idx, int tx_slot,
+                           const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                           uint32_t pkt_len);
 
 void interface_reset_redirect_maps(void);
 int interface_push_encrypt_filters(const struct app_config *cfg);

@@ -886,3 +886,123 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
     return tx_drain_iface_all_rings(&p->wans[wan_idx], srcs, src_count, p->frame_size, tx_slot);
 }
 
+uint32_t ne_pool_avail(struct ne_pair *p)
+{
+    struct ne_pool *pool;
+    uint32_t avail = 0;
+
+    if (!p)
+        return 0;
+    pool = &p->pool;
+    pthread_spin_lock(&pool->lock);
+    avail = pool->head - pool->tail;
+    pthread_spin_unlock(&pool->lock);
+    return avail;
+}
+
+static void tx_bench_fill_frame(void *pkt, uint32_t len,
+                                const uint8_t dst_mac[6], const uint8_t src_mac[6])
+{
+    uint8_t *b = pkt;
+
+    if (!b || len < 14)
+        return;
+    memcpy(b, dst_mac, 6);
+    memcpy(b + 6, src_mac, 6);
+    b[12] = 0x08;
+    b[13] = 0x00;
+    if (len > 14)
+        memset(b + 14, 0x5a, len - 14);
+}
+
+static int tx_bench_emit_queue(struct ne_pair *p, struct ne_xsk_queue *slot,
+                               const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                               uint32_t pkt_len, uint64_t *tx_no_free)
+{
+    uint64_t addrs[NE_BATCH_SIZE];
+    uint32_t idx = 0;
+    uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
+    uint32_t want;
+    uint32_t got;
+    uint32_t i;
+
+    if (!free_slots) {
+        if (tx_no_free)
+            (*tx_no_free)++;
+        if (xsk_ring_prod__needs_wakeup(&slot->tx))
+            (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+        return 0;
+    }
+
+    want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    got = pool_pop(&p->pool, addrs, want);
+    if (!got)
+        return 0;
+
+    if (xsk_ring_prod__reserve(&slot->tx, got, &idx) != got) {
+        (void)pool_push(&p->pool, addrs, got);
+        return 0;
+    }
+
+    for (i = 0; i < got; i++) {
+        struct xdp_desc *d = xsk_ring_prod__tx_desc(&slot->tx, idx + i);
+        void *pkt = xsk_umem__get_data(p->bufs, addrs[i]);
+
+        tx_bench_fill_frame(pkt, pkt_len, dst_mac, src_mac);
+        d->addr = addrs[i];
+        d->len = pkt_len;
+    }
+
+    xsk_ring_prod__submit(&slot->tx, got);
+    if (xsk_ring_prod__needs_wakeup(&slot->tx))
+        (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+    return (int)got;
+}
+
+static int tx_bench_emit_iface(struct ne_pair *p, struct ne_iface *iface, int tx_slot,
+                               const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                               uint32_t pkt_len)
+{
+    int nq = iface->queue_count;
+    int sent = 0;
+    int q;
+
+    for (q = 0; q < nq; q++) {
+        int n;
+
+        if (!xsk_queue_for_io_slot(q, tx_slot, nq, (int)NE_TX_SLOTS))
+            continue;
+        n = tx_bench_emit_queue(p, &iface->queues[q], dst_mac, src_mac, pkt_len,
+                                &iface->tx_no_free);
+        if (n > 0)
+            sent += n;
+    }
+    return sent;
+}
+
+int ne_tx_bench_emit_wan(struct ne_pair *p, int wan_idx, int tx_slot,
+                         const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                         uint32_t pkt_len)
+{
+    if (!p || wan_idx < 0 || wan_idx >= p->wan_count || !dst_mac || !src_mac)
+        return 0;
+    if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
+        return 0;
+    if (pkt_len < 14 || pkt_len > p->frame_size)
+        return 0;
+    return tx_bench_emit_iface(p, &p->wans[wan_idx], tx_slot, dst_mac, src_mac, pkt_len);
+}
+
+int ne_tx_bench_emit_local(struct ne_pair *p, int local_idx, int tx_slot,
+                           const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                           uint32_t pkt_len)
+{
+    if (!p || local_idx < 0 || local_idx >= p->local_count || !dst_mac || !src_mac)
+        return 0;
+    if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
+        return 0;
+    if (pkt_len < 14 || pkt_len > p->frame_size)
+        return 0;
+    return tx_bench_emit_iface(p, &p->locals[local_idx], tx_slot, dst_mac, src_mac, pkt_len);
+}
+

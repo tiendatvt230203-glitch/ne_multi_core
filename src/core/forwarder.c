@@ -8,6 +8,7 @@
 #include "../../inc/core/local_hwaddr.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
+#include "../../inc/core/tx_bench.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
 
 #include <net/if.h>
@@ -35,8 +36,9 @@ void forwarder_pin_cpu(void)
     pin_cpu(NE_CPU_LOC);
 }
 
-#define IO_BURST_ROUNDS   8
-#define IO_TX_BURST_MAX   64
+#define IO_BURST_ROUNDS        8
+#define IO_TX_BURST_MAX        64
+#define TX_BENCH_LOG_INTERVAL_NS 1000000000ULL
 
 // #region agent log
 #define AGENT_TX_LOG_PATH "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log"
@@ -278,8 +280,111 @@ static void *local_tx_thread(void *arg)
         }
         if (!did_work)
             atomic_fetch_add_explicit(&local_tx_idle[tx_slot], 1, memory_order_relaxed);
-        agent_tx_maybe_log_local(fwd, tx_slot, &last_log_ns);
+        if (!ne_tx_bench_active())
+            agent_tx_maybe_log_local(fwd, tx_slot, &last_log_ns);
         sched_yield();
+    }
+    return NULL;
+}
+
+static void *wan_tx_bench_thread(void *arg)
+{
+    struct io_slot_ctx *ctx = arg;
+    struct forwarder *fwd = ctx->fwd;
+    int tx_slot = ctx->slot;
+    uint64_t last_log_ns = 0;
+    uint64_t sent_acc = 0;
+    uint64_t tx_nf_acc = 0;
+    uint64_t tx_nf_prev = 0;
+    const uint32_t pkt_len = ne_tx_bench_pkt_len();
+
+    pin_cpu(ctx->cpu_id);
+    if (fwd->wan_count > 0)
+        tx_nf_prev = fwd->pair.wans[0].tx_no_free;
+
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        struct timespec ts;
+        uint64_t now_ns;
+        int sent = 0;
+        int wi;
+
+        for (int i = 0; i < IO_BURST_ROUNDS; i++)
+            ne_drain_cq_wan(&fwd->pair, tx_slot);
+
+        for (wi = 0; wi < fwd->wan_count; wi++) {
+            sent += ne_tx_bench_emit_wan(&fwd->pair, wi, tx_slot,
+                                         fwd->wans[wi].dst_mac, fwd->wans[wi].src_mac,
+                                         pkt_len);
+        }
+        sent_acc += (uint64_t)sent;
+
+        if (fwd->wan_count > 0) {
+            uint64_t tx_nf_now = fwd->pair.wans[0].tx_no_free;
+
+            tx_nf_acc += tx_nf_now - tx_nf_prev;
+            tx_nf_prev = tx_nf_now;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        if (now_ns - last_log_ns >= TX_BENCH_LOG_INTERVAL_NS) {
+            ne_tx_bench_log_pps("wan", tx_slot, sent_acc, tx_nf_acc,
+                                ne_pool_avail(&fwd->pair));
+            sent_acc = 0;
+            tx_nf_acc = 0;
+            last_log_ns = now_ns;
+        }
+    }
+    return NULL;
+}
+
+static void *local_tx_bench_thread(void *arg)
+{
+    struct io_slot_ctx *ctx = arg;
+    struct forwarder *fwd = ctx->fwd;
+    int tx_slot = ctx->slot;
+    uint64_t last_log_ns = 0;
+    uint64_t sent_acc = 0;
+    uint64_t tx_nf_acc = 0;
+    uint64_t tx_nf_prev = 0;
+    const uint32_t pkt_len = ne_tx_bench_pkt_len();
+
+    pin_cpu(ctx->cpu_id);
+    if (fwd->local_count > 0)
+        tx_nf_prev = fwd->pair.locals[0].tx_no_free;
+
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        struct timespec ts;
+        uint64_t now_ns;
+        int sent = 0;
+        int li;
+
+        for (int i = 0; i < IO_BURST_ROUNDS; i++)
+            ne_drain_cq_local(&fwd->pair, tx_slot);
+
+        for (li = 0; li < fwd->local_count; li++) {
+            sent += ne_tx_bench_emit_local(&fwd->pair, li, tx_slot,
+                                           fwd->locals[li].dst_mac, fwd->locals[li].src_mac,
+                                           pkt_len);
+        }
+        sent_acc += (uint64_t)sent;
+
+        if (fwd->local_count > 0) {
+            uint64_t tx_nf_now = fwd->pair.locals[0].tx_no_free;
+
+            tx_nf_acc += tx_nf_now - tx_nf_prev;
+            tx_nf_prev = tx_nf_now;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        if (now_ns - last_log_ns >= TX_BENCH_LOG_INTERVAL_NS) {
+            ne_tx_bench_log_pps("local", tx_slot, sent_acc, tx_nf_acc,
+                                ne_pool_avail(&fwd->pair));
+            sent_acc = 0;
+            tx_nf_acc = 0;
+            last_log_ns = now_ns;
+        }
     }
     return NULL;
 }
@@ -351,7 +456,8 @@ static void *wan_tx_thread(void *arg)
         }
         if (!did_work)
             atomic_fetch_add_explicit(&wan_tx_idle[tx_slot], 1, memory_order_relaxed);
-        agent_tx_maybe_log_wan(fwd, tx_slot, &last_log_ns);
+        if (!ne_tx_bench_active())
+            agent_tx_maybe_log_wan(fwd, tx_slot, &last_log_ns);
         sched_yield();
     }
     return NULL;
@@ -444,6 +550,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     if (forwarder_should_stop())
         return -1;
+
+    ne_tx_bench_init_from_env();
 
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
@@ -572,6 +680,51 @@ void forwarder_run(struct forwarder *fwd)
         return;
 
     g_active_fwd = fwd;
+
+    if (ne_tx_bench_active()) {
+        enum ne_tx_bench_dir dir = ne_tx_bench_direction();
+
+        if (dir == NE_TX_BENCH_WAN) {
+            for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
+                wan_tx_ctx[w].fwd = fwd;
+                wan_tx_ctx[w].slot = w;
+                wan_tx_ctx[w].cpu_id = wan_tx_cpus[w];
+                if (pthread_create(&fwd->wan_tx_threads[w], NULL, wan_tx_bench_thread,
+                                   &wan_tx_ctx[w]) != 0) {
+                    forwarder_join_started(fwd, 0, 0, 0, wan_tx_started, 0);
+                    return;
+                }
+                wan_tx_started++;
+            }
+        } else {
+            for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
+                local_tx_ctx[w].fwd = fwd;
+                local_tx_ctx[w].slot = w;
+                local_tx_ctx[w].cpu_id = local_tx_cpus[w];
+                if (pthread_create(&fwd->local_tx_threads[w], NULL, local_tx_bench_thread,
+                                   &local_tx_ctx[w]) != 0) {
+                    forwarder_join_started(fwd, 0, local_tx_started, 0, 0, 0);
+                    return;
+                }
+                local_tx_started++;
+            }
+        }
+
+        fwd->threads_started = 1;
+        if (fwd->cfg)
+            main_diag_log_dataplane_ready(fwd->cfg);
+        if (dir == NE_TX_BENCH_WAN) {
+            for (int w = 0; w < wan_tx_started; w++)
+                pthread_join(fwd->wan_tx_threads[w], NULL);
+        } else {
+            for (int w = 0; w < local_tx_started; w++)
+                pthread_join(fwd->local_tx_threads[w], NULL);
+        }
+        fwd->threads_started = 0;
+        if (g_active_fwd == fwd)
+            g_active_fwd = NULL;
+        return;
+    }
 
     if (pthread_create(&fwd->local_thread, NULL, local_rx_thread, fwd) != 0)
         return;
