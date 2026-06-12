@@ -613,21 +613,30 @@ static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t
     return (int)n;
 }
 
+static int xsk_queue_for_io_slot(int q, int slot, int nq, int n_slots)
+{
+    int slots = nq < n_slots ? (nq > 0 ? nq : 1) : n_slots;
+
+    if (slot >= slots)
+        return 0;
+    return (q % slots) == slot;
+}
+
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 {
     uint32_t total = 0;
-    struct ne_packet *out_ptr = out; 
+    struct ne_packet *out_ptr = out;
 
     for (int i = 0; i < p->local_count && total < max; i++) {
         struct ne_iface *iface = &p->locals[i];
         int q_count = iface->queue_count;
-        
+
         for (int q = 0; q < q_count && total < max; q++) {
-            iface->queues[q].rx_pending = 0; 
-            
+            iface->queues[q].rx_pending = 0;
+
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
                                NE_DIR_LOCAL, 0, (uint8_t)i);
-            
+
             total += (uint32_t)n;
             out_ptr += n;
         }
@@ -638,25 +647,24 @@ int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 {
     uint32_t total = 0;
-    struct ne_packet *out_ptr = out; 
+    struct ne_packet *out_ptr = out;
 
     for (int i = 0; i < p->wan_count && total < max; i++) {
         struct ne_iface *iface = &p->wans[i];
         int q_count = iface->queue_count;
-        
+
         for (int q = 0; q < q_count && total < max; q++) {
-            iface->queues[q].rx_pending = 0; 
-            
+            iface->queues[q].rx_pending = 0;
+
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
                                NE_DIR_WAN, (uint8_t)i, 0);
-            
+
             total += (uint32_t)n;
             out_ptr += n;
         }
     }
     return (int)total;
 }
-
 
 void ne_recv_release_local(struct ne_pair *p)
 {
@@ -701,21 +709,13 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     }
 }
 
-static int xsk_queue_for_tx_slot(int q, int tx_slot, int nq)
-{
-    int slots = nq < (int)NE_TX_SLOTS ? (nq > 0 ? nq : 1) : (int)NE_TX_SLOTS;
-
-    if (tx_slot >= slots)
-        return 0;
-    return (q % slots) == tx_slot;
-}
 
 static void drain_cq_iface_slot(struct ne_iface *iface, struct ne_pool *pool, int tx_slot)
 {
     int nq = iface->queue_count;
 
     for (int q = 0; q < nq; q++) {
-        if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
+        if (!xsk_queue_for_io_slot(q, tx_slot, nq, (int)NE_TX_SLOTS))
             continue;
         drain_cq_queue(&iface->queues[q], pool);
     }
@@ -825,7 +825,7 @@ static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint
     int nq = iface->queue_count;
 
     for (int q = 0; q < nq; q++) {
-        if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
+        if (!xsk_queue_for_io_slot(q, tx_slot, nq, (int)NE_TX_SLOTS))
             continue;
         int sent = tx_drain_queue(&iface->queues[q], src, max_frame, &iface->tx_no_free);
         if (sent > 0)
