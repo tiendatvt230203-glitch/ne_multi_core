@@ -1,7 +1,6 @@
 #include "../../inc/core/profile_iface_xdp.h"
 
 #include "../../inc/core/forwarder_crypto_runtime.h"
-#include "../../inc/core/forwarder_reload.h"
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/core/local_hwaddr.h"
@@ -12,9 +11,9 @@
 #include <net/if.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
-/* --- config ifname helpers --- */
+int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
+                                      enum profile_iface_xdp_reload_mode mode);
 
 static int cfg_has_local_ifname(const struct app_config *cfg, const char *ifname)
 {
@@ -38,7 +37,6 @@ static int cfg_has_wan_ifname(const struct app_config *cfg, const char *ifname)
     return 0;
 }
 
-/* --- LAN share vs WAN exclusive policy --- */
 
 static int lan_still_in_merged_cfg(const struct app_config *cfg, const char *ifname)
 {
@@ -59,24 +57,6 @@ static int wan_dataplane_dropped_from_merged(const struct app_config *old,
            !fwd_wan_ifname_dataplane_in_cfg(new, ifname);
 }
 
-// #region agent log
-static void dbg_log_xdp_decision(const char *location, const char *message,
-                                 const char *ifname, const char *action, const char *hypothesisId)
-{
-    FILE *f = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
-
-    if (!f)
-        return;
-    fprintf(f,
-            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-            "\"message\":\"%s\",\"data\":{\"ifname\":\"%s\",\"action\":\"%s\"},"
-            "\"timestamp\":%ld}\n",
-            hypothesisId ? hypothesisId : "", location ? location : "",
-            message ? message : "", ifname ? ifname : "", action ? action : "",
-            (long)time(NULL) * 1000L);
-    fclose(f);
-}
-// #endregion
 
 static int cfg_locals_subset(const struct app_config *sub, const struct app_config *sup)
 {
@@ -211,6 +191,14 @@ static int cfg_shared_ifaces_unchanged(const struct app_config *old, const struc
     return 1;
 }
 
+void profile_iface_xdp_prepare_init(const struct app_config *cfg)
+{
+    if (!cfg)
+        return;
+    interface_ip_xdp_off_config(cfg);
+    interface_reset_redirect_maps();
+}
+
 int profile_iface_xdp_can_add(const struct app_config *old, const struct app_config *new)
 {
     if (!old || !new || !old->profile_count)
@@ -240,7 +228,6 @@ int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_c
     return 1;
 }
 
-/* --- BPF / XDP bind --- */
 
 static int read_xdp_prog_id(const char *ifname, uint32_t *out_id)
 {
@@ -384,8 +371,6 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         fprintf(stderr,
                 "[PROFILE-XDP] LAN %s xdp/id:%u — skip attach, refresh xsks_map (shared)\n",
                 ifname, existing_id);
-        dbg_log_xdp_decision("profile_iface_xdp.c:bind_local", "lan_skip_attach_refresh_map",
-                             ifname, "skip_attach_refresh_map", "H1");
         return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
     }
 
@@ -393,8 +378,6 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         fprintf(stderr,
                 "[PROFILE-XDP] LAN %s xdp/id:%u — skip attach (shared, other profile owns xdp)\n",
                 ifname, existing_id);
-        dbg_log_xdp_decision("profile_iface_xdp.c:bind_local", "lan_skip_attach_no_owner",
-                             ifname, "skip_attach_no_bind", "H1");
         return 0;
     }
 
@@ -404,8 +387,6 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, ifname, "LAN") != 0)
         return -1;
-    dbg_log_xdp_decision("profile_iface_xdp.c:bind_local", "lan_attach",
-                         ifname, "attach", "H1");
     return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
 }
 
@@ -427,7 +408,6 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
     return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map));
 }
 
-/* --- forwarder slot helpers --- */
 
 static void init_fwd_local_meta(struct forwarder *fwd, int li,
                                 const struct app_config *cfg, int cfg_local_idx)
@@ -470,7 +450,6 @@ static int crypto_finish_reload(struct forwarder *fwd, struct app_config *cfg,
     return forwarder_should_stop() ? -1 : rc;
 }
 
-/* LAN row REMOVE: keep xdp/id while merged config still lists the ifname. */
 static int detach_removed_lan_rows(struct forwarder *fwd, const struct app_config *new_cfg)
 {
     for (int li = 0; li < fwd->local_count; li++) {
@@ -482,8 +461,6 @@ static int detach_removed_lan_rows(struct forwarder *fwd, const struct app_confi
             fprintf(stderr,
                     "[PROFILE-XDP] REMOVE LAN row: %s other profile(s) still use — keep xdp/id\n",
                     ifname);
-            dbg_log_xdp_decision("profile_iface_xdp.c:detach_lan_rows", "lan_row_keep_shared",
-                                 ifname, "keep_xdp", "H2");
             continue;
         }
         uint32_t dropped = 0;
@@ -497,14 +474,11 @@ static int detach_removed_lan_rows(struct forwarder *fwd, const struct app_confi
         fprintf(stderr,
                 "[PROFILE-XDP] REMOVE LAN row: %s no profile left — detach xdp/id (flushed %u pkts)\n",
                 ifname, dropped);
-        dbg_log_xdp_decision("profile_iface_xdp.c:detach_lan_rows", "lan_row_detach_last_user",
-                             ifname, "detach_xdp", "H3");
         ne_pair_unplumb_local(&fwd->pair, li);
     }
     return 0;
 }
 
-/* WAN row REMOVE: exclusive — always detach when WAN leaves merged dataplane. */
 static int detach_removed_wan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
                                  const struct app_config *old_cfg)
 {
@@ -519,14 +493,11 @@ static int detach_removed_wan_rows(struct forwarder *fwd, const struct app_confi
         fprintf(stderr,
                 "[PROFILE-XDP] REMOVE WAN row: %s exclusive — detach xdp/id (flushed %u pkts)\n",
                 ifname, dropped);
-        dbg_log_xdp_decision("profile_iface_xdp.c:detach_wan_rows", "wan_detach_exclusive",
-                             ifname, "detach_xdp", "H5");
         ne_pair_unplumb_wan_dp(&fwd->pair, di);
     }
     return 0;
 }
 
-/* LAN row ADD: skip when another profile already brought this ifname into merged config. */
 static int attach_new_lan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
                                const struct app_config *old_cfg)
 {
@@ -537,8 +508,6 @@ static int attach_new_lan_rows(struct forwarder *fwd, const struct app_config *n
             fprintf(stderr,
                     "[PROFILE-XDP] ADD LAN row: %s already used by other profile — skip xdp/id\n",
                     ifname);
-            dbg_log_xdp_decision("profile_iface_xdp.c:attach_lan_rows", "lan_row_shared_skip",
-                                 ifname, "skip_add", "H1");
             continue;
         }
 
@@ -558,13 +527,10 @@ static int attach_new_lan_rows(struct forwarder *fwd, const struct app_config *n
         fwd->local_count++;
         fprintf(stderr, "[PROFILE-XDP] ADD LAN row: %s first use — attach xdp/id (slot %d)\n",
                 ifname, li);
-        dbg_log_xdp_decision("profile_iface_xdp.c:attach_lan_rows", "lan_row_first_attach",
-                             ifname, "attach", "H1");
     }
     return 0;
 }
 
-/* WAN row ADD: always exclusive; every new dataplane WAN gets xdp/id. */
 static int attach_new_wan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
                               const struct app_config *old_cfg)
 {
@@ -592,8 +558,6 @@ static int attach_new_wan_rows(struct forwarder *fwd, const struct app_config *n
         fwd->wan_count++;
         fprintf(stderr, "[PROFILE-XDP] ADD WAN row: %s new — attach xdp/id (dp slot %d)\n",
                 ifname, di);
-        dbg_log_xdp_decision("profile_iface_xdp.c:attach_wan_rows", "wan_row_attach",
-                             ifname, "attach", "H4");
     }
     return 0;
 }

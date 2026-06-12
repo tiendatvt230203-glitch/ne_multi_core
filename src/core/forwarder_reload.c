@@ -54,7 +54,6 @@ static int locals_topology_unchanged(const struct app_config *old,
     return 1;
 }
 
-
 int forwarder_is_wan_only_removal(const struct app_config *old, const struct app_config *new)
 {
     if (!locals_topology_unchanged(old, new))
@@ -137,10 +136,6 @@ static int forwarder_reload_wan_removal_impl(struct forwarder *fwd, struct app_c
     return forwarder_should_stop() ? -1 : rc;
 }
 
-/*
- * Hot reload (same LAN/WAN ifnames): Postgres policies/crypto only.
- * LAN subnet from DB; fwd->locals src MAC refreshed on reload.
- */
 static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg)
 {
     if (forwarder_should_stop())

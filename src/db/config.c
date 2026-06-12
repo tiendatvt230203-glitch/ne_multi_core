@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <time.h>
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <netinet/in.h>
@@ -116,56 +115,119 @@ static int parse_hex_bytes(const char *str, uint8_t *out, int expected_len) {
     return 0;
 }
 
-static const char *profile_name_by_id(const struct app_config *cfg, int profile_id) {
-    if (!cfg)
-        return "?";
-    for (int i = 0; i < cfg->profile_count; i++) {
-        if (cfg->profiles[i].id == profile_id)
-            return cfg->profiles[i].name;
+static void format_profiles_for_policy(const struct app_config *cfg, int policy_idx,
+                                       char *buf, size_t buflen)
+{
+    size_t pos = 0;
+
+    if (!buf || buflen == 0)
+        return;
+    buf[0] = '\0';
+    if (!cfg || policy_idx < 0 || policy_idx >= cfg->policy_count)
+        return;
+
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int k = 0; k < p->policy_count; k++) {
+            if (p->policy_indices[k] != policy_idx)
+                continue;
+            int n = snprintf(buf + pos, buflen - pos, "%s%d(%s)",
+                               pos ? ", " : "", p->id, p->name);
+            if (n < 0 || (size_t)n >= buflen - pos)
+                return;
+            pos += (size_t)n;
+        }
     }
-    return "?";
 }
 
 static int config_validate_wan_profile_exclusivity(struct app_config *cfg) {
-    int owner[MAX_INTERFACES];
-
-    for (int i = 0; i < MAX_INTERFACES; i++)
-        owner[i] = -1;
+    struct wan_owner_entry {
+        char ifname[IF_NAMESIZE];
+        int profile_id;
+        char profile_name[64];
+    } owners[MAX_INTERFACES];
+    int owner_count = 0;
 
     for (int pi = 0; pi < cfg->profile_count; pi++) {
         const struct profile_config *p = &cfg->profiles[pi];
         for (int wi = 0; wi < p->wan_count; wi++) {
             int widx = p->wan_indices[wi];
+            const struct wan_config *wan;
+            int found = -1;
+
             if (widx < 0 || widx >= cfg->wan_count)
                 continue;
-            if (owner[widx] >= 0 && owner[widx] != p->id) {
-                const char *ifname = cfg->wans[widx].ifname;
-                fprintf(stderr,
-                        "[CONFIG] WAN %s is used by profile %d (%s) and profile %d (%s) — "
-                        "each WAN may belong to only one profile (LAN may be shared)\n",
-                        ifname, owner[widx], profile_name_by_id(cfg, owner[widx]),
-                        p->id, p->name);
-                // #region agent log
-                {
-                    FILE *df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
-                    if (df) {
-                        fprintf(df,
-                                "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"WAN_EXCL\","
-                                "\"location\":\"config.c:config_validate_wan_profile_exclusivity\","
-                                "\"message\":\"wan profile conflict\","
-                                "\"data\":{\"ifname\":\"%s\",\"owner_profile\":%d,\"other_profile\":%d},"
-                                "\"timestamp\":%lld}\n",
-                                ifname, owner[widx], p->id,
-                                (long long)time(NULL) * 1000);
-                        fclose(df);
-                    }
+            wan = &cfg->wans[widx];
+            if (!wan->dataplane)
+                continue;
+
+            for (int oi = 0; oi < owner_count; oi++) {
+                if (strcmp(owners[oi].ifname, wan->ifname) == 0) {
+                    found = oi;
+                    break;
                 }
-                // #endregion
+            }
+
+            if (found >= 0) {
+                if (owners[found].profile_id != p->id) {
+                    fprintf(stderr,
+                            "[CONFIG][VALIDATE] WAN dataplane %s conflict: profile %d (%s) vs profile %d (%s)\n",
+                            wan->ifname,
+                            owners[found].profile_id, owners[found].profile_name,
+                            p->id, p->name);
+                    return -1;
+                }
+                continue;
+            }
+
+            if (owner_count >= MAX_INTERFACES) {
+                fprintf(stderr, "[CONFIG][VALIDATE] WAN owner table full\n");
                 return -1;
             }
-            owner[widx] = p->id;
+            strncpy(owners[owner_count].ifname, wan->ifname, sizeof(owners[owner_count].ifname) - 1);
+            owners[owner_count].profile_id = p->id;
+            strncpy(owners[owner_count].profile_name, p->name,
+                    sizeof(owners[owner_count].profile_name) - 1);
+            owner_count++;
         }
     }
+
+    fprintf(stderr, "[CONFIG][VALIDATE] WAN dataplane exclusivity OK (%d ifname(s), %d profile(s))\n",
+            owner_count, cfg->profile_count);
+    return 0;
+}
+
+static int config_validate_policy_id_uniqueness(struct app_config *cfg) {
+    for (int i = 0; i < cfg->policy_count; i++) {
+        for (int j = i + 1; j < cfg->policy_count; j++) {
+            const struct crypto_policy *a = &cfg->policies[i];
+            const struct crypto_policy *b = &cfg->policies[j];
+            char prof_a[160];
+            char prof_b[160];
+
+            if (a->db_id > 0 && a->db_id == b->db_id) {
+                format_profiles_for_policy(cfg, i, prof_a, sizeof(prof_a));
+                format_profiles_for_policy(cfg, j, prof_b, sizeof(prof_b));
+                fprintf(stderr,
+                        "[CONFIG][VALIDATE] policy db_id=%d duplicated: "
+                        "slot[%d] wire=%d profiles{%s} vs slot[%d] wire=%d profiles{%s}\n",
+                        a->db_id, i, a->id, prof_a, j, b->id, prof_b);
+                return -1;
+            }
+            if (a->id == b->id) {
+                format_profiles_for_policy(cfg, i, prof_a, sizeof(prof_a));
+                format_profiles_for_policy(cfg, j, prof_b, sizeof(prof_b));
+                fprintf(stderr,
+                        "[CONFIG][VALIDATE] policy wire id=%d duplicated: "
+                        "slot[%d] db_id=%d profiles{%s} vs slot[%d] db_id=%d profiles{%s}\n",
+                        a->id, i, a->db_id, prof_a, j, b->db_id, prof_b);
+                return -1;
+            }
+        }
+    }
+
+    fprintf(stderr, "[CONFIG][VALIDATE] policy id uniqueness OK (%d policy row(s))\n",
+            cfg->policy_count);
     return 0;
 }
 
@@ -253,6 +315,9 @@ int config_validate(struct app_config *cfg) {
     }
 
     if (config_validate_wan_profile_exclusivity(cfg) != 0)
+        return -1;
+
+    if (config_validate_policy_id_uniqueness(cfg) != 0)
         return -1;
 
     return 0;

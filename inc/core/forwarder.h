@@ -5,8 +5,6 @@
 #include "crypto_route.h"
 #include "flow_table.h"
 
-extern struct forwarder *g_active_fwd;
-
 struct forwarder {
     struct app_config *cfg;
 

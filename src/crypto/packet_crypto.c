@@ -3,7 +3,9 @@
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
-
+#include "../../inc/crypto/types.h"
+#include "../../inc/crypto/traffic_crypto.h"
+#include "../../inc/scrypt.h"
 #include <string.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -309,18 +311,29 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t i
         return 0;
 
     evp = tls_ctx_get(&tls_ctr_ctx);
-    if (!evp)
+    if (!evp){
+        printf("Het ram\n");
         return -1;
+    }
 
     ks = key_size_bytes();
-    key_changed = tls_ctr_key_len != ks || memcmp(tls_ctr_key, key, (size_t)ks) != 0;
-
+    if (tls_ctr_key_len != ks) {
+        key_changed = 1;
+    }
+    else if (memcmp(tls_ctr_key, key, (size_t)ks) != 0) {
+        key_changed = 1;
+    } 
+    else {
+        key_changed = 0;
+    }
+    
     if (key_changed) {
         if (EVP_EncryptInit_ex(evp, cipher_ctr(), NULL, key, iv) != 1)
             return -1;
         memcpy(tls_ctr_key, key, (size_t)ks);
         tls_ctr_key_len = ks;
-    } else if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, iv) != 1) {
+    } 
+    else if (EVP_EncryptInit_ex(evp, NULL, NULL, NULL, iv) != 1) {
         return -1;
     }
 
@@ -332,8 +345,6 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t i
     return 0;
 }
 
-/* --- AES-GCM --- */
-
 int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len, uint8_t tag_out[AES_GCM_TAG_SIZE])
 {
@@ -343,12 +354,13 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
     if (len <= 0)
         return 0;
     if (!key || !nonce || !data || !tag_out)
-        return -1;
-
+        return -1;  
+    
     evp = tls_ctx_get(&tls_gcm_enc_ctx);
-    if (!evp)
+    if (!evp) {
+        printf("Het ram gcm\n");
         return -1;
-
+    }
     if (gcm_bind_key(evp, 1, key, nonce_len, tls_gcm_enc_key, &tls_gcm_enc_key_len,
                      &tls_gcm_enc_nonce_len) != 0) {
         tls_gcm_invalidate_enc();
@@ -376,7 +388,7 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
 
 int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len, const uint8_t tag[AES_GCM_TAG_SIZE])
-{
+{  
     EVP_CIPHER_CTX *evp;
     int out_len;
 
@@ -542,7 +554,6 @@ uint16_t crypto_calc_udp_checksum(const uint8_t *ip_hdr, int ip_hdr_len, const u
     return (uint16_t)(~sum);
 }
 
-/* --- dispatch --- */
 
 int packet_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {

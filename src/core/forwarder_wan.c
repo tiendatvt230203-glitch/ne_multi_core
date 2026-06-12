@@ -78,8 +78,6 @@ int fwd_wan_dp_ok_for_new_traffic(int dp)
 {
     if (dp < 0 || dp >= MAX_INTERFACES || wan_stopped[dp])
         return 0;
-    if (g_active_fwd && !ne_pair_wan_live(&g_active_fwd->pair, dp))
-        return 0;
     if (wan_drains[dp].active)
         return 0;
     return dp < wan_active_dp_count;

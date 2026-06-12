@@ -467,11 +467,13 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     for (int i = 0; i < p->local_count; i++) {
         NE_TRY(profile_iface_xdp_bind_local(p, cfg, i));
         p->xdp_local_on[i] = 1;
+        p->local_live[i] = 1;
     }
 
     for (int di = 0; di < p->wan_count; di++) {
         NE_TRY(profile_iface_xdp_bind_wan(p, cfg, di, cfg->fake_ethertype_ipv4));
         p->xdp_wan_on[di] = 1;
+        p->wan_live[di] = 1;
     }
 
     uint32_t prefill = NE_RING - 1;
@@ -481,10 +483,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         prefill_iface(p, &p->locals[i], prefill);
     for (int i = 0; i < p->wan_count; i++)
         prefill_iface(p, &p->wans[i], prefill);
-    for (int i = 0; i < p->local_count; i++)
-        p->local_live[i] = 1;
-    for (int i = 0; i < p->wan_count; i++)
-        p->wan_live[i] = 1;
 
     return 0;
 
@@ -661,32 +659,23 @@ static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t
     return (int)n;
 }
 
-static int xsk_queue_for_io_slot(int q, int slot, int nq, int n_slots)
-{
-    int slots = nq < n_slots ? (nq > 0 ? nq : 1) : n_slots;
-
-    if (slot >= slots)
-        return 0;
-    return (q % slots) == slot;
-}
-
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 {
     uint32_t total = 0;
-    struct ne_packet *out_ptr = out;
+    struct ne_packet *out_ptr = out; 
 
     for (int i = 0; i < p->local_count && total < max; i++) {
         if (!p->local_live[i])
             continue;
         struct ne_iface *iface = &p->locals[i];
         int q_count = iface->queue_count;
-
+        
         for (int q = 0; q < q_count && total < max; q++) {
-            iface->queues[q].rx_pending = 0;
-
+            iface->queues[q].rx_pending = 0; 
+            
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
                                NE_DIR_LOCAL, 0, (uint8_t)i);
-
+            
             total += (uint32_t)n;
             out_ptr += n;
         }
@@ -697,20 +686,20 @@ int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
 {
     uint32_t total = 0;
-    struct ne_packet *out_ptr = out;
+    struct ne_packet *out_ptr = out; 
 
     for (int i = 0; i < p->wan_count && total < max; i++) {
         if (!p->wan_live[i])
             continue;
         struct ne_iface *iface = &p->wans[i];
         int q_count = iface->queue_count;
-
+        
         for (int q = 0; q < q_count && total < max; q++) {
-            iface->queues[q].rx_pending = 0;
-
+            iface->queues[q].rx_pending = 0; 
+            
             int n = recv_queue(&iface->queues[q], out_ptr, max - total,
                                NE_DIR_WAN, (uint8_t)i, 0);
-
+            
             total += (uint32_t)n;
             out_ptr += n;
         }
@@ -718,9 +707,12 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
     return (int)total;
 }
 
+
 void ne_recv_release_local(struct ne_pair *p)
 {
     for (int i = 0; i < p->local_count; i++) {
+        if (!p->local_live[i])
+            continue;
         struct ne_iface *iface = &p->locals[i];
         for (int q = 0; q < iface->queue_count; q++) {
             if (iface->queues[q].rx_pending) {
@@ -734,6 +726,8 @@ void ne_recv_release_local(struct ne_pair *p)
 void ne_recv_release_wan(struct ne_pair *p)
 {
     for (int i = 0; i < p->wan_count; i++) {
+        if (!p->wan_live[i])
+            continue;
         struct ne_iface *iface = &p->wans[i];
         for (int q = 0; q < iface->queue_count; q++) {
             if (iface->queues[q].rx_pending) {
@@ -761,13 +755,21 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     }
 }
 
+static int xsk_queue_for_tx_slot(int q, int tx_slot, int nq)
+{
+    int slots = nq < (int)NE_TX_SLOTS ? (nq > 0 ? nq : 1) : (int)NE_TX_SLOTS;
+
+    if (tx_slot >= slots)
+        return 0;
+    return (q % slots) == tx_slot;
+}
 
 static void drain_cq_iface_slot(struct ne_iface *iface, struct ne_pool *pool, int tx_slot)
 {
     int nq = iface->queue_count;
 
     for (int q = 0; q < nq; q++) {
-        if (!xsk_queue_for_io_slot(q, tx_slot, nq, (int)NE_TX_SLOTS))
+        if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
             continue;
         drain_cq_queue(&iface->queues[q], pool);
     }
@@ -777,16 +779,22 @@ void ne_drain_cq_local(struct ne_pair *p, int tx_slot)
 {
     if (!p || tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return;
-    for (int i = 0; i < p->local_count; i++)
+    for (int i = 0; i < p->local_count; i++) {
+        if (!p->local_live[i])
+            continue;
         drain_cq_iface_slot(&p->locals[i], &p->pool, tx_slot);
+    }
 }
 
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot)
 {
     if (!p || tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return;
-    for (int i = 0; i < p->wan_count; i++)
+    for (int i = 0; i < p->wan_count; i++) {
+        if (!p->wan_live[i])
+            continue;
         drain_cq_iface_slot(&p->wans[i], &p->pool, tx_slot);
+    }
 }
 
 static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
@@ -817,14 +825,20 @@ static void refill_fq_iface(struct ne_iface *iface, struct ne_pool *pool)
 
 void ne_refill_fq_local(struct ne_pair *p)
 {
-    for (int i = 0; i < p->local_count; i++)
+    for (int i = 0; i < p->local_count; i++) {
+        if (!p->local_live[i])
+            continue;
         refill_fq_iface(&p->locals[i], &p->pool);
+    }
 }
 
 void ne_refill_fq_wan(struct ne_pair *p)
 {
-    for (int i = 0; i < p->wan_count; i++)
+    for (int i = 0; i < p->wan_count; i++) {
+        if (!p->wan_live[i])
+            continue;
         refill_fq_iface(&p->wans[i], &p->pool);
+    }
 }
 
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,
@@ -877,7 +891,7 @@ static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint
     int nq = iface->queue_count;
 
     for (int q = 0; q < nq; q++) {
-        if (!xsk_queue_for_io_slot(q, tx_slot, nq, (int)NE_TX_SLOTS))
+        if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
             continue;
         int sent = tx_drain_queue(&iface->queues[q], src, max_frame, &iface->tx_no_free);
         if (sent > 0)
@@ -901,7 +915,7 @@ static int tx_drain_iface_all_rings(struct ne_iface *iface, struct ne_ring *srcs
 
 int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx, int tx_slot)
 {
-    if (!p || local_idx < 0 || local_idx >= p->local_count || !src)
+    if (!p || local_idx < 0 || local_idx >= p->local_count || !p->local_live[local_idx] || !src)
         return 0;
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
@@ -910,7 +924,7 @@ int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx, int
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx, int tx_slot)
 {
-    if (!p || wan_idx < 0 || wan_idx >= p->wan_count || !src)
+    if (!p || wan_idx < 0 || wan_idx >= p->wan_count || !p->wan_live[wan_idx] || !src)
         return 0;
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
@@ -920,7 +934,7 @@ int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx, int tx_
 int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
                           int local_idx, int tx_slot)
 {
-    if (!p || local_idx < 0 || local_idx >= p->local_count)
+    if (!p || local_idx < 0 || local_idx >= p->local_count || !p->local_live[local_idx])
         return 0;
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
@@ -931,7 +945,7 @@ int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_cou
 int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
                         int wan_idx, int tx_slot)
 {
-    if (!p || wan_idx < 0 || wan_idx >= p->wan_count)
+    if (!p || wan_idx < 0 || wan_idx >= p->wan_count || !p->wan_live[wan_idx])
         return 0;
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;

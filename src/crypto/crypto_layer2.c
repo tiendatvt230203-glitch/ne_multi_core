@@ -233,7 +233,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     uint8_t *work_ptr = packet + l2_enc_start;
 
-    if (likely(is_gcm)) {
+    if (likely(is_gcm)) {   
         if (unlikely(crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) != 0))
             return -1;
     } else {

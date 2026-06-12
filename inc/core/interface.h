@@ -11,39 +11,17 @@
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
 
-/*
- * Dataplane CPU map — 11 pinned threads:
- *
- *   NE_CPU_LOC        (0)   local RX:  XDP redirect recv + FQ refill (all queues)
- *   NE_CPU_LOC_TX     (1)   local TX[0]: mid_to_local[*][*] + XSK queue q%3==0
- *   NE_CPU_LOC_TX1    (2)   local TX[1]: mid_to_local[*][*] + XSK queue q%3==1
- *   NE_CPU_LOC_TX2    (6)   local TX[2]: mid_to_local[*][*] + XSK queue q%3==2
- *   NE_CPU_MID1       (3)   crypto worker[0]
- *   NE_CPU_MID2       (4)   crypto worker[1]
- *   NE_CPU_MID3       (5)   crypto worker[2]
- *   NE_CPU_WAN_TX2    (8)   wan TX[2]:   mid_to_wan[*][*]   + XSK queue q%3==2
- *   NE_CPU_WAN_TX1    (9)   wan TX[1]:   mid_to_wan[*][*]   + XSK queue q%3==1
- *   NE_CPU_WAN_TX     (10)  wan TX[0]:   mid_to_wan[*][*]   + XSK queue q%3==0
- *   NE_CPU_WAN        (11)  wan RX:      XDP redirect recv + FQ refill (all queues)
- *
- * AF_XDP bind: XDP_COPY | XDP_USE_NEED_WAKEUP (all queues).
- * TX slots partition XSK hardware queues only (q % NE_TX_SLOTS).
- * All TX threads per direction pop every crypto output ring (MPSC via pop_lock).
- */
-
 #define NE_CPU_LOC        0u
 #define NE_CPU_LOC_TX     1u
 #define NE_CPU_LOC_TX1    2u
-#define NE_CPU_LOC_TX2    6u
 #define NE_CPU_MID1       3u
 #define NE_CPU_MID2       4u
 #define NE_CPU_MID3       5u
-#define NE_CPU_WAN_TX2    8u
 #define NE_CPU_WAN_TX1    9u
 #define NE_CPU_WAN_TX     10u
 #define NE_CPU_WAN        11u
 #define NE_CRYPTO_WORKERS 3u
-#define NE_TX_SLOTS       3u
+#define NE_TX_SLOTS       2u
 
 struct bpf_object;
 

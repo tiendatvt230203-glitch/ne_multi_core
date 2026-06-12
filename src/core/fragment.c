@@ -299,8 +299,6 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
     const uint8_t *frag1_plain = (transport_hdr_len >= 0)
                                    ? ip_payload + app_off + half1
                                    : ip_payload + half1;
-    if (!ctx || !ctx->initialized)
-        return -1;
     if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag1_plain, half2,
                                               pkt_id, 1, frag1, frag1_max, frag1_len) != 0)
         return -1;
