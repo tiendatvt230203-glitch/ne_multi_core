@@ -156,6 +156,8 @@ struct ne_pair {
     struct bpf_object *bpf_wans[MAX_INTERFACES];
     uint8_t xdp_local_on[MAX_INTERFACES];
     uint8_t xdp_wan_on[MAX_INTERFACES];
+    uint8_t local_live[MAX_INTERFACES];
+    uint8_t wan_live[MAX_INTERFACES];
     uint32_t xdp_flags;
 };
 
@@ -167,6 +169,14 @@ uint32_t ne_ring_count(const struct ne_ring *r);
 
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg);
 void ne_pair_close(struct ne_pair *p);
+int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg_local_idx,
+                        int pair_li);
+int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cfg_wan_idx,
+                         int dp_slot);
+void ne_pair_unplumb_local(struct ne_pair *p, int pair_li);
+void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot);
+int ne_pair_local_live(const struct ne_pair *p, int pair_local_idx);
+int ne_pair_wan_live(const struct ne_pair *p, int dp_slot);
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);

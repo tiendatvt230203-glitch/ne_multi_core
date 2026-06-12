@@ -1,4 +1,5 @@
 #include "../../inc/core/interface.h"
+#include "../../inc/core/profile_iface_xdp.h"
 
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
@@ -314,55 +315,6 @@ void *ne_packet_data(struct ne_pair *p, uint64_t addr)
     return xsk_umem__get_data(p->bufs, addr);
 }
 
-static int update_xsk_map_queue(struct xsk_socket *xsk, int map_fd, int queue_id)
-{
-    int key = queue_id;
-    int fd = xsk_socket__fd(xsk);
-    if (xsk_socket__update_xskmap(xsk, map_fd) == 0)
-        return 0;
-    return bpf_map_update_elem(map_fd, &key, &fd, BPF_ANY);
-}
-
-static int update_xsk_map_iface(struct ne_iface *iface, int map_fd)
-{
-    for (int q = 0; q < iface->queue_count; q++) {
-        if (!iface->queues[q].xsk)
-            return -1;
-        if (update_xsk_map_queue(iface->queues[q].xsk, map_fd, q) != 0)
-            return -1;
-    }
-    return 0;
-}
-
-static int open_bpf_object(const char *path, struct bpf_object **obj_out,
-                           const char *prog_name, struct bpf_program **prog_out,
-                           const char *map_name, struct bpf_map **map_out)
-{
-    struct bpf_object *obj = bpf_object__open_file(path, NULL);
-    if (libbpf_get_error(obj)) {
-        fprintf(stderr, "[XDP] open failed: %s\n", path);
-        return -1;
-    }
-    if (bpf_object__load(obj) != 0) {
-        fprintf(stderr, "[XDP] load failed: %s\n", path);
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    struct bpf_program *prog = bpf_object__find_program_by_name(obj, prog_name);
-    struct bpf_map *map = bpf_object__find_map_by_name(obj, map_name);
-    if (!prog || !map) {
-        fprintf(stderr, "[XDP] object %s missing program/map\n", path);
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    *obj_out = obj;
-    *prog_out = prog;
-    *map_out = map;
-    return 0;
-}
-
 static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
                              const char *ifname, int queue_count)
 {
@@ -423,17 +375,6 @@ static void prefill_iface(struct ne_pair *p, struct ne_iface *iface, uint32_t wa
 {
     for (int q = 0; q < iface->queue_count; q++)
         prefill_queue(p, &iface->queues[q], want_per_queue);
-}
-
-static void update_wan_fake_ethertype(struct bpf_object *obj, uint16_t fake_ethertype_ipv4)
-{
-    if (!obj || fake_ethertype_ipv4 == 0)
-        return;
-    struct bpf_map *map = bpf_object__find_map_by_name(obj, "wan_config_map");
-    if (!map)
-        return;
-    int key = 0;
-    (void)bpf_map_update_elem(bpf_map__fd(map), &key, &fake_ethertype_ipv4, BPF_ANY);
 }
 
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
@@ -524,24 +465,13 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     }
 
     for (int i = 0; i < p->local_count; i++) {
-        struct bpf_program *local_prog = NULL;
-        struct bpf_map *local_map = NULL;
-        NE_TRY(open_bpf_object(cfg->bpf_file, &p->bpf_locals[i],
-                               "xdp_redirect_prog", &local_prog, "xsks_map", &local_map));
-        NE_TRY(bpf_xdp_attach(p->locals[i].ifindex, bpf_program__fd(local_prog), p->xdp_flags, NULL));
+        NE_TRY(profile_iface_xdp_bind_local(p, cfg, i));
         p->xdp_local_on[i] = 1;
-        NE_TRY(update_xsk_map_iface(&p->locals[i], bpf_map__fd(local_map)));
     }
 
     for (int di = 0; di < p->wan_count; di++) {
-        struct bpf_program *wan_prog = NULL;
-        struct bpf_map *wan_map = NULL;
-        NE_TRY(open_bpf_object(cfg->bpf_wan_file, &p->bpf_wans[di],
-                               "xdp_wan_redirect_prog", &wan_prog, "wan_xsks_map", &wan_map));
-        update_wan_fake_ethertype(p->bpf_wans[di], cfg->fake_ethertype_ipv4);
-        NE_TRY(bpf_xdp_attach(p->wans[di].ifindex, bpf_program__fd(wan_prog), p->xdp_flags, NULL));
+        NE_TRY(profile_iface_xdp_bind_wan(p, cfg, di, cfg->fake_ethertype_ipv4));
         p->xdp_wan_on[di] = 1;
-        NE_TRY(update_xsk_map_iface(&p->wans[di], bpf_map__fd(wan_map)));
     }
 
     uint32_t prefill = NE_RING - 1;
@@ -551,6 +481,10 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         prefill_iface(p, &p->locals[i], prefill);
     for (int i = 0; i < p->wan_count; i++)
         prefill_iface(p, &p->wans[i], prefill);
+    for (int i = 0; i < p->local_count; i++)
+        p->local_live[i] = 1;
+    for (int i = 0; i < p->wan_count; i++)
+        p->wan_live[i] = 1;
 
     return 0;
 
@@ -596,6 +530,120 @@ void ne_pair_close(struct ne_pair *p)
     memset(p, 0, sizeof(*p));
 }
 
+int ne_pair_local_live(const struct ne_pair *p, int pair_local_idx)
+{
+    if (!p || pair_local_idx < 0 || pair_local_idx >= p->local_count)
+        return 0;
+    return p->local_live[pair_local_idx] != 0;
+}
+
+int ne_pair_wan_live(const struct ne_pair *p, int dp_slot)
+{
+    if (!p || dp_slot < 0 || dp_slot >= p->wan_count)
+        return 0;
+    return p->wan_live[dp_slot] != 0;
+}
+
+int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg_local_idx,
+                        int pair_li)
+{
+    if (!p || !cfg || !p->umem || cfg_local_idx < 0 || cfg_local_idx >= cfg->local_count)
+        return -1;
+    if (pair_li < 0 || pair_li >= MAX_INTERFACES)
+        return -1;
+
+    const char *ifname = cfg->locals[cfg_local_idx].ifname;
+    int nq = resolve_iface_queue_count(ifname, cfg->locals[cfg_local_idx].queue_count,
+                                       NE_LOCAL_QUEUE_TARGET);
+    if (interface_set_queue_count(ifname, nq) != 0)
+        return -1;
+    p->locals[pair_li].queue_count = nq;
+    if (interface_set_promisc(ifname) != 0)
+        return -1;
+    if (open_iface_queues(p, &p->locals[pair_li], ifname, nq) != 0)
+        return -1;
+
+    uint32_t prefill = NE_RING - 1;
+    if (prefill == 0)
+        prefill = 1;
+    prefill_iface(p, &p->locals[pair_li], prefill);
+    p->local_live[pair_li] = 1;
+    if (pair_li >= p->local_count)
+        p->local_count = pair_li + 1;
+    p->local_queue_total += nq;
+    return 0;
+}
+
+int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cfg_wan_idx,
+                         int dp_slot)
+{
+    if (!p || !cfg || !p->umem || cfg_wan_idx < 0 || cfg_wan_idx >= cfg->wan_count)
+        return -1;
+    if (!cfg->wans[cfg_wan_idx].dataplane || dp_slot < 0 || dp_slot >= MAX_INTERFACES)
+        return -1;
+
+    const char *ifname = cfg->wans[cfg_wan_idx].ifname;
+    int nq = resolve_iface_queue_count(ifname, cfg->wans[cfg_wan_idx].queue_count,
+                                       NE_WAN_QUEUE_TARGET);
+    if (interface_set_queue_count(ifname, nq) != 0)
+        return -1;
+    p->wans[dp_slot].queue_count = nq;
+    if (interface_set_promisc(ifname) != 0)
+        return -1;
+    if (open_iface_queues(p, &p->wans[dp_slot], ifname, nq) != 0)
+        return -1;
+
+    uint32_t prefill = NE_RING - 1;
+    if (prefill == 0)
+        prefill = 1;
+    prefill_iface(p, &p->wans[dp_slot], prefill);
+    p->wan_live[dp_slot] = 1;
+    if (dp_slot >= p->wan_count)
+        p->wan_count = dp_slot + 1;
+    p->wan_queue_total += nq;
+    return 0;
+}
+
+void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
+{
+    if (!p || pair_li < 0 || pair_li >= p->local_count || !p->local_live[pair_li])
+        return;
+
+    interface_ip_xdp_off(p->locals[pair_li].ifname);
+    p->xdp_local_on[pair_li] = 0;
+    p->local_live[pair_li] = 0;
+    if (p->bpf_locals[pair_li]) {
+        bpf_object__close(p->bpf_locals[pair_li]);
+        p->bpf_locals[pair_li] = NULL;
+    }
+    for (int q = 0; q < p->locals[pair_li].queue_count; q++) {
+        if (p->locals[pair_li].queues[q].xsk) {
+            xsk_socket__delete(p->locals[pair_li].queues[q].xsk);
+            p->locals[pair_li].queues[q].xsk = NULL;
+        }
+    }
+}
+
+void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
+{
+    if (!p || dp_slot < 0 || dp_slot >= p->wan_count || !p->wan_live[dp_slot])
+        return;
+
+    interface_ip_xdp_off(p->wans[dp_slot].ifname);
+    p->xdp_wan_on[dp_slot] = 0;
+    p->wan_live[dp_slot] = 0;
+    if (p->bpf_wans[dp_slot]) {
+        bpf_object__close(p->bpf_wans[dp_slot]);
+        p->bpf_wans[dp_slot] = NULL;
+    }
+    for (int q = 0; q < p->wans[dp_slot].queue_count; q++) {
+        if (p->wans[dp_slot].queues[q].xsk) {
+            xsk_socket__delete(p->wans[dp_slot].queues[q].xsk);
+            p->wans[dp_slot].queues[q].xsk = NULL;
+        }
+    }
+}
+
 static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t max,
                       uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
@@ -628,6 +676,8 @@ int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
     struct ne_packet *out_ptr = out;
 
     for (int i = 0; i < p->local_count && total < max; i++) {
+        if (!p->local_live[i])
+            continue;
         struct ne_iface *iface = &p->locals[i];
         int q_count = iface->queue_count;
 
@@ -650,6 +700,8 @@ int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
     struct ne_packet *out_ptr = out;
 
     for (int i = 0; i < p->wan_count && total < max; i++) {
+        if (!p->wan_live[i])
+            continue;
         struct ne_iface *iface = &p->wans[i];
         int q_count = iface->queue_count;
 

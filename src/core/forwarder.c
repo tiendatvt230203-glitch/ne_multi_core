@@ -156,8 +156,11 @@ static void *local_tx_thread(void *arg)
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         io_burst_drain_cq_local(fwd, tx_slot);
-        for (int li = 0; li < fwd->local_count; li++)
+        for (int li = 0; li < fwd->local_count; li++) {
+            if (!ne_pair_local_live(&fwd->pair, li))
+                continue;
             io_burst_tx_local(fwd, li, tx_slot);
+        }
         sched_yield();
     }
     return NULL;
@@ -212,7 +215,7 @@ static void *wan_tx_thread(void *arg)
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         io_burst_drain_cq_wan(fwd, tx_slot);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
-            if (fwd_wan_is_stopped(wi))
+            if (fwd_wan_is_stopped(wi) || !ne_pair_wan_live(&fwd->pair, wi))
                 continue;
             io_burst_tx_wan(fwd, wi, tx_slot);
             if (tx_slot == 0 && fwd_mid_to_wan_depth(fwd, wi) == 0)
@@ -308,6 +311,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
     if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
         return -1;
+    /* New init session after runtime_stop_forwarder() leaves running=0. */
+    atomic_store_explicit(&running, 1, memory_order_release);
     if (forwarder_should_stop())
         return -1;
 
