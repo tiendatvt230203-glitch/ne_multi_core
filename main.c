@@ -133,6 +133,9 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
             continue;
         }
 
+        if (strcmp(arg, "-frag-only") == 0)
+            continue;
+
         fprintf(stderr, "[FATAL] unknown option: %s\n", arg);
         return -1;
     }
