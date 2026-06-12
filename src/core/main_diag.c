@@ -151,6 +151,59 @@ static void print_iface_table(const struct app_config *cfg) {
     tbl_hline(w, 4);
 }
 
+static void print_profile_bindings(const struct app_config *cfg) {
+    static const int w[DIAG_TBL_N] = { 8, 20, 6, 14, 24, 0, 0, 0 };
+    static const char *hdr[DIAG_TBL_N] = {
+        "profile", "name", "type", "interface", "detail", "", "", ""
+    };
+
+    fprintf(stderr, "\n  [profile bindings]\n");
+    fprintf(stderr,
+            "  LAN may be shared across profiles; each WAN belongs to one profile only.\n");
+    tbl_hline(w, 5);
+    tbl_row(w, 5, hdr);
+    tbl_hline(w, 5);
+
+    for (int pr = 0; pr < cfg->profile_count; pr++) {
+        const struct profile_config *p = &cfg->profiles[pr];
+        char pid[16], pname[64], typ[8], ifn[IF_NAMESIZE], detail[32];
+
+        for (int li = 0; li < p->local_count; li++) {
+            int idx = p->local_indices[li];
+            if (idx < 0 || idx >= cfg->local_count)
+                continue;
+            snprintf(pid, sizeof(pid), "%d", p->id);
+            snprintf(pname, sizeof(pname), "%s", p->name);
+            snprintf(typ, sizeof(typ), "lan");
+            snprintf(ifn, sizeof(ifn), "%s", cfg->locals[idx].ifname);
+            snprintf(detail, sizeof(detail), "shared ok");
+            const char *row[DIAG_TBL_N] = { pid, pname, typ, ifn, detail, "", "", "" };
+            tbl_row(w, 5, row);
+        }
+        for (int wi = 0; wi < p->wan_count; wi++) {
+            int idx = p->wan_indices[wi];
+            if (idx < 0 || idx >= cfg->wan_count)
+                continue;
+            const struct wan_config *wan = &cfg->wans[idx];
+            snprintf(pid, sizeof(pid), "%d", p->id);
+            snprintf(pname, sizeof(pname), "%s", p->name);
+            snprintf(typ, sizeof(typ), "wan");
+            snprintf(ifn, sizeof(ifn), "%s", wan->ifname);
+            if (wan_is_handshake_only(wan)) {
+                struct in_addr peer;
+                peer.s_addr = wan->dst_ip;
+                snprintf(detail, sizeof(detail), "pqc peer %s", inet_ntoa(peer));
+            } else {
+                snprintf(detail, sizeof(detail), "weight %d dataplane",
+                         p->wan_bandwidth_weight[wi]);
+            }
+            const char *row[DIAG_TBL_N] = { pid, pname, typ, ifn, detail, "", "", "" };
+            tbl_row(w, 5, row);
+        }
+    }
+    tbl_hline(w, 5);
+}
+
 static void print_policy_table(const struct app_config *cfg) {
     static const int w[DIAG_TBL_N] = {
         6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 0, 0
@@ -210,6 +263,7 @@ void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cf
     fprintf(stderr, "  unchanged: LAN=%d WAN=%d policies=%d\n",
             cfg->local_count, cfg->wan_count, cfg->policy_count);
     print_iface_table(cfg);
+    print_profile_bindings(cfg);
     print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
@@ -231,6 +285,7 @@ void main_diag_log_db_apply(const struct app_config *cfg, int trigger_profile_id
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
     print_iface_table(cfg);
+    print_profile_bindings(cfg);
     print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
@@ -269,8 +324,10 @@ void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id
     }
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
-    if (!policy_only)
+    if (!policy_only) {
         print_iface_table(cfg);
+        print_profile_bindings(cfg);
+    }
     print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
@@ -282,6 +339,7 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
 
     fprintf(stderr, "+-- DATAPLANE ready --+\n");
     print_iface_table(cfg);
+    print_profile_bindings(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }

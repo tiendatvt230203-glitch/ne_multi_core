@@ -16,7 +16,6 @@ APP_SRC = main.c \
           src/core/main_diag.c \
           src/core/interface.c \
           src/core/forwarder.c \
-          src/core/frag_bench.c \
           src/core/crypto_route.c \
           src/core/forwarder_wan.c \
           src/core/forwarder_reload.c \

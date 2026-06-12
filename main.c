@@ -17,7 +17,6 @@
 #include "forwarder.h"
 #include "interface.h"
 #include "main_diag.h"
-#include "frag_bench.h"
 #include "pqc_handshake.h"
 #include "traffic_crypto.h"
 #define NOTIFY_CHANNEL "xdp_start"
@@ -63,28 +62,9 @@ struct runtime_state {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [-frag-only]       daemon (L2 split bench: no encrypt)\n"
-            "  %s -id <profile_id>   notify daemon (load / unload / reload)\n"
-            "\n"
-            "  -frag-only only affects the daemon process, not -id notify client.\n"
-            "  Equivalent: NE_FRAG_ONLY=1 %s\n",
-            prog, prog, prog);
-}
-
-static int parse_daemon_options(int argc, char **argv, int *frag_only_out)
-{
-    int frag_only = 0;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-frag-only") == 0) {
-            frag_only = 1;
-            continue;
-        }
-        fprintf(stderr, "[FATAL] unknown daemon option: %s\n", argv[i]);
-        return -1;
-    }
-    *frag_only_out = frag_only;
-    return 0;
+            "  %s                    daemon, wait NOTIFY xdp_start\n"
+            "  %s -id <profile_id>   notify daemon (load / unload / reload)\n",
+            prog, prog);
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {
@@ -133,9 +113,6 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
             continue;
         }
 
-        if (strcmp(arg, "-frag-only") == 0)
-            continue;
-
         fprintf(stderr, "[FATAL] unknown option: %s\n", arg);
         return -1;
     }
@@ -169,6 +146,22 @@ static int active_ids_remove(int *active_ids, int *active_id_count, int id) {
     }
     *active_id_count = w;
     return removed;
+}
+
+/* Drop profiles still in memory but deleted from Postgres (avoids merge failure on reload). */
+static void active_ids_prune_missing_from_db(int *active_ids, int *active_id_count) {
+    int w = 0;
+
+    for (int i = 0; i < *active_id_count; i++) {
+        int id = active_ids[i];
+        if (ne_profile_id_exists(id) == 0) {
+            active_ids[w++] = id;
+            continue;
+        }
+        fprintf(stderr,
+                "[DB] profile %d dropped from active set (deleted from Postgres)\n", id);
+    }
+    *active_id_count = w;
 }
 
 static int libbpf_print_silent(enum libbpf_print_level level,
@@ -525,14 +518,28 @@ static int runtime_tuning_only_change(const struct app_config *old,
     return profiles_fully_unchanged(old, new);
 }
 
-static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
-                                int active_id_count, int trigger_id) {
+static int apply_active_configs(struct runtime_state *rt, int *active_ids,
+                                int *active_id_count, int trigger_id) {
+    active_ids_prune_missing_from_db(active_ids, active_id_count);
+    if (*active_id_count == 0) {
+        if (rt->has_thread)
+            return runtime_stop_forwarder(rt);
+        fprintf(stderr, "[ERR] profile %d: no active profiles to load\n", trigger_id);
+        return -1;
+    }
+
+    fprintf(stderr, "[LOAD] merging Postgres profiles:");
+    for (int i = 0; i < *active_id_count; i++)
+        fprintf(stderr, " %d", active_ids[i]);
+    fprintf(stderr, " (triggered by notify %d)\n", trigger_id);
+    fflush(stderr);
+
     struct app_config *merged_cfg = calloc(1, sizeof(*merged_cfg));
     if (!merged_cfg) {
         fprintf(stderr, "[FATAL] out of memory building merged config\n");
         return -1;
     }
-    if (build_merged_config(merged_cfg, active_ids, active_id_count, NULL) != 0) {
+    if (build_merged_config(merged_cfg, active_ids, *active_id_count, NULL) != 0) {
         fprintf(stderr,
                 "[ERR] profile %d: failed to load config from Postgres (see [DB] lines above)\n",
                 trigger_id);
@@ -542,7 +549,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
 
     if (!rt->has_thread) {
         fprintf(stderr, "[LOAD] active:");
-        for (int i = 0; i < active_id_count; i++)
+        for (int i = 0; i < *active_id_count; i++)
             fprintf(stderr, " %d", active_ids[i]);
         fprintf(stderr, "\n");
         main_diag_log_db_apply(merged_cfg, trigger_id, NULL);
@@ -564,7 +571,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         fflush(stderr);
         usleep(500000);
         if (build_merged_config(&rt->cfg_slots[next_slot], active_ids,
-                                active_id_count, NULL) != 0) {
+                                *active_id_count, NULL) != 0) {
             fprintf(stderr,
                     "[ERR] profile %d: DB reload retry failed (see [DB] lines above)\n",
                     trigger_id);
@@ -671,7 +678,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         rt->active_slot = next_slot;
         fprintf(stderr, "[RELOAD] OK profile %d — applied (hot reload)\n", trigger_id);
         fprintf(stderr, "[RELOAD] active:");
-        for (int i = 0; i < active_id_count; i++)
+        for (int i = 0; i < *active_id_count; i++)
             fprintf(stderr, " %d", active_ids[i]);
         fprintf(stderr, "\n");
         main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 1);
@@ -737,7 +744,7 @@ static int load_profile_and_run(struct runtime_state *rt,
     if (added < 0)
         return -1;
     /* Even if profile is already active, force rebuild to apply DB updates. */
-    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
+    if (apply_active_configs(rt, active_ids, active_id_count, profile_id) != 0) {
         if (added == 1)
             active_ids_remove(active_ids, active_id_count, profile_id);
         return -1;
@@ -771,7 +778,7 @@ static int handle_profile_notify(struct runtime_state *rt,
     if (*active_id_count == 0)
         return runtime_stop_forwarder(rt);
 
-    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
+    if (apply_active_configs(rt, active_ids, active_id_count, profile_id) != 0) {
         fprintf(stderr, "[ERR] profile %d: unload reload failed\n", profile_id);
         return -1;
     }
@@ -823,15 +830,10 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    {
-        int frag_only_cli = 0;
-
-        if (argc > 1 && parse_daemon_options(argc, argv, &frag_only_cli) != 0) {
-            usage(argv[0]);
-            return 1;
-        }
-        if (frag_only_cli)
-            ne_frag_only_enable();
+    if (argc > 1) {
+        fprintf(stderr, "[FATAL] unknown arguments (got %d)\n", argc - 1);
+        usage(argv[0]);
+        return 1;
     }
 
     if (load_ne_env() != 0) {
@@ -866,8 +868,6 @@ int main(int argc, char **argv) {
     PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
 
     fprintf(stderr, "[DAEMON] listening %s — use %s -id <id>\n", NOTIFY_CHANNEL, argv[0]);
-    if (ne_frag_only_active())
-        fprintf(stderr, "[DAEMON] FRAG_ONLY active on this process (L2 split, no crypto)\n");
 
     /* forwarder is ~585 KiB; keep runtime off the main-thread stack (avoids segfault on small stacks). */
     struct runtime_state *rt = calloc(1, sizeof(*rt));

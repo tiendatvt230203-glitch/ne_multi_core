@@ -8,7 +8,6 @@
 #include "../../inc/core/local_hwaddr.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
-#include "../../inc/core/frag_bench.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
 
 #include <net/if.h>
@@ -311,8 +310,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     if (forwarder_should_stop())
         return -1;
-
-    ne_frag_only_init_from_env();
 
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;

@@ -8,7 +8,6 @@
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
-#include "../../inc/core/frag_bench.h"
 #include "../../inc/core/crypto_route.h"
 
 #include <string.h>
@@ -72,8 +71,6 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
                                       f2, fwd->pair.frame_size, &l2) != 0)
             return -1;
     } else {
-        if (ne_frag_only_active())
-            return 0;
         int n = -1;
         if (cp->action == POLICY_ACTION_ENCRYPT_L2)
             n = crypto_layer2_encrypt(pctx, pkt, len);

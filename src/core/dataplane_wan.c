@@ -11,7 +11,6 @@
 #include "../../inc/crypto/packet_crypto.h"
 
 #include "../../inc/core/fragment.h"
-#include "../../inc/core/frag_bench.h"
 #include "../../inc/core/crypto_route.h"
 
 #include <string.h>
@@ -93,18 +92,14 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t buf[4096];
     uint32_t blen = 0;
 
+    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
+    if (!ctx)
+        return -1;
     slot = fwd_crypto_profile_slot_for_id(
         fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id));
     if (slot < 0)
         return -1;
-    if (ne_frag_only_active()) {
-        nd = crypto_layer2_read_fragment_plain(pkt, *len, &opid, &ofidx);
-    } else {
-        ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
-        if (!ctx)
-            return -1;
-        nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
-    }
+    nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
     if (nd < 0)
         return -1;
     rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
@@ -209,12 +204,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
             frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
         if (need_backup && orig_len <= sizeof(scratch))
             memcpy(scratch, pkt, orig_len);
-        if (ne_frag_only_active()) {
-            if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
-                    return -1;
-            }
-        } else if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
+        if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
             if (need_backup)
                 memcpy(pkt, scratch, orig_len);
             len = orig_len;
@@ -228,11 +218,6 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     }
     if (pending)
         return 1;
-
-    if (ne_frag_only_active()) {
-        job->len = len;
-        return 0;
-    }
 
     if (!fwd->cfg->crypto_enabled) {
         job->len = len;

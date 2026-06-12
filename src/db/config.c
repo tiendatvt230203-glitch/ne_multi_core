@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <netinet/in.h>
@@ -115,6 +116,58 @@ static int parse_hex_bytes(const char *str, uint8_t *out, int expected_len) {
     return 0;
 }
 
+static const char *profile_name_by_id(const struct app_config *cfg, int profile_id) {
+    if (!cfg)
+        return "?";
+    for (int i = 0; i < cfg->profile_count; i++) {
+        if (cfg->profiles[i].id == profile_id)
+            return cfg->profiles[i].name;
+    }
+    return "?";
+}
+
+static int config_validate_wan_profile_exclusivity(struct app_config *cfg) {
+    int owner[MAX_INTERFACES];
+
+    for (int i = 0; i < MAX_INTERFACES; i++)
+        owner[i] = -1;
+
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int wi = 0; wi < p->wan_count; wi++) {
+            int widx = p->wan_indices[wi];
+            if (widx < 0 || widx >= cfg->wan_count)
+                continue;
+            if (owner[widx] >= 0 && owner[widx] != p->id) {
+                const char *ifname = cfg->wans[widx].ifname;
+                fprintf(stderr,
+                        "[CONFIG] WAN %s is used by profile %d (%s) and profile %d (%s) — "
+                        "each WAN may belong to only one profile (LAN may be shared)\n",
+                        ifname, owner[widx], profile_name_by_id(cfg, owner[widx]),
+                        p->id, p->name);
+                // #region agent log
+                {
+                    FILE *df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
+                    if (df) {
+                        fprintf(df,
+                                "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"WAN_EXCL\","
+                                "\"location\":\"config.c:config_validate_wan_profile_exclusivity\","
+                                "\"message\":\"wan profile conflict\","
+                                "\"data\":{\"ifname\":\"%s\",\"owner_profile\":%d,\"other_profile\":%d},"
+                                "\"timestamp\":%lld}\n",
+                                ifname, owner[widx], p->id,
+                                (long long)time(NULL) * 1000);
+                        fclose(df);
+                    }
+                }
+                // #endregion
+                return -1;
+            }
+            owner[widx] = p->id;
+        }
+    }
+    return 0;
+}
 
 int config_validate(struct app_config *cfg) {
     if (cfg->global_frame_size == 0) {
@@ -198,6 +251,9 @@ int config_validate(struct app_config *cfg) {
             return -1;
         }
     }
+
+    if (config_validate_wan_profile_exclusivity(cfg) != 0)
+        return -1;
 
     return 0;
 }

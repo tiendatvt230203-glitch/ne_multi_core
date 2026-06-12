@@ -5,7 +5,6 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/core/config.h"
-#include "../../inc/core/frag_bench.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -300,23 +299,14 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
     const uint8_t *frag1_plain = (transport_hdr_len >= 0)
                                    ? ip_payload + app_off + half1
                                    : ip_payload + half1;
-    if (ne_frag_only_active()) {
-        if (crypto_layer2_wrap_fragment_plain(eth_hdr, frag1_plain, half2,
+    if (!ctx || !ctx->initialized)
+        return -1;
+    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag1_plain, half2,
                                               pkt_id, 1, frag1, frag1_max, frag1_len) != 0)
-            return -1;
-        if (crypto_layer2_wrap_fragment_plain(eth_hdr, ip_hdr, frag0_plain_len,
+        return -1;
+    if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, frag0_plain_len,
                                               pkt_id, 0, pkt_data, frag0_max, frag0_len) != 0)
-            return -1;
-    } else {
-        if (!ctx || !ctx->initialized)
-            return -1;
-        if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, frag1_plain, half2,
-                                                  pkt_id, 1, frag1, frag1_max, frag1_len) != 0)
-            return -1;
-        if (crypto_layer2_encrypt_fragment_single(ctx, eth_hdr, ip_hdr, frag0_plain_len,
-                                                  pkt_id, 0, pkt_data, frag0_max, frag0_len) != 0)
-            return -1;
-    }
+        return -1;
 
     return 0;
 }
