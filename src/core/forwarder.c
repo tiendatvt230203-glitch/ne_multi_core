@@ -15,6 +15,8 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
+#include <stdio.h>
 
 static atomic_int running = 1;
 struct forwarder *g_active_fwd;
@@ -35,6 +37,132 @@ void forwarder_pin_cpu(void)
 
 #define IO_BURST_ROUNDS   8
 #define IO_TX_BURST_MAX   64
+
+// #region agent log
+#define AGENT_TX_LOG_PATH "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log"
+#define AGENT_TX_LOG_INTERVAL_NS (2000000000ULL)
+
+static _Atomic uint64_t wan_tx_sent[NE_TX_SLOTS];
+static _Atomic uint64_t wan_tx_idle[NE_TX_SLOTS];
+static _Atomic uint64_t local_tx_sent[NE_TX_SLOTS];
+static _Atomic uint64_t local_tx_idle[NE_TX_SLOTS];
+
+static void agent_tx_log(const char *hypothesis_id, const char *message, const char *dir,
+                         int tx_slot, uint64_t sent_delta, uint64_t idle_delta,
+                         uint32_t r0, uint32_t r1, uint32_t r2, uint64_t tx_no_free)
+{
+    FILE *f = fopen(AGENT_TX_LOG_PATH, "a");
+
+    if (!f)
+        return;
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"forwarder.c:tx_diag\","
+            "\"message\":\"%s\",\"timestamp\":%lld,\"data\":{\"dir\":\"%s\",\"tx_slot\":%d,"
+            "\"sent_delta\":%llu,\"idle_delta\":%llu,\"ring0\":%u,\"ring1\":%u,\"ring2\":%u,"
+            "\"tx_no_free\":%llu}}\n",
+            hypothesis_id, message, (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000, dir,
+            tx_slot, (unsigned long long)sent_delta, (unsigned long long)idle_delta, r0, r1, r2,
+            (unsigned long long)tx_no_free);
+    fclose(f);
+}
+
+static int io_burst_tx_wan_count(struct forwarder *fwd, int wan_idx, int tx_slot)
+{
+    struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int total = 0;
+
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+        rings[w] = &fwd->mid_to_wan[wan_idx][w];
+
+    for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
+        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
+                                       wan_idx, tx_slot);
+        if (sent <= 0)
+            break;
+        total += sent;
+    }
+    return total;
+}
+
+static int io_burst_tx_local_count(struct forwarder *fwd, int local_idx, int tx_slot)
+{
+    struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int total = 0;
+
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+        rings[w] = &fwd->mid_to_local[local_idx][w];
+
+    for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
+        int sent = ne_tx_drain_local_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
+                                         local_idx, tx_slot);
+        if (sent <= 0)
+            break;
+        total += sent;
+    }
+    return total;
+}
+
+static void agent_tx_maybe_log_wan(struct forwarder *fwd, int tx_slot, uint64_t *last_ns)
+{
+    struct timespec ts;
+    uint64_t now_ns;
+
+    if (tx_slot != 0 || !fwd)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    if (now_ns - *last_ns < AGENT_TX_LOG_INTERVAL_NS)
+        return;
+    *last_ns = now_ns;
+
+    for (int s = 0; s < (int)NE_TX_SLOTS; s++) {
+        uint64_t sent = atomic_exchange_explicit(&wan_tx_sent[s], 0, memory_order_relaxed);
+        uint64_t idle = atomic_exchange_explicit(&wan_tx_idle[s], 0, memory_order_relaxed);
+        uint32_t r0 = 0, r1 = 0, r2 = 0;
+        uint64_t tx_nf = 0;
+
+        if (fwd->wan_count > 0) {
+            r0 = ne_ring_count(&fwd->mid_to_wan[0][0]);
+            r1 = ne_ring_count(&fwd->mid_to_wan[0][1]);
+            r2 = ne_ring_count(&fwd->mid_to_wan[0][2]);
+            tx_nf = fwd->pair.wans[0].tx_no_free;
+        }
+        agent_tx_log("ABC", "wan_tx_slot_stats", "wan", s, sent, idle, r0, r1, r2, tx_nf);
+    }
+}
+
+static void agent_tx_maybe_log_local(struct forwarder *fwd, int tx_slot, uint64_t *last_ns)
+{
+    struct timespec ts;
+    uint64_t now_ns;
+
+    if (tx_slot != 0 || !fwd)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    if (now_ns - *last_ns < AGENT_TX_LOG_INTERVAL_NS)
+        return;
+    *last_ns = now_ns;
+
+    for (int s = 0; s < (int)NE_TX_SLOTS; s++) {
+        uint64_t sent = atomic_exchange_explicit(&local_tx_sent[s], 0, memory_order_relaxed);
+        uint64_t idle = atomic_exchange_explicit(&local_tx_idle[s], 0, memory_order_relaxed);
+        uint32_t r0 = 0, r1 = 0, r2 = 0;
+        uint64_t tx_nf = 0;
+
+        if (fwd->local_count > 0) {
+            r0 = ne_ring_count(&fwd->mid_to_local[0][0]);
+            r1 = ne_ring_count(&fwd->mid_to_local[0][1]);
+            r2 = ne_ring_count(&fwd->mid_to_local[0][2]);
+            tx_nf = fwd->pair.locals[0].tx_no_free;
+        }
+        agent_tx_log("ABC", "local_tx_slot_stats", "local", s, sent, idle, r0, r1, r2, tx_nf);
+    }
+}
+// #endregion
 
 static void io_burst_refill_local(struct forwarder *fwd)
 {
@@ -69,32 +197,12 @@ static void io_burst_drain_cq_wan(struct forwarder *fwd, int tx_slot)
 
 static void io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 {
-    struct ne_ring *rings[NE_CRYPTO_WORKERS];
-
-    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        rings[w] = &fwd->mid_to_local[local_idx][w];
-
-    for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_local_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
-                                         local_idx, tx_slot);
-        if (sent <= 0)
-            break;
-    }
+    (void)io_burst_tx_local_count(fwd, local_idx, tx_slot);
 }
 
 static void io_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
 {
-    struct ne_ring *rings[NE_CRYPTO_WORKERS];
-
-    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        rings[w] = &fwd->mid_to_wan[wan_idx][w];
-
-    for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
-                                       wan_idx, tx_slot);
-        if (sent <= 0)
-            break;
-    }
+    (void)io_burst_tx_wan_count(fwd, wan_idx, tx_slot);
 }
 
 struct io_slot_ctx {
@@ -151,13 +259,26 @@ static void *local_tx_thread(void *arg)
     struct io_slot_ctx *ctx = arg;
     struct forwarder *fwd = ctx->fwd;
     int tx_slot = ctx->slot;
+    uint64_t last_log_ns = 0;
+    int did_work = 0;
 
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        did_work = 0;
         io_burst_drain_cq_local(fwd, tx_slot);
-        for (int li = 0; li < fwd->local_count; li++)
-            io_burst_tx_local(fwd, li, tx_slot);
+        for (int li = 0; li < fwd->local_count; li++) {
+            int sent = io_burst_tx_local_count(fwd, li, tx_slot);
+
+            if (sent > 0) {
+                atomic_fetch_add_explicit(&local_tx_sent[tx_slot], (uint64_t)sent,
+                                          memory_order_relaxed);
+                did_work = 1;
+            }
+        }
+        if (!did_work)
+            atomic_fetch_add_explicit(&local_tx_idle[tx_slot], 1, memory_order_relaxed);
+        agent_tx_maybe_log_local(fwd, tx_slot, &last_log_ns);
         sched_yield();
     }
     return NULL;
@@ -206,18 +327,31 @@ static void *wan_tx_thread(void *arg)
     struct io_slot_ctx *ctx = arg;
     struct forwarder *fwd = ctx->fwd;
     int tx_slot = ctx->slot;
+    uint64_t last_log_ns = 0;
+    int did_work = 0;
 
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        did_work = 0;
         io_burst_drain_cq_wan(fwd, tx_slot);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
+            int sent;
+
             if (fwd_wan_is_stopped(wi))
                 continue;
-            io_burst_tx_wan(fwd, wi, tx_slot);
+            sent = io_burst_tx_wan_count(fwd, wi, tx_slot);
+            if (sent > 0) {
+                atomic_fetch_add_explicit(&wan_tx_sent[tx_slot], (uint64_t)sent,
+                                          memory_order_relaxed);
+                did_work = 1;
+            }
             if (tx_slot == 0 && fwd_mid_to_wan_depth(fwd, wi) == 0)
                 fwd->wan_tx_stuck[wi] = 0;
         }
+        if (!did_work)
+            atomic_fetch_add_explicit(&wan_tx_idle[tx_slot], 1, memory_order_relaxed);
+        agent_tx_maybe_log_wan(fwd, tx_slot, &last_log_ns);
         sched_yield();
     }
     return NULL;
