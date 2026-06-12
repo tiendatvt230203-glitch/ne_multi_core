@@ -36,4 +36,12 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     uint8_t *packet, size_t pkt_len,
     uint16_t *out_pkt_id, uint8_t *out_frag_index);
 
+int crypto_layer2_wrap_fragment_plain(const uint8_t *eth_hdr,
+    const uint8_t *plain, uint32_t plain_len,
+    uint16_t pkt_id, uint8_t frag_index,
+    uint8_t *out_buf, size_t out_max, uint32_t *out_len);
+
+int crypto_layer2_read_fragment_plain(uint8_t *packet, size_t pkt_len,
+    uint16_t *out_pkt_id, uint8_t *out_frag_index);
+
 #endif

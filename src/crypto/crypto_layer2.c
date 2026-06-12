@@ -448,3 +448,69 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     }
     return -1;
 }
+
+int crypto_layer2_wrap_fragment_plain(const uint8_t *eth_hdr,
+    const uint8_t *plain, uint32_t plain_len,
+    uint16_t pkt_id, uint8_t frag_index,
+    uint8_t *out_buf, size_t out_max, uint32_t *out_len)
+{
+    if (!eth_hdr || !plain || !out_buf || !out_len)
+        return -1;
+    if (plain_len == 0 || !pkt_is_ipv4_eth(eth_hdr))
+        return -1;
+    if (!packet_crypto_get_fake_ethertype_ipv4())
+        return -1;
+
+    int nonce_size = packet_crypto_get_nonce_size();
+    int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
+    int enc_off = l2_frag_enc_start_offset(nonce_size);
+    size_t need = (size_t)enc_off + plain_len + (is_gcm ? AES_GCM_TAG_SIZE : 0);
+
+    if (need > out_max)
+        return -1;
+
+    memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
+    memset(out_buf + CRYPTO_L2_NONCE_OFF, 0, (size_t)nonce_size);
+    memmove(out_buf + enc_off, plain, plain_len);
+    l2_write_wire_header(out_buf, packet_crypto_get_policy_id(),
+                         out_buf + CRYPTO_L2_NONCE_OFF, nonce_size);
+    out_buf[l2_frag_magic_offset(nonce_size)] = L2_FRAG_MAGIC;
+    l2_write_frag_tag(out_buf + l2_frag_magic_offset(nonce_size) + 1, pkt_id, frag_index);
+    if (is_gcm)
+        memset(out_buf + enc_off + plain_len, 0, AES_GCM_TAG_SIZE);
+
+    *out_len = (uint32_t)need;
+    return 0;
+}
+
+int crypto_layer2_read_fragment_plain(uint8_t *packet, size_t pkt_len,
+    uint16_t *out_pkt_id, uint8_t *out_frag_index)
+{
+    if (!packet || !out_pkt_id || !out_frag_index)
+        return -1;
+
+    int wire_ns = l2_wire_nonce_size();
+    int enc_off = l2_frag_enc_start_offset(wire_ns);
+
+    if (pkt_len < (size_t)enc_off || !l2_has_fake_ethertype(packet))
+        return -1;
+    if (packet[l2_frag_magic_offset(wire_ns)] != L2_FRAG_MAGIC)
+        return -1;
+
+    l2_read_frag_tag(packet + l2_frag_magic_offset(wire_ns) + 1,
+                     out_pkt_id, out_frag_index);
+
+    size_t total_after = pkt_len - (size_t)enc_off;
+    size_t enc_len;
+
+    if (packet_crypto_get_mode() == CRYPTO_MODE_GCM) {
+        if (total_after < AES_GCM_TAG_SIZE)
+            return -1;
+        enc_len = total_after - AES_GCM_TAG_SIZE;
+    } else {
+        enc_len = total_after;
+    }
+
+    memmove(packet + ETH_HEADER_SIZE, packet + enc_off, enc_len);
+    return (int)(ETH_HEADER_SIZE + enc_len);
+}
