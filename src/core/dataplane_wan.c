@@ -290,7 +290,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    (void)dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], &job);
+    (void)dp_ring_push(fwd, &fwd->worker_tx_local[li][dp_crypto_current_worker_idx()], &job);
     return;
 
 drop:

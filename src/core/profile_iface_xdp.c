@@ -466,7 +466,7 @@ static int detach_removed_lan_rows(struct forwarder *fwd, const struct app_confi
         uint32_t dropped = 0;
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
             struct ne_packet pkt;
-            while (ne_ring_try_pop(&fwd->mid_to_local[li][w], &pkt) == 0) {
+            while (ne_ring_try_pop(&fwd->worker_tx_local[li][w], &pkt) == 0) {
                 ne_frame_free(&fwd->pair, pkt.addr);
                 dropped++;
             }
@@ -521,7 +521,7 @@ static int attach_new_lan_rows(struct forwarder *fwd, const struct app_config *n
         fwd->pair.xdp_local_on[li] = 1;
         init_fwd_local_meta(fwd, li, new_cfg, ci);
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            if (ne_ring_init(&fwd->mid_to_local[li][w], NE_RING, 1) != 0)
+            if (ne_ring_init(&fwd->worker_tx_local[li][w], NE_RING, 1) != 0)
                 return -1;
         }
         fwd->local_count++;
@@ -552,7 +552,7 @@ static int attach_new_wan_rows(struct forwarder *fwd, const struct app_config *n
         init_fwd_wan_meta(fwd, di, new_cfg, ci);
         fwd->wan_cfg_idx[di] = ci;
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            if (ne_ring_init(&fwd->mid_to_wan[di][w], NE_RING, 1) != 0)
+            if (ne_ring_init(&fwd->worker_tx_wan[di][w], NE_RING, 1) != 0)
                 return -1;
         }
         fwd->wan_count++;

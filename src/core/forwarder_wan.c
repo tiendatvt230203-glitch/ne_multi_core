@@ -110,7 +110,7 @@ uint32_t fwd_wan_flush_queue(struct forwarder *fwd, int wan_idx)
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return 0;
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-        while (ne_ring_try_pop(&fwd->mid_to_wan[wan_idx][w], &pkt) == 0) {
+        while (ne_ring_try_pop(&fwd->worker_tx_wan[wan_idx][w], &pkt) == 0) {
             ne_frame_free(&fwd->pair, pkt.addr);
             dropped++;
         }
@@ -123,7 +123,7 @@ int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx)
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return 0;
     int wi = dp_crypto_current_worker_idx();
-    struct ne_ring *r = &fwd->mid_to_wan[wan_idx][wi];
+    struct ne_ring *r = &fwd->worker_tx_wan[wan_idx][wi];
     return ne_ring_count(r) + NE_BATCH_SIZE < r->cap;
 }
 
@@ -408,7 +408,7 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
             int dp = config_wan_cfg_to_dp(fwd->cfg, p->wan_indices[i]);
             if (dp < 0 || !fwd_wan_dp_ok_for_new_traffic(dp) || !fwd_wan_has_tx_room(fwd, dp))
                 continue;
-            uint32_t d = fwd_mid_to_wan_depth(fwd, dp);
+            uint32_t d = fwd_wan_tx_depth(fwd, dp);
             if (d < best_depth) {
                 best_depth = d;
                 best = dp;
@@ -424,7 +424,7 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
     for (int wi = 0; wi < fwd->wan_count; wi++) {
         if (!fwd_wan_dp_ok_for_new_traffic(wi) || !fwd_wan_has_tx_room(fwd, wi))
             continue;
-        uint32_t d = fwd_mid_to_wan_depth(fwd, wi);
+        uint32_t d = fwd_wan_tx_depth(fwd, wi);
         if (d < best_depth) {
             best_depth = d;
             best = wi;

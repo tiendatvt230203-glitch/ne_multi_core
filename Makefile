@@ -19,6 +19,7 @@ APP_SRC = main.c \
           src/core/crypto_route.c \
           src/core/forwarder_wan.c \
           src/core/forwarder_reload.c \
+          src/core/forwarder_pipeline.c \
           src/core/profile_iface_xdp.c \
           src/core/forwarder_crypto_runtime.c \
           src/core/dataplane_util.c \

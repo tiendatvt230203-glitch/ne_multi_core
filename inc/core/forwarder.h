@@ -12,32 +12,29 @@ struct forwarder {
     int local_count;
     struct xsk_interface wans[MAX_INTERFACES];
     int wan_count;
-    int wan_cfg_idx[MAX_INTERFACES]; /* dataplane slot -> cfg->wans[] index */
+    int wan_cfg_idx[MAX_INTERFACES];
 
     struct ne_pair pair;
-    struct ne_ring local_to_mid[NE_CRYPTO_WORKERS];
-    struct ne_ring wan_to_mid[NE_CRYPTO_WORKERS];
-    struct ne_ring mid_to_wan[MAX_INTERFACES][NE_CRYPTO_WORKERS];
-    struct ne_ring mid_to_local[MAX_INTERFACES][NE_CRYPTO_WORKERS];
+    struct ne_ring worker_ingress[NE_CRYPTO_WORKERS];
+    struct ne_ring worker_tx_wan[MAX_INTERFACES][NE_CRYPTO_WORKERS];
+    struct ne_ring worker_tx_local[MAX_INTERFACES][NE_CRYPTO_WORKERS];
 
-    pthread_t local_thread;
-    pthread_t local_tx_threads[NE_TX_SLOTS];
-    pthread_t crypto_threads[NE_CRYPTO_WORKERS];
-    pthread_t wan_tx_threads[NE_TX_SLOTS];
-    pthread_t wan_thread;
+    pthread_t ingress_thread;
+    pthread_t worker_threads[NE_CRYPTO_WORKERS];
     int threads_started;
 
     uint64_t wan_tx_stuck[MAX_INTERFACES];
     uint32_t wan_tx_cooldown[MAX_INTERFACES];
 };
 
-static inline uint32_t fwd_mid_to_wan_depth(const struct forwarder *fwd, int wan_dp)
+static inline uint32_t fwd_wan_tx_depth(const struct forwarder *fwd, int wan_dp)
 {
     uint32_t d = 0;
+
     if (!fwd || wan_dp < 0)
         return 0;
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        d += ne_ring_count(&fwd->mid_to_wan[wan_dp][w]);
+        d += ne_ring_count(&fwd->worker_tx_wan[wan_dp][w]);
     return d;
 }
 

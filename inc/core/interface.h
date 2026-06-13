@@ -11,17 +11,13 @@
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
 
-#define NE_CPU_LOC        0u
-#define NE_CPU_LOC_TX     1u
-#define NE_CPU_LOC_TX1    2u
-#define NE_CPU_MID1       3u
-#define NE_CPU_MID2       4u
-#define NE_CPU_MID3       5u
-#define NE_CPU_WAN_TX1    9u
-#define NE_CPU_WAN_TX     10u
-#define NE_CPU_WAN        11u
-#define NE_CRYPTO_WORKERS 3u
-#define NE_TX_SLOTS       2u
+#define NE_CPU_INGRESS      0u
+#define NE_CPU_WORKER0      1u
+#define NE_CPU_WORKER1      2u
+#define NE_CPU_WORKER2      3u
+#define NE_CPU_WORKER3      4u
+#define NE_CRYPTO_WORKERS   4u
+#define NE_TX_SLOTS         4u
 
 struct bpf_object;
 
