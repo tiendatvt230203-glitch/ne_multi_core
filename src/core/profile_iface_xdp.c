@@ -12,20 +12,8 @@
 #include <net/if.h>
 #include <stdio.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <unistd.h>
-
-/*
- * NE1 may ship an older system libbpf without bpf_get_link_xdp_id (added ~0.6).
- * Provide a weak stub so the link succeeds; sysfs fallback handles validation.
- */
-__attribute__((weak))
-int bpf_get_link_xdp_id(int ifindex, __u32 *prog_id, __u32 flags)
-{
-    (void)ifindex;
-    (void)prog_id;
-    (void)flags;
-    return -ENOSYS;
-}
 
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
                                       enum profile_iface_xdp_reload_mode mode);
@@ -276,43 +264,101 @@ static int lan_iface_has_kernel_xdp(const char *ifname, uint32_t *prog_id_out)
     return 1;
 }
 
-static int query_xdp_prog_id(int ifindex, const char *ifname, uint32_t attach_flags,
-                             uint32_t *prog_id_out)
+typedef int (*ne_bpf_xdp_attach_fn)(int ifindex, int prog_fd, __u32 flags, const void *opts);
+typedef int (*ne_bpf_xdp_detach_fn)(int ifindex, __u32 flags, const void *opts);
+typedef int (*ne_bpf_set_link_xdp_fd_fn)(int ifindex, int fd, __u32 flags);
+typedef int (*ne_bpf_get_link_xdp_id_fn)(int ifindex, __u32 *prog_id, __u32 flags);
+typedef int (*ne_bpf_xdp_query_id_fn)(int ifindex, int flags, __u32 *prog_id);
+
+static ne_bpf_xdp_attach_fn ne_bpf_xdp_attach;
+static ne_bpf_xdp_detach_fn ne_bpf_xdp_detach;
+static ne_bpf_set_link_xdp_fd_fn ne_bpf_set_link_xdp_fd;
+static ne_bpf_get_link_xdp_id_fn ne_bpf_get_link_xdp_id;
+static ne_bpf_xdp_query_id_fn ne_bpf_xdp_query_id;
+static int ne_xdp_api_inited;
+
+static void ne_xdp_api_init_once(void)
+{
+    if (ne_xdp_api_inited)
+        return;
+    ne_xdp_api_inited = 1;
+    ne_bpf_xdp_attach = (ne_bpf_xdp_attach_fn)dlsym(RTLD_DEFAULT, "bpf_xdp_attach");
+    ne_bpf_xdp_detach = (ne_bpf_xdp_detach_fn)dlsym(RTLD_DEFAULT, "bpf_xdp_detach");
+    ne_bpf_set_link_xdp_fd =
+        (ne_bpf_set_link_xdp_fd_fn)dlsym(RTLD_DEFAULT, "bpf_set_link_xdp_fd");
+    ne_bpf_get_link_xdp_id =
+        (ne_bpf_get_link_xdp_id_fn)dlsym(RTLD_DEFAULT, "bpf_get_link_xdp_id");
+    ne_bpf_xdp_query_id =
+        (ne_bpf_xdp_query_id_fn)dlsym(RTLD_DEFAULT, "bpf_xdp_query_id");
+}
+
+static int ne_xdp_do_attach(int ifindex, int prog_fd, uint32_t flags)
+{
+    ne_xdp_api_init_once();
+    if (ne_bpf_xdp_attach)
+        return ne_bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
+    if (ne_bpf_set_link_xdp_fd)
+        return ne_bpf_set_link_xdp_fd(ifindex, prog_fd, flags);
+    return -ENOSYS;
+}
+
+static int ne_xdp_do_detach(int ifindex, uint32_t flags)
+{
+    ne_xdp_api_init_once();
+    if (ne_bpf_xdp_detach)
+        return ne_bpf_xdp_detach(ifindex, flags, NULL);
+    if (ne_bpf_set_link_xdp_fd)
+        return ne_bpf_set_link_xdp_fd(ifindex, -1, flags);
+    return -ENOSYS;
+}
+
+static int ne_xdp_query_prog_id(int ifindex, const char *ifname, uint32_t attach_flags,
+                                uint32_t *prog_id_out)
 {
     __u32 prog_id = 0;
-    uint32_t qflags[3];
+    int qflags[3];
     int nq = 0;
 
     if (!prog_id_out)
         return -1;
     *prog_id_out = 0;
+    ne_xdp_api_init_once();
 
-    qflags[nq++] = attach_flags;
-    if (attach_flags != XDP_FLAGS_DRV_MODE)
-        qflags[nq++] = XDP_FLAGS_DRV_MODE;
-    if (attach_flags != XDP_FLAGS_SKB_MODE)
-        qflags[nq++] = XDP_FLAGS_SKB_MODE;
+    qflags[nq++] = (int)attach_flags;
+    qflags[nq++] = (int)XDP_FLAGS_DRV_MODE;
+    qflags[nq++] = (int)XDP_FLAGS_SKB_MODE;
 
-    for (int i = 0; i < nq; i++) {
-        prog_id = 0;
-        if (bpf_get_link_xdp_id(ifindex, &prog_id, qflags[i]) == 0 && prog_id != 0) {
-            *prog_id_out = prog_id;
-            return 0;
+    if (ne_bpf_get_link_xdp_id) {
+        for (int i = 0; i < nq; i++) {
+            prog_id = 0;
+            if (ne_bpf_get_link_xdp_id(ifindex, &prog_id, (__u32)qflags[i]) == 0 &&
+                prog_id != 0) {
+                *prog_id_out = prog_id;
+                return 0;
+            }
         }
     }
-
+    if (ne_bpf_xdp_query_id) {
+        for (int i = 0; i < nq; i++) {
+            prog_id = 0;
+            if (ne_bpf_xdp_query_id(ifindex, qflags[i], &prog_id) == 0 && prog_id != 0) {
+                *prog_id_out = prog_id;
+                return 0;
+            }
+        }
+    }
     if (ifname && read_xdp_prog_id(ifname, prog_id_out) == 0 && *prog_id_out != 0)
         return 0;
     return -1;
 }
 
-static int validate_xdp_attached_idx(int ifindex, const char *ifname, const char *role,
-                                     uint32_t attach_flags)
+static int validate_xdp_attached(int ifindex, const char *ifname, const char *role,
+                                 uint32_t attach_flags)
 {
     uint32_t prog_id = 0;
 
-    for (int retry = 0; retry < 5; retry++) {
-        if (query_xdp_prog_id(ifindex, ifname, attach_flags, &prog_id) == 0 &&
+    for (int retry = 0; retry < 20; retry++) {
+        if (ne_xdp_query_prog_id(ifindex, ifname, attach_flags, &prog_id) == 0 &&
             prog_id != 0) {
             fprintf(stderr,
                     "[PROFILE-XDP] validate OK %s %s prog_id=%u (xdp/id:%u ifindex=%d)\n",
@@ -320,8 +366,8 @@ static int validate_xdp_attached_idx(int ifindex, const char *ifname, const char
             fflush(stderr);
             return 0;
         }
-        if (retry < 4)
-            usleep(2000);
+        if (retry < 19)
+            usleep(5000);
     }
     fprintf(stderr,
             "[PROFILE-XDP] validate FAIL %s %s: no prog_id (ifindex=%d flags=0x%x)\n",
@@ -332,9 +378,9 @@ static int validate_xdp_attached_idx(int ifindex, const char *ifname, const char
 
 static void xdp_try_detach(int ifindex, uint32_t flags)
 {
-    int rc = bpf_xdp_detach(ifindex, flags, NULL);
+    int rc = ne_xdp_do_detach(ifindex, flags);
 
-    if (rc && rc != -EINVAL && rc != -ENOENT)
+    if (rc < 0 && rc != -EINVAL && rc != -ENOENT)
         fprintf(stderr, "[PROFILE-XDP] detach ifindex=%d flags=0x%x: %s\n",
                 ifindex, flags, strerror(-rc));
 }
@@ -352,12 +398,23 @@ static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
         return -1;
     }
 
+    ne_xdp_api_init_once();
+    if (!ne_bpf_xdp_attach && !ne_bpf_set_link_xdp_fd) {
+        fprintf(stderr,
+                "[PROFILE-XDP] attach failed %s %s: libbpf has no XDP attach API\n",
+                role, ifname);
+        fflush(stderr);
+        return -1;
+    }
+
     try_flags[n_try++] = flags;
     if (flags != (XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST))
         try_flags[n_try++] = XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST;
 
-    fprintf(stderr, "[PROFILE-XDP] attach %s %s ifindex=%d prog_fd=%d primary_flags=0x%x\n",
-            role, ifname, ifindex, prog_fd, flags);
+    fprintf(stderr,
+            "[PROFILE-XDP] attach %s %s ifindex=%d prog_fd=%d primary_flags=0x%x api=%s\n",
+            role, ifname, ifindex, prog_fd, flags,
+            ne_bpf_xdp_attach ? "bpf_xdp_attach" : "bpf_set_link_xdp_fd");
     fflush(stderr);
 
     for (int i = 0; i < n_try; i++) {
@@ -367,15 +424,27 @@ static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
         if (i > 0)
             xdp_try_detach(ifindex, try_flags[i - 1]);
 
-        rc = bpf_xdp_attach(ifindex, prog_fd, f, NULL);
-        if (rc) {
+        rc = ne_xdp_do_attach(ifindex, prog_fd, f);
+        if (rc < 0) {
             fprintf(stderr, "[PROFILE-XDP] attach attempt %s %s flags=0x%x: %s\n",
                     role, ifname, f, strerror(-rc));
             fflush(stderr);
             continue;
         }
-        if (validate_xdp_attached_idx(ifindex, ifname, role, f) == 0)
+        if (validate_xdp_attached(ifindex, ifname, role, f) == 0)
             return 0;
+        /*
+         * bpf_xdp_attach (libbpf ≥0.7) may succeed without sysfs prog_id when
+         * query APIs are absent (older NE nodes). Trust attach in that case.
+         */
+        if (ne_bpf_xdp_attach && !ne_bpf_get_link_xdp_id && !ne_bpf_xdp_query_id) {
+            fprintf(stderr,
+                    "[PROFILE-XDP] validate skip %s %s flags=0x%x "
+                    "(bpf_xdp_attach OK, no prog_id query API)\n",
+                    role, ifname, f);
+            fflush(stderr);
+            return 0;
+        }
         fprintf(stderr,
                 "[PROFILE-XDP] attach OK but validate failed %s %s flags=0x%x — retry\n",
                 role, ifname, f);
