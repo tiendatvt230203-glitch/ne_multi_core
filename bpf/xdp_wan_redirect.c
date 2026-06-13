@@ -75,8 +75,12 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
     if (fake4 && *fake4 != 0 && proto == bpf_htons(*fake4)) {
         int wi = ne_l2_core_id_pick_worker(data, data_end, eth);
+        __u32 qid = ctx->rx_queue_index;
 
-        if (wi >= 0) {
+        /* Only redirect when core_id queue matches HW RX queue.  Cross-queue
+         * bpf_redirect_map black-holes on some DRV+XSK setups; fallback to
+         * rx_queue_index (usually 0) and userspace relay by core_id. */
+        if (wi >= 0 && (__u32)wi == qid) {
             rc = ne_try_xsk_redirect_u32(&wan_xsks_map, (__u32)wi);
             if (rc)
                 return rc;
