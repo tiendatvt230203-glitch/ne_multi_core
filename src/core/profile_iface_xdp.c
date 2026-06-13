@@ -547,7 +547,7 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
     return 0;
 }
 
-static int update_xsk_map_queue(struct xsk_socket *xsk, int map_fd, int queue_id)
+static int update_xsk_map_queue_int(struct xsk_socket *xsk, int map_fd, int queue_id)
 {
     int key = queue_id;
     int fd = xsk_socket__fd(xsk);
@@ -556,23 +556,37 @@ static int update_xsk_map_queue(struct xsk_socket *xsk, int map_fd, int queue_id
     return bpf_map_update_elem(map_fd, &key, &fd, BPF_ANY);
 }
 
-static int update_xsk_map_iface(struct ne_iface *iface, int map_fd, const char *tag)
+static int update_xsk_map_queue_u32(struct xsk_socket *xsk, int map_fd, int queue_id)
+{
+    __u32 key = (__u32)queue_id;
+    int sock_fd = xsk_socket__fd(xsk);
+    __u32 val = (__u32)sock_fd;
+
+    (void)xsk_socket__update_xskmap(xsk, map_fd);
+    return bpf_map_update_elem(map_fd, &key, &val, BPF_ANY);
+}
+
+static int update_xsk_map_iface(struct ne_iface *iface, int map_fd, const char *tag,
+                                int u32_keys)
 {
     for (int q = 0; q < iface->queue_count; q++) {
-        int key = q;
-        int fd;
+        int sock_fd;
+        int rc;
 
         if (!iface->queues[q].xsk)
             return -1;
-        if (update_xsk_map_queue(iface->queues[q].xsk, map_fd, q) != 0)
-            return -1;
-        if (bpf_map_lookup_elem(map_fd, &key, &fd) != 0) {
-            fprintf(stderr, "[PROFILE-XDP] %s %s xsks_map[%d] bind FAILED\n",
-                    tag, iface->ifname, q);
+        sock_fd = xsk_socket__fd(iface->queues[q].xsk);
+        rc = u32_keys
+            ? update_xsk_map_queue_u32(iface->queues[q].xsk, map_fd, q)
+            : update_xsk_map_queue_int(iface->queues[q].xsk, map_fd, q);
+        if (rc != 0) {
+            fprintf(stderr, "[PROFILE-XDP] %s %s xsks_map[%d] update failed errno=%d\n",
+                    tag, iface->ifname, q, errno);
+            fflush(stderr);
             return -1;
         }
         fprintf(stderr, "[PROFILE-XDP] %s %s xsks_map[%d]=fd%d\n",
-                tag, iface->ifname, q, fd);
+                tag, iface->ifname, q, sock_fd);
     }
     fflush(stderr);
     return 0;
@@ -615,7 +629,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         fprintf(stderr,
                 "[PROFILE-XDP] LAN %s xdp/id:%u — skip attach, refresh xsks_map (shared)\n",
                 ifname, existing_id);
-        return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map), "LAN");
+        return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map), "LAN", 1);
     }
 
     if (skip_attach) {
@@ -635,7 +649,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, ifname, "LAN") != 0)
         return -1;
-    return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map), "LAN");
+    return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map), "LAN", 1);
 }
 
 int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, int dp_slot,
@@ -653,7 +667,7 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0)
         return -1;
-    return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map), "WAN");
+    return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map), "WAN", 0);
 }
 
 

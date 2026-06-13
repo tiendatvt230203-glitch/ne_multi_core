@@ -275,6 +275,11 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     int dec;
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
+        uint8_t log_core_id = 0;
+        int log_wi = dp_crypto_current_worker_idx();
+
+        if (job.len >= CRYPTO_L2_NONCE_OFF)
+            (void)crypto_layer2_read_core_id(pkt, job.len, &log_core_id);
         dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
             ne_frame_free(&fwd->pair, job.addr);
@@ -282,13 +287,12 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         if (dec != 0) {
             // #region agent log
-            uint8_t core_id = 0;
+            uint8_t core_id = log_core_id;
             uint32_t mark = 0;
 
             if (job.len >= 16)
                 mark = ((uint32_t)pkt[12] << 24) | ((uint32_t)pkt[13] << 16) |
                        ((uint32_t)pkt[14] << 8) | pkt[15];
-            (void)crypto_layer2_read_core_id(pkt, job.len, &core_id);
             dp_agent_log_drop("H2", "dataplane_wan.c:decrypt", "decrypt_fail",
                               (uint32_t)core_id, mark, (uint16_t)job.wan_idx, (uint16_t)job.len);
             // #endregion
@@ -297,28 +301,12 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         // #region agent log
         {
             static uint32_t ok_budget = 30;
-            uint8_t core_id = 0;
-            FILE *f;
 
             if (ok_budget > 0) {
                 ok_budget--;
-                (void)crypto_layer2_read_core_id(pkt, job.len, &core_id);
                 fprintf(stderr,
                         "[DATAPLANE] decrypt_ok core_id=%u wi=%d len=%u\n",
-                        (unsigned)core_id, dp_crypto_current_worker_idx(), job.len);
-                f = fopen(".cursor/debug-dfdcf7.log", "a");
-                if (!f)
-                    f = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
-                if (f) {
-                    fprintf(f,
-                            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H-B\","
-                            "\"location\":\"dataplane_wan.c:decrypt_ok\","
-                            "\"message\":\"decrypt ok\",\"data\":{\"core_id\":%u,"
-                            "\"wi\":%d,\"len\":%u},\"timestamp\":%ld}\n",
-                            (unsigned)core_id, dp_crypto_current_worker_idx(), job.len,
-                            (long)(time(NULL) * 1000));
-                    fclose(f);
-                }
+                        (unsigned)log_core_id, log_wi, job.len);
             }
         }
         // #endregion

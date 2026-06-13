@@ -7,6 +7,7 @@
 #include "../../inc/core/forwarder_reload.h"
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/main_diag.h"
+#include "../../inc/core/interface.h"
 
 #include "../../inc/crypto/crypto_layer2.h"
 
@@ -103,6 +104,34 @@ static void worker_recycle_tx_slot(struct forwarder *fwd, int wi)
     worker_touch_fq_slot(fwd, wi);
 }
 
+static int worker_relay_ingress(struct forwarder *fwd, int target, struct ne_packet *pkt)
+{
+    struct ne_packet relay = *pkt;
+    const uint8_t *src = ne_packet_data(&fwd->pair, pkt->addr);
+    uint8_t *dst;
+
+    if (target < 0 || target >= (int)NE_CRYPTO_WORKERS)
+        return -1;
+    if (ne_frame_alloc(&fwd->pair, &relay.addr) != 0) {
+        // #region agent log
+        dp_agent_log_drop("H-F", "forwarder_pipeline.c:relay", "relay_alloc_fail",
+                          (uint32_t)target, pkt->len, (uint16_t)pkt->dir, 0);
+        // #endregion
+        return -1;
+    }
+    dst = ne_packet_data(&fwd->pair, relay.addr);
+    memcpy(dst, src, pkt->len);
+    if (ne_ring_try_push(&fwd->worker_ingress[target], &relay) != 0) {
+        ne_frame_free(&fwd->pair, relay.addr);
+        // #region agent log
+        dp_agent_log_drop("H-F", "forwarder_pipeline.c:relay", "relay_ring_full",
+                          (uint32_t)target, pkt->len, (uint16_t)pkt->dir, 0);
+        // #endregion
+        return -1;
+    }
+    return 0;
+}
+
 static int worker_handle_local(struct forwarder *fwd, int wi, struct ne_packet *pkt)
 {
     int target = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, pkt->addr), pkt->len);
@@ -113,7 +142,7 @@ static int worker_handle_local(struct forwarder *fwd, int wi, struct ne_packet *
         dataplane_process_local(fwd, *pkt);
         return 0;
     }
-    if (ne_ring_try_push(&fwd->worker_ingress[target], pkt) != 0) {
+    if (worker_relay_ingress(fwd, target, pkt) != 0) {
         ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
     }
@@ -162,7 +191,7 @@ static int worker_handle_wan(struct forwarder *fwd, int wi, struct ne_packet *pk
         dp_agent_log_wan_route("relay", core_id, wi, target, pkt->len);
     }
     // #endregion
-    if (ne_ring_try_push(&fwd->worker_ingress[target], pkt) != 0) {
+    if (worker_relay_ingress(fwd, target, pkt) != 0) {
         ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
     }
