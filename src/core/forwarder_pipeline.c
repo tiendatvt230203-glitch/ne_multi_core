@@ -19,8 +19,8 @@
 extern atomic_int running;
 extern pthread_mutex_t runtime_lock;
 
-#define IO_BURST_ROUNDS   8
 #define IO_TX_BURST_MAX   64
+#define IO_FQ_TOUCH_IDLE  128u
 #define WORKER_STATS_EVERY 500000u
 
 // #region agent log
@@ -53,23 +53,18 @@ static void pin_cpu(unsigned int cpu)
     (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 }
 
-static void worker_refill_slot(struct forwarder *fwd, int wi)
+static void worker_touch_fq_slot(struct forwarder *fwd, int wi)
 {
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_local_slot(&fwd->pair, wi);
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_wan_slot(&fwd->pair, wi);
+    ne_refill_fq_local_slot(&fwd->pair, wi);
+    ne_refill_fq_wan_slot(&fwd->pair, wi);
 }
 
-static void worker_drain_tx(struct forwarder *fwd, int wi)
+static int worker_drain_tx(struct forwarder *fwd, int wi)
 {
-    if (wi < 0 || wi >= (int)NE_TX_SLOTS)
-        return;
+    int total_sent = 0;
 
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_drain_cq_local(&fwd->pair, wi);
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_drain_cq_wan(&fwd->pair, wi);
+    if (wi < 0 || wi >= (int)NE_TX_SLOTS)
+        return 0;
 
     for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
         int sent = 0;
@@ -88,9 +83,18 @@ static void worker_drain_tx(struct forwarder *fwd, int wi)
             if (wi == 0 && fwd_wan_tx_depth(fwd, di) == 0)
                 fwd->wan_tx_stuck[di] = 0;
         }
+        total_sent += sent;
         if (sent <= 0)
             break;
     }
+    return total_sent;
+}
+
+static void worker_recycle_tx_slot(struct forwarder *fwd, int wi)
+{
+    ne_drain_cq_local(&fwd->pair, wi);
+    ne_drain_cq_wan(&fwd->pair, wi);
+    worker_touch_fq_slot(fwd, wi);
 }
 
 static int worker_handle_local(struct forwarder *fwd, int wi, struct ne_packet *pkt)
@@ -221,6 +225,7 @@ static void *pipeline_worker_thread(void *arg)
     struct forwarder *fwd = ctx->fwd;
     struct ne_packet job;
     uint32_t gc_tick = 0;
+    uint32_t idle_ticks = 0;
     uint64_t local_pkts = 0;
     uint64_t wan_pkts = 0;
     uint64_t relay_pkts = 0;
@@ -238,8 +243,8 @@ static void *pipeline_worker_thread(void *arg)
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
-
-        worker_refill_slot(fwd, wi);
+        int did_recv = 0;
+        int sent;
 
         if (ne_ring_try_pop(&fwd->worker_ingress[wi], &job) == 0) {
             if (job.dir == NE_DIR_WAN)
@@ -249,10 +254,23 @@ static void *pipeline_worker_thread(void *arg)
             did_work = 1;
         }
 
-        if (worker_recv_slot(fwd, wi, &local_pkts, &wan_pkts, &relay_pkts))
+        did_recv = worker_recv_slot(fwd, wi, &local_pkts, &wan_pkts, &relay_pkts);
+        if (did_recv) {
             did_work = 1;
+            worker_touch_fq_slot(fwd, wi);
+        } else if ((++idle_ticks & (IO_FQ_TOUCH_IDLE - 1)) == 0) {
+            worker_touch_fq_slot(fwd, wi);
+        }
 
-        worker_drain_tx(fwd, wi);
+        sent = worker_drain_tx(fwd, wi);
+        if (sent > 0) {
+            did_work = 1;
+            idle_ticks = 0;
+            worker_recycle_tx_slot(fwd, wi);
+        }
+
+        if (did_work)
+            idle_ticks = 0;
 
         if (++gc_tick >= 2048) {
             fwd_crypto_frag_gc_worker_tick(wi);
