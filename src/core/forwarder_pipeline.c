@@ -152,8 +152,14 @@ static int worker_recv_slot(struct forwarder *fwd, int wi, uint64_t *local_pkts,
     struct ne_packet batch[NE_BATCH_SIZE];
     int did_recv = 0;
     int rcvd;
+    static uint32_t recv_log_budget = 8;
 
     rcvd = ne_recv_local_slot(&fwd->pair, batch, NE_BATCH_SIZE, wi);
+    if (rcvd > 0 && recv_log_budget > 0) {
+        recv_log_budget--;
+        fprintf(stderr, "[PIPELINE] worker %d recv LAN batch=%d\n", wi, rcvd);
+        fflush(stderr);
+    }
     for (int i = 0; i < rcvd; i++) {
         int r = worker_handle_local(fwd, wi, &batch[i]);
 
@@ -168,6 +174,11 @@ static int worker_recv_slot(struct forwarder *fwd, int wi, uint64_t *local_pkts,
     }
 
     rcvd = ne_recv_wan_slot(&fwd->pair, batch, NE_BATCH_SIZE, wi);
+    if (rcvd > 0 && recv_log_budget > 0) {
+        recv_log_budget--;
+        fprintf(stderr, "[PIPELINE] worker %d recv WAN batch=%d\n", wi, rcvd);
+        fflush(stderr);
+    }
     for (int i = 0; i < rcvd; i++) {
         if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
             ne_frame_free(&fwd->pair, batch[i].addr);

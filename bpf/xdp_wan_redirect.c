@@ -32,6 +32,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
+    int rc;
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
@@ -50,8 +51,13 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         if (ip->protocol == IPPROTO_ICMP_VAL || ip->protocol == IPPROTO_TCP_VAL ||
             ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_OSPF_VAL ||
             ip->protocol == IPPROTO_CUSTOM_VAL) {
-            __u32 qid = ctx->rx_queue_index;
-            return bpf_redirect_map(&wan_xsks_map, qid, 0);
+            rc = ne_try_xsk_redirect_int(&wan_xsks_map, (int)ctx->rx_queue_index);
+            if (rc)
+                return rc;
+            rc = ne_try_xsk_redirect_int(&wan_xsks_map, 0);
+            if (rc)
+                return rc;
+            return XDP_PASS;
         }
 
         return XDP_PASS;
@@ -62,10 +68,18 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     if (fake4 && *fake4 != 0 && proto == bpf_htons(*fake4)) {
         int wi = ne_l2_core_id_pick_worker(data, data_end, eth);
 
-        if (wi >= 0)
-            return bpf_redirect_map(&wan_xsks_map, wi, 0);
-        __u32 qid = ctx->rx_queue_index;
-        return bpf_redirect_map(&wan_xsks_map, qid, 0);
+        if (wi >= 0) {
+            rc = ne_try_xsk_redirect_int(&wan_xsks_map, wi);
+            if (rc)
+                return rc;
+        }
+        rc = ne_try_xsk_redirect_int(&wan_xsks_map, (int)ctx->rx_queue_index);
+        if (rc)
+            return rc;
+        rc = ne_try_xsk_redirect_int(&wan_xsks_map, 0);
+        if (rc)
+            return rc;
+        return XDP_PASS;
     }
 
     return XDP_PASS;

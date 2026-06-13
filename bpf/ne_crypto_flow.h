@@ -67,4 +67,19 @@ static __always_inline int ne_l2_core_id_pick_worker(void *data, void *data_end,
     return (int)(core_id - NE_CPU_WORKER_MIN);
 }
 
+/* Redirect only when xsks_map slot is bound; avoids XDP_ABORTED on empty keys. */
+static __always_inline int ne_try_xsk_redirect_u32(void *xsks_map, __u32 key)
+{
+    if (bpf_map_lookup_elem(xsks_map, &key))
+        return bpf_redirect_map(xsks_map, key, 0);
+    return 0;
+}
+
+static __always_inline int ne_try_xsk_redirect_int(void *xsks_map, int key)
+{
+    if (bpf_map_lookup_elem(xsks_map, &key))
+        return bpf_redirect_map(xsks_map, key, 0);
+    return 0;
+}
+
 #endif

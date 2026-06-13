@@ -418,6 +418,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
                                            NE_LOCAL_QUEUE_TARGET);
         NE_TRY(interface_set_queue_count(cfg->locals[i].ifname, nq));
         p->locals[i].queue_count = nq;
+        fprintf(stderr, "[QUEUE] LAN %s queue_count=%d\n", cfg->locals[i].ifname, nq);
         p->local_queue_total += nq;
     }
     for (int di = 0; di < p->wan_count; di++) {
@@ -429,6 +430,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
                                            NE_WAN_QUEUE_TARGET);
         NE_TRY(interface_set_queue_count(cfg->wans[ci].ifname, nq));
         p->wans[di].queue_count = nq;
+        fprintf(stderr, "[QUEUE] WAN %s queue_count=%d\n", cfg->wans[ci].ifname, nq);
         p->wan_queue_total += nq;
     }
 
