@@ -14,6 +14,19 @@
 #include <string.h>
 #include <unistd.h>
 
+/*
+ * NE1 may ship an older system libbpf without bpf_get_link_xdp_id (added ~0.6).
+ * Provide a weak stub so the link succeeds; sysfs fallback handles validation.
+ */
+__attribute__((weak))
+int bpf_get_link_xdp_id(int ifindex, __u32 *prog_id, __u32 flags)
+{
+    (void)ifindex;
+    (void)prog_id;
+    (void)flags;
+    return -ENOSYS;
+}
+
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
                                       enum profile_iface_xdp_reload_mode mode);
 
