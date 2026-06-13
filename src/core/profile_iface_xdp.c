@@ -8,9 +8,11 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
+#include <linux/if_link.h>
 #include <net/if.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
                                       enum profile_iface_xdp_reload_mode mode);
@@ -261,33 +263,113 @@ static int lan_iface_has_kernel_xdp(const char *ifname, uint32_t *prog_id_out)
     return 1;
 }
 
-static int validate_xdp_attached(const char *ifname, const char *role)
+static int query_xdp_prog_id(int ifindex, const char *ifname, uint32_t attach_flags,
+                             uint32_t *prog_id_out)
+{
+    __u32 prog_id = 0;
+    uint32_t qflags[3];
+    int nq = 0;
+
+    if (!prog_id_out)
+        return -1;
+    *prog_id_out = 0;
+
+    qflags[nq++] = attach_flags;
+    if (attach_flags != XDP_FLAGS_DRV_MODE)
+        qflags[nq++] = XDP_FLAGS_DRV_MODE;
+    if (attach_flags != XDP_FLAGS_SKB_MODE)
+        qflags[nq++] = XDP_FLAGS_SKB_MODE;
+
+    for (int i = 0; i < nq; i++) {
+        prog_id = 0;
+        if (bpf_get_link_xdp_id(ifindex, &prog_id, qflags[i]) == 0 && prog_id != 0) {
+            *prog_id_out = prog_id;
+            return 0;
+        }
+    }
+
+    if (ifname && read_xdp_prog_id(ifname, prog_id_out) == 0 && *prog_id_out != 0)
+        return 0;
+    return -1;
+}
+
+static int validate_xdp_attached_idx(int ifindex, const char *ifname, const char *role,
+                                     uint32_t attach_flags)
 {
     uint32_t prog_id = 0;
 
-    if (read_xdp_prog_id(ifname, &prog_id) != 0 || prog_id == 0) {
-        fprintf(stderr,
-                "[PROFILE-XDP] validate FAIL %s %s: no prog_id\n", role, ifname);
-        return -1;
+    for (int retry = 0; retry < 5; retry++) {
+        if (query_xdp_prog_id(ifindex, ifname, attach_flags, &prog_id) == 0 &&
+            prog_id != 0) {
+            fprintf(stderr,
+                    "[PROFILE-XDP] validate OK %s %s prog_id=%u (xdp/id:%u ifindex=%d)\n",
+                    role, ifname, prog_id, prog_id, ifindex);
+            fflush(stderr);
+            return 0;
+        }
+        if (retry < 4)
+            usleep(2000);
     }
-    fprintf(stderr, "[PROFILE-XDP] validate OK %s %s prog_id=%u (xdp/id:%u)\n",
-            role, ifname, prog_id, prog_id);
+    fprintf(stderr,
+            "[PROFILE-XDP] validate FAIL %s %s: no prog_id (ifindex=%d flags=0x%x)\n",
+            role, ifname, ifindex, attach_flags);
     fflush(stderr);
-    return 0;
+    return -1;
+}
+
+static void xdp_try_detach(int ifindex, uint32_t flags)
+{
+    int rc = bpf_xdp_detach(ifindex, flags, NULL);
+
+    if (rc && rc != -EINVAL && rc != -ENOENT)
+        fprintf(stderr, "[PROFILE-XDP] detach ifindex=%d flags=0x%x: %s\n",
+                ifindex, flags, strerror(-rc));
 }
 
 static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
                            const char *ifname, const char *role)
 {
-    int rc = bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
+    uint32_t try_flags[2];
+    int n_try = 0;
 
-    if (rc) {
-        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s: %s\n",
-                role, ifname, strerror(-rc));
+    if (prog_fd < 0) {
+        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s: invalid prog_fd\n",
+                role, ifname);
         fflush(stderr);
         return -1;
     }
-    return validate_xdp_attached(ifname, role);
+
+    try_flags[n_try++] = flags;
+    if (flags != (XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST))
+        try_flags[n_try++] = XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST;
+
+    fprintf(stderr, "[PROFILE-XDP] attach %s %s ifindex=%d prog_fd=%d primary_flags=0x%x\n",
+            role, ifname, ifindex, prog_fd, flags);
+    fflush(stderr);
+
+    for (int i = 0; i < n_try; i++) {
+        uint32_t f = try_flags[i];
+        int rc;
+
+        if (i > 0)
+            xdp_try_detach(ifindex, try_flags[i - 1]);
+
+        rc = bpf_xdp_attach(ifindex, prog_fd, f, NULL);
+        if (rc) {
+            fprintf(stderr, "[PROFILE-XDP] attach attempt %s %s flags=0x%x: %s\n",
+                    role, ifname, f, strerror(-rc));
+            fflush(stderr);
+            continue;
+        }
+        if (validate_xdp_attached_idx(ifindex, ifname, role, f) == 0)
+            return 0;
+        fprintf(stderr,
+                "[PROFILE-XDP] attach OK but validate failed %s %s flags=0x%x — retry\n",
+                role, ifname, f);
+        fflush(stderr);
+        xdp_try_detach(ifindex, f);
+    }
+    return -1;
 }
 
 static int open_bpf_object(const char *path, struct bpf_object **obj_out,
@@ -380,6 +462,10 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
                 ifname, existing_id);
         return 0;
     }
+
+    fprintf(stderr, "[PROFILE-XDP] LAN %s bind ifindex=%d bpf=%s\n",
+            ifname, p->locals[pair_li].ifindex, cfg->bpf_file);
+    fflush(stderr);
 
     if (open_bpf_object(cfg->bpf_file, &p->bpf_locals[pair_li],
                         "xdp_redirect_prog", &prog, "xsks_map", &map) != 0)

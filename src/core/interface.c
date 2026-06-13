@@ -396,7 +396,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->frame_size = NE_FRAME;
     p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
-    p->xdp_flags = XDP_FLAGS_DRV_MODE;
+    p->xdp_flags = XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST;
 
     p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
