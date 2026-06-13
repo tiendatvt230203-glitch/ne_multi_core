@@ -77,10 +77,15 @@ static int worker_drain_tx(struct forwarder *fwd, int wi)
                                       li, wi);
         }
         for (int di = 0; di < fwd->wan_count; di++) {
+            int wan_sent;
+
             if (!ne_pair_wan_live(&fwd->pair, di) || fwd_wan_is_stopped(di))
                 continue;
-            sent += ne_tx_drain_wan(&fwd->pair, &fwd->worker_tx_wan[di][wi],
-                                    di, wi);
+            wan_sent = ne_tx_drain_wan(&fwd->pair, &fwd->worker_tx_wan[di][wi],
+                                       di, wi);
+            if (wan_sent > 0)
+                dp_agent_log_wan_tx(wi, di, 0, wan_sent);
+            sent += wan_sent;
             if (wi == 0 && fwd_wan_tx_depth(fwd, di) == 0)
                 fwd->wan_tx_stuck[di] = 0;
         }
@@ -349,7 +354,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
     fprintf(stderr,
-            "[PIPELINE] BPF redirect: LAN flow-hash + WAN L2 core_id (fallback rx_queue_index)\n");
+            "[PIPELINE] BPF redirect: LAN rx_queue_index + WAN L2 core_id (fallback rx_queue_index)\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)

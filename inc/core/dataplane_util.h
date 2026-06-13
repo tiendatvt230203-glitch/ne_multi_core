@@ -31,6 +31,11 @@ void dp_agent_log_fwd(const char *path, uint32_t dst_host, uint16_t dst_port, ui
 
 void dp_agent_log_wan_route(const char *event, uint8_t core_id,
                             int recv_wi, int target_wi, uint32_t pkt_len);
+
+void dp_agent_log_encrypt_wan(uint8_t core_id, int wi, int wan_dp,
+                              uint32_t dst_host, uint16_t dst_port, uint32_t len);
+
+void dp_agent_log_wan_tx(int wi, int wan_dp, uint32_t len, int sent);
 // #endregion
 
 #endif

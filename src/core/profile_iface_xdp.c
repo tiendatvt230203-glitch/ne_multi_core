@@ -570,13 +570,18 @@ static int update_xsk_map_iface(struct ne_iface *iface, int map_fd)
 
 static void update_wan_fake_ethertype(struct bpf_object *obj, uint16_t fake_ethertype_ipv4)
 {
-    if (!obj || fake_ethertype_ipv4 == 0)
+    if (!obj)
         return;
+    if (fake_ethertype_ipv4 == 0)
+        fake_ethertype_ipv4 = 0x88B5u;
     struct bpf_map *map = bpf_object__find_map_by_name(obj, "wan_config_map");
     if (!map)
         return;
     int key = 0;
     (void)bpf_map_update_elem(bpf_map__fd(map), &key, &fake_ethertype_ipv4, BPF_ANY);
+    fprintf(stderr, "[PROFILE-XDP] wan_config_map fake_ethertype=0x%04x\n",
+            (unsigned)fake_ethertype_ipv4);
+    fflush(stderr);
 }
 
 int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg, int pair_li)

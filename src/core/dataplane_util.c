@@ -82,6 +82,61 @@ void dp_agent_log_fwd(const char *path, uint32_t dst_host, uint16_t dst_port, ui
     fclose(f);
 }
 
+void dp_agent_log_encrypt_wan(uint8_t core_id, int wi, int wan_dp,
+                              uint32_t dst_host, uint16_t dst_port, uint32_t len)
+{
+    static uint32_t budget = 40;
+    FILE *f;
+
+    if (budget == 0)
+        return;
+    budget--;
+    fprintf(stderr,
+            "[DATAPLANE] encrypt_wan core_id=%u wi=%d wan=%d dst=%u.%u.%u.%u dport=%u len=%u\n",
+            (unsigned)core_id, wi, wan_dp,
+            (dst_host >> 24) & 0xFFu, (dst_host >> 16) & 0xFFu,
+            (dst_host >> 8) & 0xFFu, dst_host & 0xFFu,
+            (unsigned)dst_port, len);
+    f = fopen(DP_AGENT_LOG_CWD, "a");
+    if (!f)
+        f = fopen(DP_AGENT_LOG_LOCAL, "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H-B\",\"location\":"
+            "\"dataplane_local.c:encrypt_wan\",\"message\":\"encrypt wan push\","
+            "\"data\":{\"core_id\":%u,\"wi\":%d,\"wan_dp\":%d,\"dst_host\":%u,"
+            "\"dport\":%u,\"len\":%u},\"timestamp\":%ld}\n",
+            (unsigned)core_id, wi, wan_dp, dst_host, (unsigned)dst_port, len,
+            (long)(time(NULL) * 1000));
+    fclose(f);
+}
+
+void dp_agent_log_wan_tx(int wi, int wan_dp, uint32_t len, int sent)
+{
+    static uint32_t budget = 40;
+    FILE *f;
+
+    if (budget == 0 || sent <= 0)
+        return;
+    budget--;
+    fprintf(stderr,
+            "[DATAPLANE] wan_tx wi=%d wan=%d len=%u sent=%d\n",
+            wi, wan_dp, len, sent);
+    f = fopen(DP_AGENT_LOG_CWD, "a");
+    if (!f)
+        f = fopen(DP_AGENT_LOG_LOCAL, "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H-E\",\"location\":"
+            "\"forwarder_pipeline.c:wan_tx\",\"message\":\"wan xsk tx\","
+            "\"data\":{\"wi\":%d,\"wan_dp\":%d,\"len\":%u,\"sent\":%d},"
+            "\"timestamp\":%ld}\n",
+            wi, wan_dp, len, sent, (long)(time(NULL) * 1000));
+    fclose(f);
+}
+
 void dp_agent_log_wan_route(const char *event, uint8_t core_id,
                             int recv_wi, int target_wi, uint32_t pkt_len)
 {

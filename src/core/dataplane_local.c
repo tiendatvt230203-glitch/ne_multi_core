@@ -224,6 +224,14 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
     (void)push_to_wan(fwd, &job, wan_dp);
     // #region agent log
+    {
+        uint8_t core_id = 0;
+
+        pkt = ne_packet_data(&fwd->pair, job.addr);
+        (void)crypto_layer2_read_core_id(pkt, job.len, &core_id);
+        dp_agent_log_encrypt_wan(core_id, dp_crypto_current_worker_idx(), wan_dp,
+                                 ntohl(dst_ip), dst_port, job.len);
+    }
     dp_agent_log_fwd("dataplane_local.c:encrypt", ntohl(dst_ip), dst_port, job.len);
     // #endregion
     return;
