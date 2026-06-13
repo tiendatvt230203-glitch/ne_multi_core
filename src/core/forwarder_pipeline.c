@@ -136,9 +136,23 @@ static int worker_handle_wan(struct forwarder *fwd, int wi, struct ne_packet *pk
         return -1;
     }
     if (target == wi) {
+        // #region agent log
+        uint8_t core_id = 0;
+
+        (void)crypto_layer2_read_core_id(raw, pkt->len, &core_id);
+        dp_agent_log_wan_route("direct", core_id, wi, target, pkt->len);
+        // #endregion
         dataplane_process_wan(fwd, *pkt);
         return 0;
     }
+    // #region agent log
+    {
+        uint8_t core_id = 0;
+
+        (void)crypto_layer2_read_core_id(raw, pkt->len, &core_id);
+        dp_agent_log_wan_route("relay", core_id, wi, target, pkt->len);
+    }
+    // #endregion
     if (ne_ring_try_push(&fwd->worker_ingress[target], pkt) != 0) {
         ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
@@ -335,7 +349,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
     fprintf(stderr,
-            "[PIPELINE] BPF redirect: rx_queue_index only (core_id routing in userspace relay)\n");
+            "[PIPELINE] BPF redirect: LAN flow-hash + WAN L2 core_id (fallback rx_queue_index)\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)

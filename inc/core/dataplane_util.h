@@ -28,6 +28,9 @@ void dp_agent_log_drop(const char *hypothesis_id, const char *path,
 int dp_dest_is_nonunicast(const struct forwarder *fwd, uint32_t dest_ip);
 
 void dp_agent_log_fwd(const char *path, uint32_t dst_host, uint16_t dst_port, uint32_t len);
+
+void dp_agent_log_wan_route(const char *event, uint8_t core_id,
+                            int recv_wi, int target_wi, uint32_t pkt_len);
 // #endregion
 
 #endif

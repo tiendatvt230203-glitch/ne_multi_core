@@ -14,6 +14,8 @@
 #include "../../inc/core/crypto_route.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <time.h>
 #include <arpa/inet.h>
 
 static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fwd, uint8_t wire_id)
@@ -292,6 +294,34 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             // #endregion
             goto drop;
         }
+        // #region agent log
+        {
+            static uint32_t ok_budget = 30;
+            uint8_t core_id = 0;
+            FILE *f;
+
+            if (ok_budget > 0) {
+                ok_budget--;
+                (void)crypto_layer2_read_core_id(pkt, job.len, &core_id);
+                fprintf(stderr,
+                        "[DATAPLANE] decrypt_ok core_id=%u wi=%d len=%u\n",
+                        (unsigned)core_id, dp_crypto_current_worker_idx(), job.len);
+                f = fopen(".cursor/debug-dfdcf7.log", "a");
+                if (!f)
+                    f = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log", "a");
+                if (f) {
+                    fprintf(f,
+                            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H-B\","
+                            "\"location\":\"dataplane_wan.c:decrypt_ok\","
+                            "\"message\":\"decrypt ok\",\"data\":{\"core_id\":%u,"
+                            "\"wi\":%d,\"len\":%u},\"timestamp\":%ld}\n",
+                            (unsigned)core_id, dp_crypto_current_worker_idx(), job.len,
+                            (long)(time(NULL) * 1000));
+                    fclose(f);
+                }
+            }
+        }
+        // #endregion
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 

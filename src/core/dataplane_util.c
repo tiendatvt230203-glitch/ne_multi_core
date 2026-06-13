@@ -81,6 +81,33 @@ void dp_agent_log_fwd(const char *path, uint32_t dst_host, uint16_t dst_port, ui
             path, dst_host, (unsigned)dst_port, len, (long)(time(NULL) * 1000));
     fclose(f);
 }
+
+void dp_agent_log_wan_route(const char *event, uint8_t core_id,
+                            int recv_wi, int target_wi, uint32_t pkt_len)
+{
+    static uint32_t budget = 60;
+    FILE *f;
+
+    if (budget == 0)
+        return;
+    budget--;
+    fprintf(stderr,
+            "[DATAPLANE] wan_route event=%s core_id=%u recv_wi=%d target_wi=%d len=%u\n",
+            event, (unsigned)core_id, recv_wi, target_wi, pkt_len);
+    f = fopen(DP_AGENT_LOG_CWD, "a");
+    if (!f)
+        f = fopen(DP_AGENT_LOG_LOCAL, "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H-A\",\"location\":"
+            "\"forwarder_pipeline.c:wan_route\",\"message\":\"wan route\","
+            "\"data\":{\"event\":\"%s\",\"core_id\":%u,\"recv_wi\":%d,"
+            "\"target_wi\":%d,\"len\":%u},\"timestamp\":%ld}\n",
+            event, (unsigned)core_id, recv_wi, target_wi, pkt_len,
+            (long)(time(NULL) * 1000));
+    fclose(f);
+}
 // #endregion
 
 int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
