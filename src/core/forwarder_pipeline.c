@@ -34,7 +34,7 @@ static void agent_log_worker_io(int wi, uint8_t cpu_id, uint64_t local_pkts,
     if (!f)
         return;
     fprintf(f,
-            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H3\",\"location\":\"forwarder_pipeline.c:worker_io\","
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H4\",\"location\":\"forwarder_pipeline.c:worker_io\","
             "\"message\":\"worker queue-slot stats\",\"data\":{\"worker\":%d,\"cpu\":%u,\"local_pkts\":%llu,"
             "\"wan_pkts\":%llu,\"relay_pkts\":%llu,\"loops\":%llu},\"timestamp\":%ld}\n",
             wi, (unsigned)cpu_id, (unsigned long long)local_pkts,
@@ -310,6 +310,8 @@ void forwarder_pipeline_run(struct forwarder *fwd)
     fprintf(stderr,
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
+    fprintf(stderr,
+            "[PIPELINE] BPF LAN: 5-tuple hash → XSK worker | BPF WAN L2: core_id byte15 → XSK worker\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)

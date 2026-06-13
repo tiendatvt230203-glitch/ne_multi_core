@@ -8,6 +8,21 @@
 #include <arpa/inet.h>
 #include <stddef.h>
 
+#define NE_FLOW_GOLDEN 0x9E3779B1u
+
+/* Must match bpf/ne_crypto_flow.h ne_flow_hash_mix(). */
+uint32_t dp_crypto_flow_hash_mix(uint32_t src_ip, uint32_t dst_ip,
+                                 uint16_t src_port, uint16_t dst_port,
+                                 uint8_t proto)
+{
+    uint32_t key = (uint32_t)(src_port ^ dst_port);
+
+    key ^= src_ip ^ dst_ip ^ (uint32_t)proto;
+    key *= NE_FLOW_GOLDEN;
+    key ^= key >> 16;
+    return key;
+}
+
 static const uint8_t ne_crypto_cpus[NE_CRYPTO_WORKERS] = {
     NE_CPU_WORKER0,
     NE_CPU_WORKER1,
@@ -65,10 +80,9 @@ int dp_crypto_pick_local_worker(const uint8_t *pkt, uint32_t len)
     }
 
     /* src^dst đổi theo connection: forward (src đổi) và return (dst đổi). */
-    key = (uint32_t)(src_port ^ dst_port);
-    key ^= ntohl(src_ip) ^ ntohl(dst_ip) ^ (uint32_t)proto;
-    key *= 0x9E3779B1u;
-    return (int)((key >> 15) % NE_CRYPTO_WORKERS);
+    key = dp_crypto_flow_hash_mix(ntohl(src_ip), ntohl(dst_ip),
+                                  src_port, dst_port, proto);
+    return (int)(key % NE_CRYPTO_WORKERS);
 }
 
 int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)

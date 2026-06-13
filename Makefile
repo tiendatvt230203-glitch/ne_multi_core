@@ -64,7 +64,7 @@ $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 bpf/%.o: bpf/%.c
-	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -I./bpf -c $< -o $@
 
 clean:
 	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)
