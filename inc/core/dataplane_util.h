@@ -24,6 +24,10 @@ int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *
 // #region agent log
 void dp_agent_log_drop(const char *hypothesis_id, const char *path,
                        const char *reason, uint32_t a, uint32_t b, uint16_t c, uint16_t d);
+
+int dp_dest_is_nonunicast(const struct forwarder *fwd, uint32_t dest_ip);
+
+void dp_agent_log_fwd(const char *path, uint32_t dst_host, uint16_t dst_port, uint32_t len);
 // #endregion
 
 #endif

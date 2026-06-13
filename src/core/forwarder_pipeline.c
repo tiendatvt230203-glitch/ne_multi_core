@@ -335,7 +335,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
     fprintf(stderr,
-            "[PIPELINE] BPF LAN: 5-tuple hash → XSK worker | BPF WAN L2: core_id byte15 → XSK worker\n");
+            "[PIPELINE] BPF redirect: rx_queue_index only (core_id routing in userspace relay)\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)

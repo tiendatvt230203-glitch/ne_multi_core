@@ -295,6 +295,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
+    {
+        uint32_t dest = dp_dest_ipv4(pkt, job.len);
+
+        if (dp_dest_is_nonunicast(fwd, dest))
+            goto drop;
+    }
+
     li = pick_local(fwd, pkt, job.len);
     if (li < 0 || li >= fwd->local_count) {
         // #region agent log

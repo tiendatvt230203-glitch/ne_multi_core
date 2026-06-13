@@ -38,6 +38,49 @@ void dp_agent_log_drop(const char *hypothesis_id, const char *path,
             (long)(time(NULL) * 1000));
     fclose(f);
 }
+
+int dp_dest_is_nonunicast(const struct forwarder *fwd, uint32_t dest_ip)
+{
+    if (!fwd || !fwd->cfg || dest_ip == 0 || dest_ip == htonl(0xFFFFFFFFu))
+        return 1;
+    if ((ntohl(dest_ip) & 0xF0000000u) == 0xE0000000u)
+        return 1;
+    for (int i = 0; i < fwd->cfg->local_count; i++) {
+        const struct local_config *local = &fwd->cfg->locals[i];
+        uint32_t bcast = local->network | ~local->netmask;
+
+        if (dest_ip == bcast)
+            return 1;
+    }
+    return 0;
+}
+
+void dp_agent_log_fwd(const char *path, uint32_t dst_host, uint16_t dst_port, uint32_t len)
+{
+    static uint32_t budget = 20;
+    FILE *f;
+
+    if (budget == 0)
+        return;
+    budget--;
+    fprintf(stderr,
+            "[DATAPLANE] fwd %s dst=%u.%u.%u.%u dport=%u len=%u\n",
+            path,
+            (dst_host >> 24) & 0xFFu, (dst_host >> 16) & 0xFFu,
+            (dst_host >> 8) & 0xFFu, dst_host & 0xFFu,
+            (unsigned)dst_port, len);
+    f = fopen(DP_AGENT_LOG_CWD, "a");
+    if (!f)
+        f = fopen(DP_AGENT_LOG_LOCAL, "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H6\",\"location\":\"%s\","
+            "\"message\":\"dataplane forward\",\"data\":{\"dst_host\":%u,\"dport\":%u,"
+            "\"len\":%u},\"timestamp\":%ld}\n",
+            path, dst_host, (unsigned)dst_port, len, (long)(time(NULL) * 1000));
+    fclose(f);
+}
 // #endregion
 
 int dp_parse_flow(void *pkt_data, uint32_t pkt_len,

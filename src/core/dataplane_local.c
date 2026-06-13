@@ -181,6 +181,9 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
             // #endregion
             goto drop;
         }
+        // #region agent log
+        dp_agent_log_fwd("dataplane_local.c:bypass", ntohl(dst_ip), dst_port, job.len);
+        // #endregion
         return;
     }
     if (!fwd->cfg->crypto_enabled) {
@@ -213,9 +216,16 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         // #endregion
         goto drop;
     }
-    if (enc > 0)
+    if (enc > 0) {
+        // #region agent log
+        dp_agent_log_fwd("dataplane_local.c:encrypt_frag", ntohl(dst_ip), dst_port, job.len);
+        // #endregion
         return;
+    }
     (void)push_to_wan(fwd, &job, wan_dp);
+    // #region agent log
+    dp_agent_log_fwd("dataplane_local.c:encrypt", ntohl(dst_ip), dst_port, job.len);
+    // #endregion
     return;
 
 drop:
