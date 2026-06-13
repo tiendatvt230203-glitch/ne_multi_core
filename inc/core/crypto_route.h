@@ -16,6 +16,8 @@ int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_
 uint8_t dp_crypto_worker_cpu(int worker_idx);
 int dp_crypto_worker_idx_for_cpu(uint8_t cpu_id);
 
+int dp_crypto_frag_idx_for_packet(const uint8_t *pkt, uint32_t len);
+
 void dp_crypto_worker_bind(int worker_idx);
 int dp_crypto_current_worker_idx(void);
 

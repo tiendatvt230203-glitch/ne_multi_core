@@ -105,7 +105,7 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
     if (nd < 0)
         return -1;
-    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
+    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_frag_idx_for_packet(pkt, *len)),
                                 pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
         *pending = 1;

@@ -85,6 +85,20 @@ int dp_crypto_pick_local_worker(const uint8_t *pkt, uint32_t len)
     return (int)(key % NE_CRYPTO_WORKERS);
 }
 
+int dp_crypto_frag_idx_for_packet(const uint8_t *pkt, uint32_t len)
+{
+    uint8_t core_id = 0;
+    int wi;
+
+    if (!pkt || crypto_layer2_read_core_id(pkt, len, &core_id) != 0)
+        return dp_crypto_current_worker_idx();
+
+    wi = dp_crypto_worker_idx_for_cpu(core_id);
+    if (wi < 0)
+        return dp_crypto_current_worker_idx();
+    return wi;
+}
+
 int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
     uint16_t pid = 0;

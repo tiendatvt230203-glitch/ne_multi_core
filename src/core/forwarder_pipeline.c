@@ -167,50 +167,21 @@ static int worker_handle_local(struct forwarder *fwd, int wi, struct ne_packet *
 static int worker_handle_wan(struct forwarder *fwd, int wi, struct ne_packet *pkt)
 {
     const uint8_t *raw = ne_packet_data(&fwd->pair, pkt->addr);
-    int target = dp_crypto_pick_wan_worker(fwd, raw, pkt->len);
+    uint8_t core_id = 0;
+    int frag_wi = wi;
 
-    if (target < 0 || target >= (int)NE_CRYPTO_WORKERS) {
-        // #region agent log
-        uint8_t core_id = 0;
-        uint32_t eth = 0;
+    (void)crypto_layer2_read_core_id(raw, pkt->len, &core_id);
+    if (core_id >= 1 && core_id <= (int)NE_CRYPTO_WORKERS) {
+        int t = dp_crypto_worker_idx_for_cpu(core_id);
 
-        if (pkt->len >= 16)
-            eth = ((uint32_t)raw[12] << 24) | ((uint32_t)raw[13] << 16) |
-                  ((uint32_t)raw[14] << 8) | raw[15];
-        (void)crypto_layer2_read_core_id(raw, pkt->len, &core_id);
-        dp_agent_log_drop("H3", "forwarder_pipeline.c:wan_target", "invalid_core_id",
-                          (uint32_t)core_id, eth, (uint16_t)target, (uint16_t)wi);
-        // #endregion
-        if (target < 0)
-            target = wi;
-        else {
-            ne_frame_free(&fwd->pair, pkt->addr);
-            return -1;
-        }
-    }
-    if (target == wi) {
-        // #region agent log
-        uint8_t core_id = 0;
-
-        (void)crypto_layer2_read_core_id(raw, pkt->len, &core_id);
-        dp_agent_log_wan_route("direct", core_id, wi, target, pkt->len);
-        // #endregion
-        dataplane_process_wan(fwd, *pkt);
-        return 0;
+        if (t >= 0)
+            frag_wi = t;
     }
     // #region agent log
-    {
-        uint8_t core_id = 0;
-
-        (void)crypto_layer2_read_core_id(raw, pkt->len, &core_id);
-        dp_agent_log_wan_route("relay", core_id, wi, target, pkt->len);
-    }
+    dp_agent_log_wan_route("local", core_id, wi, frag_wi, pkt->len);
     // #endregion
-    if (worker_relay_ingress(fwd, target, pkt) != 0) {
-        ne_frame_free(&fwd->pair, pkt->addr);
-        return -1;
-    }
-    return 1;
+    dataplane_process_wan(fwd, *pkt);
+    return 0;
 }
 
 static int worker_recv_slot(struct forwarder *fwd, int wi, uint64_t *local_pkts,
@@ -418,7 +389,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
     fprintf(stderr,
-            "[PIPELINE] BPF redirect: WAN L2 0x88b5 → rx_queue (no cross-q); core_id relay userspace\n");
+            "[PIPELINE] BPF redirect: WAN → queue0; decrypt local wi=0 frag by core_id\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)
