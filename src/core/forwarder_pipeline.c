@@ -177,6 +177,16 @@ static int worker_handle_wan(struct forwarder *fwd, int wi, struct ne_packet *pk
         if (t >= 0)
             frag_wi = t;
     }
+    if (frag_wi != wi) {
+        // #region agent log
+        dp_agent_log_wan_route("relay", core_id, wi, frag_wi, pkt->len);
+        // #endregion
+        if (worker_relay_ingress(fwd, frag_wi, pkt) != 0) {
+            ne_frame_free(&fwd->pair, pkt->addr);
+            return -1;
+        }
+        return 1;
+    }
     // #region agent log
     dp_agent_log_wan_route("local", core_id, wi, frag_wi, pkt->len);
     // #endregion

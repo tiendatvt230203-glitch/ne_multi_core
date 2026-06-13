@@ -90,6 +90,10 @@ static struct {
     uint16_t pkt_id;
     uint8_t fidx;
     uint16_t bucket;
+    uint32_t len;
+    uint8_t core_id;
+    uint8_t pol;
+    uint8_t frag_mark;
 } last_decrypt_fail;
 
 static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
@@ -119,6 +123,7 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
         last_decrypt_fail.sub = "frag_decrypt";
         last_decrypt_fail.pkt_id = opid;
         last_decrypt_fail.fidx = ofidx;
+        last_decrypt_fail.bucket = (uint16_t)frag_bucket_index(opid);
         return -1;
     }
     frag_wi = dp_crypto_frag_idx_for_packet(pkt, *len);
@@ -219,6 +224,14 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     last_decrypt_fail.pkt_id = 0;
     last_decrypt_fail.fidx = 0;
     last_decrypt_fail.bucket = 0;
+    last_decrypt_fail.len = len;
+    last_decrypt_fail.core_id = 0;
+    last_decrypt_fail.pol = 0;
+    last_decrypt_fail.frag_mark = 0;
+    if (len >= CRYPTO_L2_NONCE_OFF)
+        (void)crypto_layer2_read_core_id(pkt, len, &last_decrypt_fail.core_id);
+    if (len > CRYPTO_L2_POLICY_OFF)
+        last_decrypt_fail.pol = pkt[CRYPTO_L2_POLICY_OFF];
 
     {
         int frag_mark = 0;
@@ -229,6 +242,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
         wan_apply_l2_policy(fwd, pkt);
         if (len > (uint32_t)mark_off)
             frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
+        last_decrypt_fail.frag_mark = (uint8_t)frag_mark;
 
         int need_backup = frag_mark ||
             frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
@@ -328,8 +342,12 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
                               (uint32_t)core_id, mark, (uint16_t)job.wan_idx, (uint16_t)job.len);
             if (last_decrypt_fail.sub) {
                 fprintf(stderr,
-                        "[DATAPLANE] decrypt_fail_detail sub=%s pkt_id=%u fidx=%u bucket=%u wi=%d\n",
-                        last_decrypt_fail.sub, (unsigned)last_decrypt_fail.pkt_id,
+                        "[DATAPLANE] decrypt_fail_detail sub=%s len=%u core_id=%u pol=%u "
+                        "frag_mark=%u pkt_id=%u fidx=%u bucket=%u wi=%d\n",
+                        last_decrypt_fail.sub, last_decrypt_fail.len,
+                        (unsigned)last_decrypt_fail.core_id, (unsigned)last_decrypt_fail.pol,
+                        (unsigned)last_decrypt_fail.frag_mark,
+                        (unsigned)last_decrypt_fail.pkt_id,
                         (unsigned)last_decrypt_fail.fidx, (unsigned)last_decrypt_fail.bucket,
                         log_wi);
             }
