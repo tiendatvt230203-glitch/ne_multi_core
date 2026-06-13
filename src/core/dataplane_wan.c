@@ -85,6 +85,13 @@ static int decrypt_l2(uint8_t *pkt, uint32_t *len)
     return 0;
 }
 
+static struct {
+    const char *sub;
+    uint16_t pkt_id;
+    uint8_t fidx;
+    uint16_t bucket;
+} last_decrypt_fail;
+
 static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
                          uint8_t policy_id, int *pending)
 {
@@ -94,25 +101,40 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t ofidx;
     uint8_t buf[4096];
     uint32_t blen = 0;
+    int frag_wi;
 
     ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
-    if (!ctx)
+    if (!ctx) {
+        last_decrypt_fail.sub = "no_ctx";
         return -1;
+    }
     slot = fwd_crypto_profile_slot_for_id(
         fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id));
-    if (slot < 0)
+    if (slot < 0) {
+        last_decrypt_fail.sub = "no_slot";
         return -1;
+    }
     nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
-    if (nd < 0)
+    if (nd < 0) {
+        last_decrypt_fail.sub = "frag_decrypt";
+        last_decrypt_fail.pkt_id = opid;
+        last_decrypt_fail.fidx = ofidx;
         return -1;
-    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_frag_idx_for_packet(pkt, *len)),
+    }
+    frag_wi = dp_crypto_frag_idx_for_packet(pkt, *len);
+    last_decrypt_fail.pkt_id = opid;
+    last_decrypt_fail.fidx = ofidx;
+    last_decrypt_fail.bucket = (uint16_t)(opid % 4096u);
+    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, frag_wi),
                                 pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
-    if (rr != 1)
+    if (rr != 1) {
+        last_decrypt_fail.sub = "frag_reasm";
         return -1;
+    }
     memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
@@ -193,6 +215,11 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     int pending = 0;
     struct crypto_dispatch_ctx dctx;
 
+    last_decrypt_fail.sub = NULL;
+    last_decrypt_fail.pkt_id = 0;
+    last_decrypt_fail.fidx = 0;
+    last_decrypt_fail.bucket = 0;
+
     {
         int frag_mark = 0;
         int ns = PACKET_CRYPTO_NONCE_BYTES;
@@ -215,6 +242,10 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
                 if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
                     return -1;
             } else {
+                last_decrypt_fail.sub = "l2_crypto";
+                last_decrypt_fail.pkt_id = 0;
+                last_decrypt_fail.fidx = 0;
+                last_decrypt_fail.bucket = 0;
                 return -1;
             }
         }
@@ -295,6 +326,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
                        ((uint32_t)pkt[14] << 8) | pkt[15];
             dp_agent_log_drop("H2", "dataplane_wan.c:decrypt", "decrypt_fail",
                               (uint32_t)core_id, mark, (uint16_t)job.wan_idx, (uint16_t)job.len);
+            if (last_decrypt_fail.sub) {
+                fprintf(stderr,
+                        "[DATAPLANE] decrypt_fail_detail sub=%s pkt_id=%u fidx=%u bucket=%u wi=%d\n",
+                        last_decrypt_fail.sub, (unsigned)last_decrypt_fail.pkt_id,
+                        (unsigned)last_decrypt_fail.fidx, (unsigned)last_decrypt_fail.bucket,
+                        log_wi);
+            }
             // #endregion
             goto drop;
         }
