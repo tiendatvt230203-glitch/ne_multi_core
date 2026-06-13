@@ -14,6 +14,7 @@
 #include "../../inc/core/crypto_route.h"
 
 #include <string.h>
+#include <arpa/inet.h>
 
 static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fwd, uint8_t wire_id)
 {
@@ -277,20 +278,48 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             ne_frame_free(&fwd->pair, job.addr);
             return;
         }
-        if (dec != 0)
+        if (dec != 0) {
+            // #region agent log
+            uint8_t core_id = 0;
+            uint32_t mark = 0;
+
+            if (job.len >= 16)
+                mark = ((uint32_t)pkt[12] << 24) | ((uint32_t)pkt[13] << 16) |
+                       ((uint32_t)pkt[14] << 8) | pkt[15];
+            (void)crypto_layer2_read_core_id(pkt, job.len, &core_id);
+            dp_agent_log_drop("H2", "dataplane_wan.c:decrypt", "decrypt_fail",
+                              (uint32_t)core_id, mark, (uint16_t)job.wan_idx, (uint16_t)job.len);
+            // #endregion
             goto drop;
+        }
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
     li = pick_local(fwd, pkt, job.len);
-    if (li < 0 || li >= fwd->local_count)
+    if (li < 0 || li >= fwd->local_count) {
+        // #region agent log
+        dp_agent_log_drop("H4", "dataplane_wan.c:pick_local", "no_local_subnet",
+                          ntohl(dp_dest_ipv4(pkt, job.len)), job.len, 0, 0);
+        // #endregion
         goto drop;
-    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
+    }
+    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0) {
+        // #region agent log
+        dp_agent_log_drop("H4", "dataplane_wan.c:lan_mac", "lan_src_mac_unset",
+                          (uint32_t)li, job.len, 0, 0);
+        // #endregion
         goto drop;
+    }
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    (void)dp_ring_push(fwd, &fwd->worker_tx_local[li][dp_crypto_current_worker_idx()], &job);
+    if (dp_ring_push(fwd, &fwd->worker_tx_local[li][dp_crypto_current_worker_idx()], &job) != 0) {
+        // #region agent log
+        dp_agent_log_drop("H5", "dataplane_wan.c:lan_tx", "lan_tx_ring_full",
+                          (uint32_t)li, job.len, 0, 0);
+        // #endregion
+        return;
+    }
     return;
 
 drop:

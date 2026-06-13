@@ -1,6 +1,7 @@
 #include "../../inc/core/forwarder_pipeline.h"
 
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/dataplane_util.h"
 #include "../../inc/core/dataplane.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/forwarder_reload.h"
@@ -120,6 +121,17 @@ static int worker_handle_wan(struct forwarder *fwd, int wi, struct ne_packet *pk
     int target = dp_crypto_pick_wan_worker(fwd, raw, pkt->len);
 
     if (target < 0 || target >= (int)NE_CRYPTO_WORKERS) {
+        // #region agent log
+        uint8_t core_id = 0;
+        uint32_t eth = 0;
+
+        if (pkt->len >= 16)
+            eth = ((uint32_t)raw[12] << 24) | ((uint32_t)raw[13] << 16) |
+                  ((uint32_t)raw[14] << 8) | raw[15];
+        (void)crypto_layer2_read_core_id(raw, pkt->len, &core_id);
+        dp_agent_log_drop("H3", "forwarder_pipeline.c:wan_target", "invalid_core_id",
+                          (uint32_t)core_id, eth, (uint16_t)target, (uint16_t)wi);
+        // #endregion
         ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
     }

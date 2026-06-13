@@ -11,6 +11,7 @@
 #include "../../inc/core/crypto_route.h"
 
 #include <string.h>
+#include <arpa/inet.h>
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
@@ -148,26 +149,55 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     int enc;
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                            &profile_idx, &cp) != 0)
+                            &profile_idx, &cp) != 0) {
+        // #region agent log
+        dp_agent_log_drop("H1", "dataplane_local.c:no_policy", "no_policy",
+                          ntohl(src_ip), ntohl(dst_ip), src_port, dst_port);
+        // #endregion
         goto drop;
+    }
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
+    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp)) {
+        // #region agent log
+        dp_agent_log_drop("H5", "dataplane_local.c:wan_pick", "wan_pick_or_tx_room",
+                          (uint32_t)wan_dp, (uint32_t)profile_idx, src_port, dst_port);
+        // #endregion
         goto drop;
-    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
+    }
+    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
+        // #region agent log
+        dp_agent_log_drop("H5", "dataplane_local.c:wan_l2", "wan_l2_mac", (uint32_t)wan_dp, job.len, 0, 0);
+        // #endregion
         goto drop;
+    }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
-        (void)push_to_wan(fwd, &job, wan_dp);
+        if (push_to_wan(fwd, &job, wan_dp) != 0) {
+            // #region agent log
+            dp_agent_log_drop("H5", "dataplane_local.c:bypass_tx", "bypass_tx_ring_full",
+                              (uint32_t)wan_dp, job.len, 0, 0);
+            // #endregion
+            goto drop;
+        }
         return;
     }
-    if (!fwd->cfg->crypto_enabled)
+    if (!fwd->cfg->crypto_enabled) {
+        // #region agent log
+        dp_agent_log_drop("H1", "dataplane_local.c:crypto_off", "crypto_disabled", 0, 0, 0, 0);
+        // #endregion
         goto drop;
+    }
 
     pi = (int)(cp - fwd->cfg->policies);
-    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
+    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
+        // #region agent log
+        dp_agent_log_drop("H1", "dataplane_local.c:policy_ready", "policy_not_ready",
+                          (uint32_t)pi, (uint32_t)cp->id, (uint16_t)cp->action, 0);
+        // #endregion
         goto drop;
+    }
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx)
         goto drop;
@@ -176,8 +206,13 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                          src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
-    if (enc < 0)
+    if (enc < 0) {
+        // #region agent log
+        dp_agent_log_drop("H1", "dataplane_local.c:encrypt", "encrypt_fail",
+                          (uint32_t)cp->id, (uint32_t)cp->action, src_port, dst_port);
+        // #endregion
         goto drop;
+    }
     if (enc > 0)
         return;
     (void)push_to_wan(fwd, &job, wan_dp);

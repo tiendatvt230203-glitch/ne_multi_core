@@ -6,6 +6,39 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <string.h>
+#include <stdio.h>
+#include <time.h>
+
+// #region agent log
+#define DP_AGENT_LOG_LOCAL "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log"
+#define DP_AGENT_LOG_CWD   ".cursor/debug-dfdcf7.log"
+
+void dp_agent_log_drop(const char *hypothesis_id, const char *path,
+                       const char *reason, uint32_t a, uint32_t b, uint16_t c, uint16_t d)
+{
+    static uint32_t budget = 40;
+    FILE *f;
+
+    if (budget == 0)
+        return;
+    budget--;
+    fprintf(stderr,
+            "[DATAPLANE] drop %s reason=%s a=%u b=%u c=%u d=%u\n",
+            path, reason, a, b, (unsigned)c, (unsigned)d);
+    f = fopen(DP_AGENT_LOG_CWD, "a");
+    if (!f)
+        f = fopen(DP_AGENT_LOG_LOCAL, "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
+            "\"message\":\"dataplane drop\",\"data\":{\"reason\":\"%s\",\"a\":%u,"
+            "\"b\":%u,\"c\":%u,\"d\":%u},\"timestamp\":%ld}\n",
+            hypothesis_id, path, reason, a, b, (unsigned)c, (unsigned)d,
+            (long)(time(NULL) * 1000));
+    fclose(f);
+}
+// #endregion
 
 int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
                   uint32_t *src_ip, uint32_t *dst_ip,

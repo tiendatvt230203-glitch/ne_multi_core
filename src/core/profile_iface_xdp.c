@@ -5,6 +5,7 @@
 #include "../../inc/core/interface.h"
 #include "../../inc/core/local_hwaddr.h"
 
+#include <errno.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
@@ -14,6 +15,31 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <time.h>
+
+// #region agent log
+#define AGENT_LOG_PATH_LOCAL "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log"
+#define AGENT_LOG_PATH_CWD   ".cursor/debug-dfdcf7.log"
+
+static void agent_log_xdp(const char *hypothesis_id, const char *location,
+                          const char *message, const char *path, int err_no,
+                          int file_missing)
+{
+    FILE *f = fopen(AGENT_LOG_PATH_CWD, "a");
+
+    if (!f)
+        f = fopen(AGENT_LOG_PATH_LOCAL, "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
+            "\"message\":\"%s\",\"data\":{\"path\":\"%s\",\"errno\":%d,"
+            "\"file_missing\":%d},\"timestamp\":%ld}\n",
+            hypothesis_id, location, message,
+            path ? path : "", err_no, file_missing, (long)(time(NULL) * 1000));
+    fclose(f);
+}
+// #endregion
 
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
                                       enum profile_iface_xdp_reload_mode mode);
@@ -451,6 +477,10 @@ static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
         fflush(stderr);
         xdp_try_detach(ifindex, f);
     }
+    // #region agent log
+    agent_log_xdp("H4", "profile_iface_xdp.c:xdp_attach_prog",
+                  "xdp attach failed after all attempts", ifname, errno, 0);
+    // #endregion
     return -1;
 }
 
@@ -458,21 +488,56 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
                            const char *prog_name, struct bpf_program **prog_out,
                            const char *map_name, struct bpf_map **map_out)
 {
-    struct bpf_object *obj = bpf_object__open_file(path, NULL);
+    char cwd[512];
+    int missing = (access(path, F_OK) != 0);
+    struct bpf_object *obj;
+
+    cwd[0] = '\0';
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
+        strncpy(cwd, "?", sizeof(cwd) - 1);
+
+    if (missing) {
+        fprintf(stderr,
+                "[PROFILE-XDP] bpf open failed: %s (file missing, cwd=%s — run 'make' in repo root)\n",
+                path, cwd);
+        // #region agent log
+        agent_log_xdp("H1", "profile_iface_xdp.c:open_bpf_object",
+                      "bpf object file missing", path, ENOENT, 1);
+        // #endregion
+        return -1;
+    }
+
+    obj = bpf_object__open_file(path, NULL);
 
     if (libbpf_get_error(obj)) {
-        fprintf(stderr, "[PROFILE-XDP] bpf open failed: %s\n", path);
+        int err = libbpf_get_error(obj);
+
+        fprintf(stderr, "[PROFILE-XDP] bpf open failed: %s (%s, cwd=%s)\n",
+                path, strerror(-err), cwd);
+        // #region agent log
+        agent_log_xdp("H3", "profile_iface_xdp.c:open_bpf_object",
+                      "bpf_object__open_file failed", path, -err, 0);
+        // #endregion
         return -1;
     }
     if (bpf_object__load(obj) != 0) {
-        fprintf(stderr, "[PROFILE-XDP] bpf load failed: %s\n", path);
+        fprintf(stderr, "[PROFILE-XDP] bpf load failed: %s (verifier/kernel — check dmesg)\n", path);
+        // #region agent log
+        agent_log_xdp("H2", "profile_iface_xdp.c:open_bpf_object",
+                      "bpf_object__load failed", path, errno, 0);
+        // #endregion
         bpf_object__close(obj);
         return -1;
     }
     struct bpf_program *prog = bpf_object__find_program_by_name(obj, prog_name);
     struct bpf_map *map = bpf_object__find_map_by_name(obj, map_name);
     if (!prog || !map) {
-        fprintf(stderr, "[PROFILE-XDP] bpf object %s missing prog/map\n", path);
+        fprintf(stderr, "[PROFILE-XDP] bpf object %s missing prog=%s map=%s\n",
+                path, prog_name, map_name);
+        // #region agent log
+        agent_log_xdp("H2", "profile_iface_xdp.c:open_bpf_object",
+                      "bpf prog/map missing in object", path, 0, 0);
+        // #endregion
         bpf_object__close(obj);
         return -1;
     }
