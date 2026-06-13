@@ -667,7 +667,7 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0)
         return -1;
-    return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map), "WAN", 0);
+    return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map), "WAN", 1);
 }
 
 

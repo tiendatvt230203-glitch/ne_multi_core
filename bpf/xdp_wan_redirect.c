@@ -10,8 +10,8 @@
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __uint(max_entries, 64);
-    __type(key, int);
-    __type(value, int);
+    __type(key, __u32);
+    __type(value, __u32);
 } wan_xsks_map SEC(".maps");
 
 struct {
@@ -30,12 +30,12 @@ struct {
 static __always_inline int redirect_wan_fallback(struct xdp_md *ctx)
 {
     int rc;
-    int qid = (int)ctx->rx_queue_index;
+    __u32 qid = ctx->rx_queue_index;
 
-    rc = ne_try_xsk_redirect_int(&wan_xsks_map, qid);
+    rc = ne_try_xsk_redirect_u32(&wan_xsks_map, qid);
     if (rc)
         return rc;
-    return ne_try_xsk_redirect_int(&wan_xsks_map, 0);
+    return ne_try_xsk_redirect_u32(&wan_xsks_map, 0);
 }
 
 SEC("xdp")
@@ -74,8 +74,13 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     int key0 = 0;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
     if (fake4 && *fake4 != 0 && proto == bpf_htons(*fake4)) {
-        /* rx_queue_index first: cross-queue core_id redirect can black-hole on
-         * some DRV+XSK setups.  Userspace relays by core_id byte 15. */
+        int wi = ne_l2_core_id_pick_worker(data, data_end, eth);
+
+        if (wi >= 0) {
+            rc = ne_try_xsk_redirect_u32(&wan_xsks_map, (__u32)wi);
+            if (rc)
+                return rc;
+        }
         rc = redirect_wan_fallback(ctx);
         if (rc)
             return rc;

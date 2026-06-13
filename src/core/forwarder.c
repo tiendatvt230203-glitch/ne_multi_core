@@ -97,7 +97,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     }
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-        if (ne_ring_init(&fwd->worker_ingress[w], NE_RING, 0) != 0) {
+        if (ne_ring_init(&fwd->worker_ingress[w], NE_INGRESS_RING, 1) != 0) {
             forwarder_cleanup(fwd);
             return -1;
         }

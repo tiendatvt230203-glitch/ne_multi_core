@@ -22,6 +22,8 @@ extern atomic_int running;
 extern pthread_mutex_t runtime_lock;
 
 #define IO_TX_BURST_MAX   64
+#define IO_INGRESS_BURST_MAX 512
+#define IO_RELAY_PUSH_RETRIES 64
 #define IO_FQ_TOUCH_IDLE  128u
 #define WORKER_STATS_EVERY 500000u
 
@@ -126,14 +128,20 @@ static int worker_relay_ingress(struct forwarder *fwd, int target, struct ne_pac
     }
     dst = ne_packet_data(&fwd->pair, relay.addr);
     memcpy(dst, src, pkt->len);
-    if (ne_ring_try_push(&fwd->worker_ingress[target], &relay) != 0) {
-        ne_frame_free(&fwd->pair, relay.addr);
-        // #region agent log
-        dp_agent_log_drop("H-F", "forwarder_pipeline.c:relay", "relay_ring_full",
-                          (uint32_t)target, pkt->len, (uint16_t)pkt->dir, 0);
-        // #endregion
-        return -1;
+    for (int attempt = 0; attempt < IO_RELAY_PUSH_RETRIES; attempt++) {
+        if (ne_ring_try_push(&fwd->worker_ingress[target], &relay) == 0)
+            goto relay_ok;
+        if (attempt + 1 < IO_RELAY_PUSH_RETRIES)
+            sched_yield();
     }
+    ne_frame_free(&fwd->pair, relay.addr);
+    // #region agent log
+    dp_agent_log_drop("H-F", "forwarder_pipeline.c:relay", "relay_ring_full",
+                      (uint32_t)target, pkt->len, (uint16_t)pkt->dir, 0);
+    // #endregion
+    return -1;
+
+relay_ok:
     /* RX frame returned to pool; relay owns an independent copy. */
     ne_frame_free(&fwd->pair, pkt->addr);
     return 0;
@@ -341,7 +349,11 @@ static void *pipeline_worker_thread(void *arg)
         int did_recv = 0;
         int sent;
 
-        if (ne_ring_try_pop(&fwd->worker_ingress[wi], &job) == 0) {
+        int ingress_burst;
+
+        for (ingress_burst = 0; ingress_burst < IO_INGRESS_BURST_MAX; ingress_burst++) {
+            if (ne_ring_try_pop(&fwd->worker_ingress[wi], &job) != 0)
+                break;
             if (job.dir == NE_DIR_WAN)
                 dataplane_process_wan(fwd, job);
             else
@@ -406,7 +418,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
     fprintf(stderr,
-            "[PIPELINE] BPF redirect: LAN/WAN L2 0x88b5 via rx_queue_index; core_id relay in userspace\n");
+            "[PIPELINE] BPF redirect: WAN L2 0x88b5 core_id + fallback; LAN rx_queue_index\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)
