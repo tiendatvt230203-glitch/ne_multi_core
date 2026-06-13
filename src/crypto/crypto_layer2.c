@@ -184,10 +184,6 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (!l2_has_fake_ethertype(packet))
         return (int)pkt_len;
 
-    if (pkt_len >= (size_t)(l2_frag_magic_offset(wire_ns) + 1) &&
-        packet[l2_frag_magic_offset(wire_ns)] == L2_FRAG_MAGIC)
-        return (int)pkt_len;
-
     if (crypto_mode_is_pqc()) {
         const int pqc_nonce_size = CRYPTO_PQC_NONCE_BYTES;
         const int pqc_l2_enc_start = l2_enc_start_offset(pqc_nonce_size);

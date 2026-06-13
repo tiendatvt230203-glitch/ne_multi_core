@@ -237,31 +237,21 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
         int frag_mark = 0;
         int ns = PACKET_CRYPTO_NONCE_BYTES;
         int mark_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
-        uint32_t orig_len = len;
 
         wan_apply_l2_policy(fwd, pkt);
         if (len > (uint32_t)mark_off)
             frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
         last_decrypt_fail.frag_mark = (uint8_t)frag_mark;
 
-        int need_backup = frag_mark ||
-            frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
-        if (need_backup && orig_len <= sizeof(scratch))
-            memcpy(scratch, pkt, orig_len);
-        if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
-            if (need_backup)
-                memcpy(pkt, scratch, orig_len);
-            len = orig_len;
-            if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
-                    return -1;
-            } else {
-                last_decrypt_fail.sub = "l2_crypto";
-                last_decrypt_fail.pkt_id = 0;
-                last_decrypt_fail.fidx = 0;
-                last_decrypt_fail.bucket = 0;
+        if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
+            if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
                 return -1;
-            }
+        } else if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
+            last_decrypt_fail.sub = "l2_crypto";
+            last_decrypt_fail.pkt_id = 0;
+            last_decrypt_fail.fidx = 0;
+            last_decrypt_fail.bucket = 0;
+            return -1;
         }
     }
     if (pending)

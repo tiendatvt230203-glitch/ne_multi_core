@@ -20,6 +20,8 @@
 /* Spread sequential pkt_id values across buckets (plain % 4096 collides every 4096 ids). */
 static inline int frag_bucket_index(uint16_t pkt_id) {
     uint32_t h = (uint32_t)pkt_id * 0x9E3779B9u;
+    h ^= (uint32_t)pkt_id >> 4;
+    h ^= (uint32_t)pkt_id << 6;
     h ^= h >> 16;
     return (int)(h % FRAG_TABLE_SIZE);
 }

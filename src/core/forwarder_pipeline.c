@@ -399,7 +399,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
     fprintf(stderr,
-            "[PIPELINE] BPF redirect: WAN → queue0; decrypt local wi=0 frag by core_id\n");
+            "[PIPELINE] BPF redirect: WAN → queue0; decrypt relay by core_id\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)
