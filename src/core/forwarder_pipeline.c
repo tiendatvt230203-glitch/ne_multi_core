@@ -263,6 +263,7 @@ static void *pipeline_worker_thread(void *arg)
             "[PIPELINE] worker %d core %u: XSK queue q%%%d==%d, recv+FQ+CQ+crypto+TX\n",
             wi, ctx->cpu_id, (int)NE_TX_SLOTS, wi);
     fflush(stderr);
+    worker_touch_fq_slot(fwd, wi);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;

@@ -644,11 +644,22 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
     }
 }
 
+static void xsk_kick_rx(struct ne_xsk_queue *slot)
+{
+    if (!slot || !slot->xsk)
+        return;
+    if (xsk_ring_prod__needs_wakeup(&slot->fq))
+        (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+}
+
 static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t max,
                       uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
     uint32_t idx = 0;
-    uint32_t n = xsk_ring_cons__peek(&slot->rx, max, &idx);
+    uint32_t n;
+
+    xsk_kick_rx(slot);
+    n = xsk_ring_cons__peek(&slot->rx, max, &idx);
     for (uint32_t i = 0; i < n; i++) {
         const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + i);
         out[i].addr = d->addr;
@@ -920,6 +931,7 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     for (uint32_t i = 0; i < got; i++)
         *xsk_ring_prod__fill_addr(&slot->fq, idx + i) = addrs[i];
     xsk_ring_prod__submit(&slot->fq, got);
+    xsk_kick_rx(slot);
 }
 
 static void refill_fq_iface_slot(struct ne_iface *iface, struct ne_pool *pool, int ingress_slot)
