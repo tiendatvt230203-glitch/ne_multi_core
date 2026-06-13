@@ -14,12 +14,35 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 extern atomic_int running;
 extern pthread_mutex_t runtime_lock;
 
 #define IO_BURST_ROUNDS   8
 #define IO_TX_BURST_MAX   64
+#define WORKER_STATS_EVERY 500000u
+
+// #region agent log
+#define AGENT_LOG_PATH "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log"
+
+static void agent_log_worker_io(int wi, uint8_t cpu_id, uint64_t local_pkts,
+                                uint64_t wan_pkts, uint64_t relay_pkts, uint64_t loops)
+{
+    FILE *f = fopen(AGENT_LOG_PATH, "a");
+
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H3\",\"location\":\"forwarder_pipeline.c:worker_io\","
+            "\"message\":\"worker queue-slot stats\",\"data\":{\"worker\":%d,\"cpu\":%u,\"local_pkts\":%llu,"
+            "\"wan_pkts\":%llu,\"relay_pkts\":%llu,\"loops\":%llu},\"timestamp\":%ld}\n",
+            wi, (unsigned)cpu_id, (unsigned long long)local_pkts,
+            (unsigned long long)wan_pkts, (unsigned long long)relay_pkts,
+            (unsigned long long)loops, (long)(time(NULL) * 1000));
+    fclose(f);
+}
+// #endregion
 
 static void pin_cpu(unsigned int cpu)
 {
@@ -30,25 +53,23 @@ static void pin_cpu(unsigned int cpu)
     (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 }
 
-static void io_burst_refill(struct forwarder *fwd)
+static void worker_refill_slot(struct forwarder *fwd, int wi)
 {
     for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_local(&fwd->pair);
+        ne_refill_fq_local_slot(&fwd->pair, wi);
     for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_wan(&fwd->pair);
+        ne_refill_fq_wan_slot(&fwd->pair, wi);
 }
 
 static void worker_drain_tx(struct forwarder *fwd, int wi)
 {
-    int tx_slot = wi;
-
-    if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
+    if (wi < 0 || wi >= (int)NE_TX_SLOTS)
         return;
 
     for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_drain_cq_local(&fwd->pair, tx_slot);
+        ne_drain_cq_local(&fwd->pair, wi);
     for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_drain_cq_wan(&fwd->pair, tx_slot);
+        ne_drain_cq_wan(&fwd->pair, wi);
 
     for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
         int sent = 0;
@@ -57,14 +78,14 @@ static void worker_drain_tx(struct forwarder *fwd, int wi)
             if (!ne_pair_local_live(&fwd->pair, li))
                 continue;
             sent += ne_tx_drain_local(&fwd->pair, &fwd->worker_tx_local[li][wi],
-                                      li, tx_slot);
+                                      li, wi);
         }
         for (int di = 0; di < fwd->wan_count; di++) {
             if (!ne_pair_wan_live(&fwd->pair, di) || fwd_wan_is_stopped(di))
                 continue;
             sent += ne_tx_drain_wan(&fwd->pair, &fwd->worker_tx_wan[di][wi],
-                                    di, tx_slot);
-            if (tx_slot == 0 && fwd_wan_tx_depth(fwd, di) == 0)
+                                    di, wi);
+            if (wi == 0 && fwd_wan_tx_depth(fwd, di) == 0)
                 fwd->wan_tx_stuck[di] = 0;
         }
         if (sent <= 0)
@@ -72,73 +93,83 @@ static void worker_drain_tx(struct forwarder *fwd, int wi)
     }
 }
 
-static int ingress_dispatch_local(struct forwarder *fwd, struct ne_packet *pkt)
+static int worker_handle_local(struct forwarder *fwd, int wi, struct ne_packet *pkt)
 {
-    int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, pkt->addr), pkt->len);
+    int target = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, pkt->addr), pkt->len);
 
-    if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
-        wi = 0;
-    if (ne_ring_try_push(&fwd->worker_ingress[wi], pkt) != 0)
+    if (target < 0 || target >= (int)NE_CRYPTO_WORKERS)
+        target = wi;
+    if (target == wi) {
+        dataplane_process_local(fwd, *pkt);
+        return 0;
+    }
+    if (ne_ring_try_push(&fwd->worker_ingress[target], pkt) != 0) {
+        ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
-    return 0;
+    }
+    return 1;
 }
 
-static int ingress_dispatch_wan(struct forwarder *fwd, struct ne_packet *pkt)
+static int worker_handle_wan(struct forwarder *fwd, int wi, struct ne_packet *pkt)
 {
     const uint8_t *raw = ne_packet_data(&fwd->pair, pkt->addr);
-    int wi = dp_crypto_pick_wan_worker(fwd, raw, pkt->len);
+    int target = dp_crypto_pick_wan_worker(fwd, raw, pkt->len);
 
-    if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS)
+    if (target < 0 || target >= (int)NE_CRYPTO_WORKERS) {
+        ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
-    if (ne_ring_try_push(&fwd->worker_ingress[wi], pkt) != 0)
+    }
+    if (target == wi) {
+        dataplane_process_wan(fwd, *pkt);
+        return 0;
+    }
+    if (ne_ring_try_push(&fwd->worker_ingress[target], pkt) != 0) {
+        ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
-    return 0;
+    }
+    return 1;
 }
 
-static void *ingress_thread(void *arg)
+static int worker_recv_slot(struct forwarder *fwd, int wi, uint64_t *local_pkts,
+                            uint64_t *wan_pkts, uint64_t *relay_pkts)
 {
-    struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
+    int did_recv = 0;
+    int rcvd;
 
-    pin_cpu(NE_CPU_INGRESS);
-    fprintf(stderr,
-            "[PIPELINE] ingress core %u: AF_XDP recv LAN+WAN, dispatch to workers 1-%u\n",
-            NE_CPU_INGRESS, NE_CPU_WORKER3);
-    fflush(stderr);
+    rcvd = ne_recv_local_slot(&fwd->pair, batch, NE_BATCH_SIZE, wi);
+    for (int i = 0; i < rcvd; i++) {
+        int r = worker_handle_local(fwd, wi, &batch[i]);
 
-    while (atomic_load_explicit(&running, memory_order_acquire)) {
-        int did_recv = 0;
-
-        io_burst_refill(fwd);
-
-        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
-        for (int i = 0; i < rcvd; i++) {
-            if (ingress_dispatch_local(fwd, &batch[i]) != 0)
-                ne_frame_free(&fwd->pair, batch[i].addr);
-        }
-        if (rcvd > 0) {
-            ne_recv_release_local(&fwd->pair);
-            did_recv = 1;
-        }
-
-        rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
-        for (int i = 0; i < rcvd; i++) {
-            if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
-                continue;
-            }
-            if (ingress_dispatch_wan(fwd, &batch[i]) != 0)
-                ne_frame_free(&fwd->pair, batch[i].addr);
-        }
-        if (rcvd > 0) {
-            ne_recv_release_wan(&fwd->pair);
-            did_recv = 1;
-        }
-
-        if (!did_recv)
-            sched_yield();
+        if (r > 0)
+            (*relay_pkts)++;
+        if (r == 0)
+            (*local_pkts)++;
     }
-    return NULL;
+    if (rcvd > 0) {
+        ne_recv_release_local_slot(&fwd->pair, wi);
+        did_recv = 1;
+    }
+
+    rcvd = ne_recv_wan_slot(&fwd->pair, batch, NE_BATCH_SIZE, wi);
+    for (int i = 0; i < rcvd; i++) {
+        if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
+            ne_frame_free(&fwd->pair, batch[i].addr);
+            continue;
+        }
+        int r = worker_handle_wan(fwd, wi, &batch[i]);
+
+        if (r > 0)
+            (*relay_pkts)++;
+        if (r == 0)
+            (*wan_pkts)++;
+    }
+    if (rcvd > 0) {
+        ne_recv_release_wan_slot(&fwd->pair, wi);
+        did_recv = 1;
+    }
+
+    return did_recv;
 }
 
 struct pipeline_worker_ctx {
@@ -155,55 +186,62 @@ static void worker_maint_tick(struct forwarder *fwd)
     fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
 }
 
+static void *coordinator_thread(void *arg)
+{
+    struct forwarder *fwd = arg;
+    uint32_t maint_tick = 0;
+
+    pin_cpu(NE_CPU_INGRESS);
+    fprintf(stderr,
+            "[PIPELINE] coordinator core %u: BPF redirect in kernel, reload/maint only (no AF_XDP)\n",
+            NE_CPU_INGRESS);
+    fflush(stderr);
+
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_lock(&runtime_lock);
+        if (!atomic_load_explicit(&running, memory_order_acquire)) {
+            pthread_mutex_unlock(&runtime_lock);
+            break;
+        }
+        if (fwd_reload_apply_if_pending()) {
+            pthread_mutex_unlock(&runtime_lock);
+            continue;
+        }
+        if ((++maint_tick & 1023u) == 0)
+            worker_maint_tick(fwd);
+        pthread_mutex_unlock(&runtime_lock);
+        sched_yield();
+    }
+    return NULL;
+}
+
 static void *pipeline_worker_thread(void *arg)
 {
     struct pipeline_worker_ctx *ctx = arg;
     struct forwarder *fwd = ctx->fwd;
     struct ne_packet job;
     uint32_t gc_tick = 0;
-    uint32_t maint_tick = 0;
-    int is_primary = (ctx->worker_idx == 0);
+    uint64_t local_pkts = 0;
+    uint64_t wan_pkts = 0;
+    uint64_t relay_pkts = 0;
+    uint64_t loops = 0;
+    int wi = ctx->worker_idx;
 
     pin_cpu(ctx->cpu_id);
-    dp_crypto_worker_bind(ctx->worker_idx);
+    dp_crypto_worker_bind(wi);
     crypto_layer2_bind_worker_core(ctx->cpu_id);
 
-    fprintf(stderr, "[PIPELINE] worker %d core %u: ingress ring + crypto + AF_XDP TX\n",
-            ctx->worker_idx, ctx->cpu_id);
+    fprintf(stderr,
+            "[PIPELINE] worker %d core %u: XSK queue q%%%d==%d, recv+FQ+CQ+crypto+TX\n",
+            wi, ctx->cpu_id, (int)NE_TX_SLOTS, wi);
     fflush(stderr);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
 
-        if (is_primary) {
-            if (pthread_mutex_trylock(&runtime_lock) != 0) {
-                if (!atomic_load_explicit(&running, memory_order_acquire))
-                    break;
-                if (ne_ring_try_pop(&fwd->worker_ingress[ctx->worker_idx], &job) == 0) {
-                    if (job.dir == NE_DIR_WAN)
-                        dataplane_process_wan(fwd, job);
-                    else
-                        dataplane_process_local(fwd, job);
-                    did_work = 1;
-                }
-                worker_drain_tx(fwd, ctx->worker_idx);
-                if (!did_work)
-                    sched_yield();
-                continue;
-            }
-            if (!atomic_load_explicit(&running, memory_order_acquire)) {
-                pthread_mutex_unlock(&runtime_lock);
-                break;
-            }
-            if (fwd_reload_apply_if_pending()) {
-                pthread_mutex_unlock(&runtime_lock);
-                continue;
-            }
-            if ((++maint_tick & 1023u) == 0)
-                worker_maint_tick(fwd);
-        }
+        worker_refill_slot(fwd, wi);
 
-        if (ne_ring_try_pop(&fwd->worker_ingress[ctx->worker_idx], &job) == 0) {
+        if (ne_ring_try_pop(&fwd->worker_ingress[wi], &job) == 0) {
             if (job.dir == NE_DIR_WAN)
                 dataplane_process_wan(fwd, job);
             else
@@ -211,27 +249,33 @@ static void *pipeline_worker_thread(void *arg)
             did_work = 1;
         }
 
-        worker_drain_tx(fwd, ctx->worker_idx);
+        if (worker_recv_slot(fwd, wi, &local_pkts, &wan_pkts, &relay_pkts))
+            did_work = 1;
+
+        worker_drain_tx(fwd, wi);
 
         if (++gc_tick >= 2048) {
-            fwd_crypto_frag_gc_worker_tick(ctx->worker_idx);
+            fwd_crypto_frag_gc_worker_tick(wi);
             gc_tick = 0;
         }
 
-        if (is_primary)
-            pthread_mutex_unlock(&runtime_lock);
+        loops++;
+        if ((loops % WORKER_STATS_EVERY) == 0)
+            agent_log_worker_io(wi, ctx->cpu_id, local_pkts, wan_pkts, relay_pkts, loops);
 
         if (!did_work)
             sched_yield();
     }
+
+    agent_log_worker_io(wi, ctx->cpu_id, local_pkts, wan_pkts, relay_pkts, loops);
     return NULL;
 }
 
-static void pipeline_join_started(struct forwarder *fwd, int ingress_on, int workers_started)
+static void pipeline_join_started(struct forwarder *fwd, int coord_on, int workers_started)
 {
     atomic_store_explicit(&running, 0, memory_order_release);
-    if (ingress_on)
-        pthread_join(fwd->ingress_thread, NULL);
+    if (coord_on)
+        pthread_join(fwd->coordinator_thread, NULL);
     for (int w = 0; w < workers_started; w++)
         pthread_join(fwd->worker_threads[w], NULL);
 }
@@ -239,22 +283,27 @@ static void pipeline_join_started(struct forwarder *fwd, int ingress_on, int wor
 void forwarder_pipeline_run(struct forwarder *fwd)
 {
     struct pipeline_worker_ctx wctx[NE_CRYPTO_WORKERS];
-    int ingress_on = 0;
+    int coord_on = 0;
     int workers_started = 0;
 
     if (!fwd || forwarder_should_stop())
         return;
 
-    if (pthread_create(&fwd->ingress_thread, NULL, ingress_thread, fwd) != 0)
+    fprintf(stderr,
+            "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
+            NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
+    fflush(stderr);
+
+    if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)
         return;
-    ingress_on = 1;
+    coord_on = 1;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
         wctx[w].fwd = fwd;
         wctx[w].worker_idx = w;
         wctx[w].cpu_id = dp_crypto_worker_cpu(w);
         if (pthread_create(&fwd->worker_threads[w], NULL, pipeline_worker_thread, &wctx[w]) != 0) {
-            pipeline_join_started(fwd, ingress_on, workers_started);
+            pipeline_join_started(fwd, coord_on, workers_started);
             return;
         }
         workers_started++;
@@ -264,7 +313,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
     if (fwd->cfg)
         main_diag_log_dataplane_ready(fwd->cfg);
 
-    pthread_join(fwd->ingress_thread, NULL);
+    pthread_join(fwd->coordinator_thread, NULL);
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         pthread_join(fwd->worker_threads[w], NULL);
     fwd->threads_started = 0;

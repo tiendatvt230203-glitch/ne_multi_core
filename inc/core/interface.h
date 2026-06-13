@@ -161,6 +161,12 @@ void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
+void ne_refill_fq_local_slot(struct ne_pair *p, int ingress_slot);
+void ne_refill_fq_wan_slot(struct ne_pair *p, int ingress_slot);
+int ne_recv_local_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int ingress_slot);
+int ne_recv_wan_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int ingress_slot);
+void ne_recv_release_local_slot(struct ne_pair *p, int ingress_slot);
+void ne_recv_release_wan_slot(struct ne_pair *p, int ingress_slot);
 int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx, int tx_slot);
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx, int tx_slot);
 int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,

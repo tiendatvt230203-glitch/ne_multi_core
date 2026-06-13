@@ -19,7 +19,7 @@ struct forwarder {
     struct ne_ring worker_tx_wan[MAX_INTERFACES][NE_CRYPTO_WORKERS];
     struct ne_ring worker_tx_local[MAX_INTERFACES][NE_CRYPTO_WORKERS];
 
-    pthread_t ingress_thread;
+    pthread_t coordinator_thread;
     pthread_t worker_threads[NE_CRYPTO_WORKERS];
     int threads_started;
 
