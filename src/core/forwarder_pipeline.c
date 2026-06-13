@@ -137,8 +137,12 @@ static int worker_handle_wan(struct forwarder *fwd, int wi, struct ne_packet *pk
         dp_agent_log_drop("H3", "forwarder_pipeline.c:wan_target", "invalid_core_id",
                           (uint32_t)core_id, eth, (uint16_t)target, (uint16_t)wi);
         // #endregion
-        ne_frame_free(&fwd->pair, pkt->addr);
-        return -1;
+        if (target < 0)
+            target = wi;
+        else {
+            ne_frame_free(&fwd->pair, pkt->addr);
+            return -1;
+        }
     }
     if (target == wi) {
         // #region agent log
@@ -203,6 +207,18 @@ static int worker_recv_slot(struct forwarder *fwd, int wi, uint64_t *local_pkts,
             ne_frame_free(&fwd->pair, batch[i].addr);
             continue;
         }
+        // #region agent log
+        {
+            const uint8_t *raw = ne_packet_data(&fwd->pair, batch[i].addr);
+            uint8_t core_id = 0;
+            uint16_t eth_type = 0;
+
+            if (batch[i].len >= 14)
+                eth_type = ((uint16_t)raw[12] << 8) | raw[13];
+            (void)crypto_layer2_read_core_id(raw, batch[i].len, &core_id);
+            dp_agent_log_wan_recv(wi, (int)batch[i].wan_idx, batch[i].len, core_id, eth_type);
+        }
+        // #endregion
         int r = worker_handle_wan(fwd, wi, &batch[i]);
 
         if (r > 0)
@@ -354,7 +370,7 @@ void forwarder_pipeline_run(struct forwarder *fwd)
             "[PIPELINE] core %u coordinator + %u workers on cores %u-%u (each owns XSK queue slot)\n",
             NE_CPU_INGRESS, NE_CRYPTO_WORKERS, NE_CPU_WORKER0, NE_CPU_WORKER3);
     fprintf(stderr,
-            "[PIPELINE] BPF redirect: LAN rx_queue_index + WAN L2 core_id (fallback rx_queue_index)\n");
+            "[PIPELINE] BPF redirect: LAN/WAN L2 0x88b5 via rx_queue_index; core_id relay in userspace\n");
     fflush(stderr);
 
     if (pthread_create(&fwd->coordinator_thread, NULL, coordinator_thread, fwd) != 0)

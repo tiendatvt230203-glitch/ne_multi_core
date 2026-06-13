@@ -36,6 +36,8 @@ void dp_agent_log_encrypt_wan(uint8_t core_id, int wi, int wan_dp,
                               uint32_t dst_host, uint16_t dst_port, uint32_t len);
 
 void dp_agent_log_wan_tx(int wi, int wan_dp, uint32_t len, int sent);
+
+void dp_agent_log_wan_recv(int wi, int wan_dp, uint32_t len, uint8_t core_id, uint16_t eth_type);
 // #endregion
 
 #endif

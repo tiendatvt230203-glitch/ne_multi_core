@@ -552,19 +552,29 @@ static int update_xsk_map_queue(struct xsk_socket *xsk, int map_fd, int queue_id
     int key = queue_id;
     int fd = xsk_socket__fd(xsk);
 
-    if (xsk_socket__update_xskmap(xsk, map_fd) == 0)
-        return 0;
+    (void)xsk_socket__update_xskmap(xsk, map_fd);
     return bpf_map_update_elem(map_fd, &key, &fd, BPF_ANY);
 }
 
-static int update_xsk_map_iface(struct ne_iface *iface, int map_fd)
+static int update_xsk_map_iface(struct ne_iface *iface, int map_fd, const char *tag)
 {
     for (int q = 0; q < iface->queue_count; q++) {
+        int key = q;
+        int fd;
+
         if (!iface->queues[q].xsk)
             return -1;
         if (update_xsk_map_queue(iface->queues[q].xsk, map_fd, q) != 0)
             return -1;
+        if (bpf_map_lookup_elem(map_fd, &key, &fd) != 0) {
+            fprintf(stderr, "[PROFILE-XDP] %s %s xsks_map[%d] bind FAILED\n",
+                    tag, iface->ifname, q);
+            return -1;
+        }
+        fprintf(stderr, "[PROFILE-XDP] %s %s xsks_map[%d]=fd%d\n",
+                tag, iface->ifname, q, fd);
     }
+    fflush(stderr);
     return 0;
 }
 
@@ -605,7 +615,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         fprintf(stderr,
                 "[PROFILE-XDP] LAN %s xdp/id:%u — skip attach, refresh xsks_map (shared)\n",
                 ifname, existing_id);
-        return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
+        return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map), "LAN");
     }
 
     if (skip_attach) {
@@ -625,7 +635,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, ifname, "LAN") != 0)
         return -1;
-    return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
+    return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map), "LAN");
 }
 
 int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, int dp_slot,
@@ -643,7 +653,7 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0)
         return -1;
-    return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map));
+    return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map), "WAN");
 }
 
 

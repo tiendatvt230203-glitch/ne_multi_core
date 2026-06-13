@@ -112,6 +112,32 @@ void dp_agent_log_encrypt_wan(uint8_t core_id, int wi, int wan_dp,
     fclose(f);
 }
 
+void dp_agent_log_wan_recv(int wi, int wan_dp, uint32_t len, uint8_t core_id, uint16_t eth_type)
+{
+    static uint32_t budget = 50;
+    FILE *f;
+
+    if (budget == 0)
+        return;
+    budget--;
+    fprintf(stderr,
+            "[DATAPLANE] wan_recv wi=%d wan=%d len=%u core_id=%u eth=0x%04x\n",
+            wi, wan_dp, len, (unsigned)core_id, (unsigned)eth_type);
+    f = fopen(DP_AGENT_LOG_CWD, "a");
+    if (!f)
+        f = fopen(DP_AGENT_LOG_LOCAL, "a");
+    if (!f)
+        return;
+    fprintf(f,
+            "{\"sessionId\":\"dfdcf7\",\"hypothesisId\":\"H-C\",\"location\":"
+            "\"forwarder_pipeline.c:wan_recv\",\"message\":\"wan recv\","
+            "\"data\":{\"wi\":%d,\"wan_dp\":%d,\"len\":%u,\"core_id\":%u,"
+            "\"eth_type\":%u},\"timestamp\":%ld}\n",
+            wi, wan_dp, len, (unsigned)core_id, (unsigned)eth_type,
+            (long)(time(NULL) * 1000));
+    fclose(f);
+}
+
 void dp_agent_log_wan_tx(int wi, int wan_dp, uint32_t len, int sent)
 {
     static uint32_t budget = 40;
