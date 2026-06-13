@@ -241,6 +241,10 @@ static int worker_recv_slot(struct forwarder *fwd, int wi, uint64_t *local_pkts,
             if (batch[i].len >= 14)
                 eth_type = ((uint16_t)raw[12] << 8) | raw[13];
             (void)crypto_layer2_read_core_id(raw, batch[i].len, &core_id);
+            if (eth_type == 0x88b5)
+                dp_stats_inc(DP_STAT_WAN_ETH_ENC);
+            else if (eth_type == 0x0800)
+                dp_stats_inc(DP_STAT_WAN_ETH_PLAIN);
             dp_agent_log_wan_recv(wi, (int)batch[i].wan_idx, batch[i].len, core_id, eth_type);
         }
         // #endregion

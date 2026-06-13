@@ -8,10 +8,38 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdatomic.h>
 
 // #region agent log
 #define DP_AGENT_LOG_LOCAL "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-dfdcf7.log"
 #define DP_AGENT_LOG_CWD   ".cursor/debug-dfdcf7.log"
+
+static atomic_uint_fast64_t dp_stats[DP_STAT_COUNT];
+
+void dp_stats_inc(enum dp_stat_kind kind)
+{
+    uint64_t total;
+    int i;
+
+    if (kind < 0 || kind >= DP_STAT_COUNT)
+        return;
+    atomic_fetch_add(&dp_stats[kind], 1);
+    total = 0;
+    for (i = 0; i < DP_STAT_COUNT; i++)
+        total += atomic_load(&dp_stats[i]);
+    if ((total % 5000) != 0)
+        return;
+    fprintf(stderr,
+            "[DATAPLANE] stats lan_encrypt=%llu lan_bypass=%llu lan_frag=%llu "
+            "wan_0x88b5=%llu wan_0x0800=%llu decrypt_ok=%llu decrypt_fail=%llu\n",
+            (unsigned long long)atomic_load(&dp_stats[DP_STAT_LAN_ENCRYPT]),
+            (unsigned long long)atomic_load(&dp_stats[DP_STAT_LAN_BYPASS]),
+            (unsigned long long)atomic_load(&dp_stats[DP_STAT_LAN_ENCRYPT_FRAG]),
+            (unsigned long long)atomic_load(&dp_stats[DP_STAT_WAN_ETH_ENC]),
+            (unsigned long long)atomic_load(&dp_stats[DP_STAT_WAN_ETH_PLAIN]),
+            (unsigned long long)atomic_load(&dp_stats[DP_STAT_DECRYPT_OK]),
+            (unsigned long long)atomic_load(&dp_stats[DP_STAT_DECRYPT_FAIL]));
+}
 
 void dp_agent_log_drop(const char *hypothesis_id, const char *path,
                        const char *reason, uint32_t a, uint32_t b, uint16_t c, uint16_t d)

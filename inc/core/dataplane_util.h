@@ -38,6 +38,19 @@ void dp_agent_log_encrypt_wan(uint8_t core_id, int wi, int wan_dp,
 void dp_agent_log_wan_tx(int wi, int wan_dp, uint32_t len, int sent);
 
 void dp_agent_log_wan_recv(int wi, int wan_dp, uint32_t len, uint8_t core_id, uint16_t eth_type);
+
+enum dp_stat_kind {
+    DP_STAT_LAN_ENCRYPT = 0,
+    DP_STAT_LAN_BYPASS,
+    DP_STAT_LAN_ENCRYPT_FRAG,
+    DP_STAT_WAN_ETH_ENC,
+    DP_STAT_WAN_ETH_PLAIN,
+    DP_STAT_DECRYPT_OK,
+    DP_STAT_DECRYPT_FAIL,
+    DP_STAT_COUNT
+};
+
+void dp_stats_inc(enum dp_stat_kind kind);
 // #endregion
 
 #endif

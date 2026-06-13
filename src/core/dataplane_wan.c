@@ -85,7 +85,7 @@ static int decrypt_l2(uint8_t *pkt, uint32_t *len)
     return 0;
 }
 
-static struct {
+static __thread struct {
     const char *sub;
     uint16_t pkt_id;
     uint8_t fidx;
@@ -342,6 +342,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
                         log_wi);
             }
             // #endregion
+            dp_stats_inc(DP_STAT_DECRYPT_FAIL);
             goto drop;
         }
         // #region agent log
@@ -356,6 +357,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             }
         }
         // #endregion
+        dp_stats_inc(DP_STAT_DECRYPT_OK);
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 

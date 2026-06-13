@@ -184,6 +184,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         // #region agent log
         dp_agent_log_fwd("dataplane_local.c:bypass", ntohl(dst_ip), dst_port, job.len);
         // #endregion
+        dp_stats_inc(DP_STAT_LAN_BYPASS);
         return;
     }
     if (!fwd->cfg->crypto_enabled) {
@@ -220,6 +221,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         // #region agent log
         dp_agent_log_fwd("dataplane_local.c:encrypt_frag", ntohl(dst_ip), dst_port, job.len);
         // #endregion
+        dp_stats_inc(DP_STAT_LAN_ENCRYPT_FRAG);
         return;
     }
     (void)push_to_wan(fwd, &job, wan_dp);
@@ -234,6 +236,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
     dp_agent_log_fwd("dataplane_local.c:encrypt", ntohl(dst_ip), dst_port, job.len);
     // #endregion
+    dp_stats_inc(DP_STAT_LAN_ENCRYPT);
     return;
 
 drop:
