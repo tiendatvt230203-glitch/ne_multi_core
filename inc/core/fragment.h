@@ -64,8 +64,7 @@ static inline int frag_need_split_l4(uint32_t pkt_len) {
 
 
 static inline int frag_need_split_l2(uint32_t pkt_len) {
-    int overhead = crypto_layer2_frag_meta_len();
-    return (pkt_len + overhead) > FRAG_MTU;
+    return crypto_layer2_enc_wire_len(pkt_len) > FRAG_MTU;
 }
 
 int frag_split_and_encrypt(struct packet_crypto_ctx *ctx,

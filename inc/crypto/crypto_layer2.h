@@ -25,6 +25,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
 int crypto_layer2_wire_eth_len(void);
 int crypto_layer2_frag_meta_len(void);
+int crypto_layer2_enc_wire_len(uint32_t pkt_len);
 
 int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     const uint8_t *eth_hdr,

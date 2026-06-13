@@ -102,6 +102,19 @@ int crypto_layer2_frag_meta_len(void) {
     return meta;
 }
 
+int crypto_layer2_enc_wire_len(uint32_t pkt_len) {
+    if (pkt_len <= ETH_HEADER_SIZE)
+        return (int)pkt_len;
+    int nonce_size = packet_crypto_get_nonce_size();
+    int enc_start = CRYPTO_L2_NONCE_OFF + nonce_size;
+    uint32_t payload = pkt_len - ETH_HEADER_SIZE;
+    uint32_t enc = (uint32_t)enc_start + payload;
+
+    if (crypto_mode_uses_gcm_tag())
+        enc += AES_GCM_TAG_SIZE;
+    return (int)enc;
+}
+
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
     if (unlikely(!ctx || !ctx->initialized || !packet || pkt_len < MIN_ETH_PKT))
         return -1;

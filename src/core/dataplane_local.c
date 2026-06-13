@@ -59,6 +59,19 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     uint8_t f2[4096];
     uint32_t l1 = 0, l2 = 0;
 
+    if (cp->action == POLICY_ACTION_ENCRYPT_L2 && len >= 1400) {
+        static uint32_t split_log_budget = 24;
+
+        if (split_log_budget > 0) {
+            int enc_wire = crypto_layer2_enc_wire_len(len);
+            int do_split = frag_need_split_l2(len);
+
+            split_log_budget--;
+            fprintf(stderr,
+                    "[DATAPLANE] l2_split_decision split=%d lan_len=%u enc_wire=%u\n",
+                    do_split, len, (unsigned)enc_wire);
+        }
+    }
     if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(len)) {
         if (frag_split_and_encrypt_l2(pctx, pkt, len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
