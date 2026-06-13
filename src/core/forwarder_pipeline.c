@@ -107,10 +107,15 @@ static void worker_recycle_tx_slot(struct forwarder *fwd, int wi)
 static int worker_relay_ingress(struct forwarder *fwd, int target, struct ne_packet *pkt)
 {
     struct ne_packet relay = *pkt;
-    const uint8_t *src = ne_packet_data(&fwd->pair, pkt->addr);
+    const uint8_t *src;
     uint8_t *dst;
 
     if (target < 0 || target >= (int)NE_CRYPTO_WORKERS)
+        return -1;
+    if (!pkt || pkt->len == 0 || pkt->len > fwd->pair.frame_size)
+        return -1;
+    src = ne_packet_data(&fwd->pair, pkt->addr);
+    if (!src)
         return -1;
     if (ne_frame_alloc(&fwd->pair, &relay.addr) != 0) {
         // #region agent log
@@ -129,6 +134,8 @@ static int worker_relay_ingress(struct forwarder *fwd, int target, struct ne_pac
         // #endregion
         return -1;
     }
+    /* RX frame returned to pool; relay owns an independent copy. */
+    ne_frame_free(&fwd->pair, pkt->addr);
     return 0;
 }
 
