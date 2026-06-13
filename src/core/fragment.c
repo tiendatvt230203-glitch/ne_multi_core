@@ -8,8 +8,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-// 
+#include <stdio.h>
+
 static atomic_uint_fast32_t g_pkt_id_counter = 0;
+// #region agent log
+static atomic_int frag_evict_log_budget = 30;
+// #endregion
 
 uint16_t frag_next_pkt_id(void) {
     return (uint16_t)(atomic_fetch_add(&g_pkt_id_counter, 1) & 0xFFFF);
@@ -52,10 +56,25 @@ static int frag_require_ipv4(const uint8_t *pkt, uint32_t pkt_len, int *ip_hdr_l
 }
 
 static void frag_prepare_entry(struct frag_entry *entry, uint16_t pkt_id, uint64_t now) {
-    if (entry->pkt_id != pkt_id ||
-        ((entry->got_first || entry->got_second) &&
-         (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS))
+    if (entry->pkt_id != pkt_id) {
+        if (entry->got_first || entry->got_second) {
+            // #region agent log
+            if ((now - entry->timestamp_ns) <= FRAG_TIMEOUT_NS) {
+                int left = atomic_fetch_sub(&frag_evict_log_budget, 1);
+                if (left > 0) {
+                    fprintf(stderr,
+                            "[DATAPLANE] frag_bucket_evict idx=%d old_pkt=%u new_pkt=%u\n",
+                            frag_bucket_index(pkt_id), (unsigned)entry->pkt_id,
+                            (unsigned)pkt_id);
+                }
+            }
+            // #endregion
+            memset(entry, 0, sizeof(*entry));
+        }
+    } else if ((entry->got_first || entry->got_second) &&
+               (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
         memset(entry, 0, sizeof(*entry));
+    }
     entry->pkt_id = pkt_id;
     entry->timestamp_ns = now;
 }
@@ -209,7 +228,7 @@ int frag_try_reassemble(struct frag_table *ft,
     const uint8_t *payload = pkt_data + 14 + ip_hdr_len;
     uint32_t payload_len = pkt_len - 14 - (uint32_t)ip_hdr_len;
 
-    int idx = pkt_id % FRAG_TABLE_SIZE;
+    int idx = frag_bucket_index(pkt_id);
     struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
 
@@ -362,7 +381,7 @@ int frag_try_reassemble_l2(struct frag_table *ft,
     const uint8_t *inner = pkt_data + wire_eth;
     uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
 
-    int idx = pkt_id % FRAG_TABLE_SIZE;
+    int idx = frag_bucket_index(pkt_id);
     struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
 
@@ -513,7 +532,7 @@ int frag_try_reassemble_l4(struct frag_table *ft,
     const uint8_t *payload = pkt_data + 14 + ip_hdr_len;
     uint32_t payload_len = pkt_len - 14 - ip_hdr_len;
 
-    int idx = pkt_id % FRAG_TABLE_SIZE;
+    int idx = frag_bucket_index(pkt_id);
     struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
 

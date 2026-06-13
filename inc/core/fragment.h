@@ -15,7 +15,14 @@
 #define FRAG_MTU            1500
 
 #define FRAG_TABLE_SIZE     4096
-#define FRAG_TIMEOUT_NS     (200ULL * 1000000ULL)
+#define FRAG_TIMEOUT_NS     (500ULL * 1000000ULL)
+
+/* Spread sequential pkt_id values across buckets (plain % 4096 collides every 4096 ids). */
+static inline int frag_bucket_index(uint16_t pkt_id) {
+    uint32_t h = (uint32_t)pkt_id * 0x9E3779B9u;
+    h ^= h >> 16;
+    return (int)(h % FRAG_TABLE_SIZE);
+}
 
 struct frag_entry {
     uint16_t pkt_id;

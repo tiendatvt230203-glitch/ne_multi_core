@@ -124,7 +124,7 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     frag_wi = dp_crypto_frag_idx_for_packet(pkt, *len);
     last_decrypt_fail.pkt_id = opid;
     last_decrypt_fail.fidx = ofidx;
-    last_decrypt_fail.bucket = (uint16_t)(opid % 4096u);
+    last_decrypt_fail.bucket = (uint16_t)frag_bucket_index(opid);
     rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, frag_wi),
                                 pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
