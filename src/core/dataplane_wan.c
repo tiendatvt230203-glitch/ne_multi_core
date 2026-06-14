@@ -317,9 +317,20 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     int li;
     int dec;
     uint8_t wire_core = 0;
+    uint8_t wire_tag = 0;
     int worker = dp_crypto_current_worker_idx();
 
     if (wan_pkt_is_l2(pkt, job.len, &wire_core)) {
+        wire_tag = pkt[CRYPTO_L2_POLICY_OFF];
+        // #region agent log
+        {
+            static _Atomic uint64_t wan_l2_in;
+            uint64_t n = atomic_fetch_add(&wan_l2_in, 1);
+            if (n < 40 || (n & 0xFFu) == 0)
+                fprintf(stderr, "[DP-WAN-IN] worker=%d wire_tag=%u core=%u len=%u\n",
+                        worker, (unsigned)wire_tag, (unsigned)wire_core, job.len);
+        }
+        // #endregion
         int ok = dp_crypto_l2_affinity_ok(pkt, job.len);
         dbg_l2_core_log("dataplane_wan.c:process_wan", "l2 wan affinity", worker,
                         (int)wire_core, ok, job.len);
@@ -336,10 +347,36 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             return;
         }
         if (dec != 0) {
+            // #region agent log
+            if (wire_tag)
+                fprintf(stderr, "[DP-DROP-WAN] decrypt worker=%d wire_tag=%u len=%u\n",
+                        worker, (unsigned)wire_tag, job.len);
+            // #endregion
             dp_wan_drop_log("decrypt", &dp_wan_drop_decrypt, job.len, wire_core, worker);
             goto drop;
         }
         pkt = ne_packet_data(&fwd->pair, job.addr);
+        // #region agent log
+        {
+            uint32_t sip = 0, dip = 0;
+            uint16_t sp = 0, dp = 0;
+            uint8_t proto = 0;
+            if (dp_parse_flow(pkt, job.len, &sip, &dip, &sp, &dp, &proto) == 0) {
+                static _Atomic uint64_t wan_dec_flow;
+                uint64_t fn = atomic_fetch_add(&wan_dec_flow, 1);
+                if (fn < 40 || (proto == 6 && fn < 80))
+                    fprintf(stderr,
+                            "[DP-WAN-DEC] worker=%d wire_tag=%u proto=%u "
+                            "src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u len=%u\n",
+                            worker, (unsigned)wire_tag, (unsigned)proto,
+                            (ntohl(sip) >> 24) & 0xff, (ntohl(sip) >> 16) & 0xff,
+                            (ntohl(sip) >> 8) & 0xff, ntohl(sip) & 0xff, (unsigned)sp,
+                            (ntohl(dip) >> 24) & 0xff, (ntohl(dip) >> 16) & 0xff,
+                            (ntohl(dip) >> 8) & 0xff, ntohl(dip) & 0xff, (unsigned)dp,
+                            job.len);
+            }
+        }
+        // #endregion
     }
 
     li = pick_local(fwd, pkt, job.len);
@@ -369,10 +406,18 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         uint64_t wo = atomic_fetch_add(&wan_lan_ok, 1);
         if (wo < 20 || (wo & 0xFFu) == 0) {
             uint32_t dip = ntohl(dp_dest_ipv4(pkt, job.len));
+            uint32_t sip = 0;
+            uint16_t sp = 0, dport = 0;
+            uint8_t proto = 0;
+            (void)dp_parse_flow(pkt, job.len, &sip, &dip, &sp, &dport, &proto);
             fprintf(stderr,
-                    "[DP-WAN] worker=%d -> LAN li=%d dest=%u.%u.%u.%u len=%u\n",
-                    worker, li, (dip >> 24) & 0xff, (dip >> 16) & 0xff,
-                    (dip >> 8) & 0xff, dip & 0xff, job.len);
+                    "[DP-WAN] worker=%d -> LAN li=%d proto=%u "
+                    "src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u len=%u\n",
+                    worker, li, (unsigned)proto,
+                    (ntohl(sip) >> 24) & 0xff, (ntohl(sip) >> 16) & 0xff,
+                    (ntohl(sip) >> 8) & 0xff, ntohl(sip) & 0xff, (unsigned)sp,
+                    (dip >> 24) & 0xff, (dip >> 16) & 0xff,
+                    (dip >> 8) & 0xff, dip & 0xff, (unsigned)dport, job.len);
         }
     }
     // #endregion
