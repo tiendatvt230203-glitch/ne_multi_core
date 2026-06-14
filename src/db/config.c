@@ -115,33 +115,6 @@ static int parse_hex_bytes(const char *str, uint8_t *out, int expected_len) {
     return 0;
 }
 
-static int config_validate_wan_profile_exclusive(struct app_config *cfg)
-{
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *pa = &cfg->profiles[pi];
-        for (int wi = 0; wi < pa->wan_count; wi++) {
-            int wan_idx = pa->wan_indices[wi];
-            if (wan_idx < 0 || wan_idx >= cfg->wan_count)
-                continue;
-            if (!cfg->wans[wan_idx].dataplane)
-                continue;
-            for (int pj = pi + 1; pj < cfg->profile_count; pj++) {
-                const struct profile_config *pb = &cfg->profiles[pj];
-                for (int wj = 0; wj < pb->wan_count; wj++) {
-                    if (pb->wan_indices[wj] != wan_idx)
-                        continue;
-                    fprintf(stderr,
-                            "[VALIDATE] WAN %s dataplane already used by profile %d — "
-                            "profile %d cannot add/share it\n",
-                            cfg->wans[wan_idx].ifname, pa->id, pb->id);
-                    return -1;
-                }
-            }
-        }
-    }
-    return 0;
-}
-
 int config_policy_db_id_taken(const struct app_config *cfg, int db_id)
 {
     if (!cfg || db_id <= 0)
@@ -246,9 +219,6 @@ int config_validate(struct app_config *cfg) {
             return -1;
         }
     }
-
-    if (config_validate_wan_profile_exclusive(cfg) != 0)
-        return -1;
 
     return 0;
 }

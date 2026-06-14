@@ -5,6 +5,7 @@
 #include "../../inc/db/db_env.h"
 
 #include <libpq-fe.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -127,6 +128,26 @@ static int find_wan_by_ifname(const struct app_config *cfg, const char *ifname) 
     return -1;
 }
 
+/* Return owning profile id if dataplane WAN index already bound to another profile. */
+static int wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
+{
+    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
+        return 0;
+    if (!cfg->wans[wan_idx].dataplane)
+        return 0;
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        if (p->id == skip_profile_id)
+            continue;
+        for (int wi = 0; wi < p->wan_count; wi++) {
+            if (p->wan_indices[wi] == wan_idx)
+                return p->id;
+        }
+    }
+    return 0;
+}
+
 static int append_local_unique(struct app_config *dst, const struct local_config *src_loc) {
     int idx = find_local_by_ifname(dst, src_loc->ifname);
     if (idx >= 0)
@@ -185,10 +206,8 @@ static int append_policy_skip_dup(struct app_config *dst, const struct crypto_po
 static int merge_one_config(struct app_config *dst, const struct app_config *src) {
     int local_map[MAX_INTERFACES];
     int wan_map[MAX_INTERFACES];
-    int policy_map[MAX_CRYPTO_POLICIES];
     memset(local_map, -1, sizeof(local_map));
     memset(wan_map, -1, sizeof(wan_map));
-    memset(policy_map, -1, sizeof(policy_map));
 
     int src_profile_id = src->profile_count > 0 ? src->profiles[0].id : -1;
 
@@ -202,37 +221,107 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
         if (wan_map[i] < 0)
             return -1;
     }
-    for (int i = 0; i < src->policy_count; i++)
-        policy_map[i] = append_policy_skip_dup(dst, &src->policies[i], src_profile_id);
 
     for (int pi = 0; pi < src->profile_count; pi++) {
         if (dst->profile_count >= MAX_PROFILES)
             return -1;
         struct profile_config *dp = &dst->profiles[dst->profile_count++];
         const struct profile_config *sp = &src->profiles[pi];
+        int policy_map[MAX_CRYPTO_POLICIES];
+        int iface_validate_failed = 0;
+
         memset(dp, 0, sizeof(*dp));
+        memset(policy_map, -1, sizeof(policy_map));
         dp->id = sp->id;
         strncpy(dp->name, sp->name, sizeof(dp->name) - 1);
         dp->enabled = sp->enabled;
 
         for (int i = 0; i < sp->local_count; i++) {
             int sli = sp->local_indices[i];
-            if (sli < 0 || sli >= src->local_count)
+            int merged_li;
+            const char *ifname;
+
+            if (sli < 0 || sli >= src->local_count) {
+                iface_validate_failed = 1;
                 continue;
-            if (dp->local_count >= MAX_PROFILE_INTERFACES)
+            }
+            merged_li = local_map[sli];
+            if (merged_li < 0 || merged_li >= dst->local_count) {
+                iface_validate_failed = 1;
+                continue;
+            }
+            ifname = dst->locals[merged_li].ifname;
+            if (if_nametoindex(ifname) == 0) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: skip LAN %s (interface not found)\n",
+                        src_profile_id, ifname);
+                iface_validate_failed = 1;
+                continue;
+            }
+            if (dp->local_count >= MAX_PROFILE_INTERFACES) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: skip LAN %s (MAX_PROFILE_INTERFACES)\n",
+                        src_profile_id, ifname);
+                iface_validate_failed = 1;
                 break;
-            dp->local_indices[dp->local_count++] = local_map[sli];
+            }
+            dp->local_indices[dp->local_count++] = merged_li;
         }
         for (int i = 0; i < sp->wan_count; i++) {
             int swi = sp->wan_indices[i];
-            if (swi < 0 || swi >= src->wan_count)
+            int merged_wi;
+            int owner;
+            const char *ifname;
+
+            if (swi < 0 || swi >= src->wan_count) {
+                iface_validate_failed = 1;
                 continue;
-            if (dp->wan_count >= MAX_PROFILE_INTERFACES)
+            }
+            merged_wi = wan_map[swi];
+            if (merged_wi < 0 || merged_wi >= dst->wan_count) {
+                iface_validate_failed = 1;
+                continue;
+            }
+            ifname = dst->wans[merged_wi].ifname;
+            if (if_nametoindex(ifname) == 0) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: skip WAN %s (interface not found)\n",
+                        src_profile_id, ifname);
+                iface_validate_failed = 1;
+                continue;
+            }
+            owner = wan_dataplane_owner_profile(dst, merged_wi, src_profile_id);
+            if (owner > 0) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: skip WAN %s (dataplane already used by profile %d)\n",
+                        src_profile_id, ifname, owner);
+                iface_validate_failed = 1;
+                continue;
+            }
+            if (dp->wan_count >= MAX_PROFILE_INTERFACES) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: skip WAN %s (MAX_PROFILE_INTERFACES)\n",
+                        src_profile_id, ifname);
+                iface_validate_failed = 1;
                 break;
-            dp->wan_indices[dp->wan_count] = wan_map[swi];
+            }
+            dp->wan_indices[dp->wan_count] = merged_wi;
             dp->wan_bandwidth_weight[dp->wan_count] = sp->wan_bandwidth_weight[i];
             dp->wan_count++;
         }
+
+        if (iface_validate_failed) {
+            dp->local_count = 0;
+            dp->wan_count = 0;
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: skip all policies (LAN/WAN validation failed)\n",
+                    src_profile_id);
+            continue;
+        }
+
+        for (int i = 0; i < src->policy_count; i++)
+            policy_map[i] = append_policy_skip_dup(dst, &src->policies[i], src_profile_id);
+
         for (int i = 0; i < sp->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
             int spi = sp->policy_indices[i];
             if (spi < 0 || spi >= src->policy_count)

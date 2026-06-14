@@ -19,15 +19,19 @@ int profile_iface_xdp_can_remove(const struct app_config *old, const struct app_
 int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_config *new);
 int profile_iface_xdp_is_add_only(const struct app_config *old, const struct app_config *new);
 
-int profile_iface_xdp_apply_add(struct forwarder *fwd, struct app_config *cfg);
-int profile_iface_xdp_apply_remove(struct forwarder *fwd, struct app_config *cfg);
-int profile_iface_xdp_apply_delta(struct forwarder *fwd, struct app_config *cfg);
+int profile_iface_xdp_apply_add(struct forwarder *fwd, struct app_config *cfg,
+                                int trigger_profile_id);
+int profile_iface_xdp_apply_remove(struct forwarder *fwd, struct app_config *cfg,
+                                   int trigger_profile_id);
+int profile_iface_xdp_apply_delta(struct forwarder *fwd, struct app_config *cfg,
+                                    int trigger_profile_id);
 
 int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg, int pair_li);
 int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, int dp_slot,
                                uint16_t fake_ethertype_ipv4);
 
 int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
-                                  enum profile_iface_xdp_reload_mode mode);
+                                  enum profile_iface_xdp_reload_mode mode,
+                                  int trigger_profile_id);
 
 #endif

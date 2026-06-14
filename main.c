@@ -575,7 +575,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN attach (add-only)\n",
                     trigger_id);
             fflush(stderr);
-            if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg) == 0)
+            if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else
                 fprintf(stderr,
@@ -585,7 +585,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN delta\n",
                     trigger_id);
             fflush(stderr);
-            if (profile_iface_xdp_apply_delta(&rt->fwd, new_cfg) == 0)
+            if (profile_iface_xdp_apply_delta(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else
                 fprintf(stderr,
@@ -595,7 +595,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN attach\n",
                     trigger_id);
             fflush(stderr);
-            if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg) == 0)
+            if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else
                 fprintf(stderr,
@@ -605,7 +605,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN detach\n",
                     trigger_id);
             fflush(stderr);
-            if (profile_iface_xdp_apply_remove(&rt->fwd, new_cfg) == 0)
+            if (profile_iface_xdp_apply_remove(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else
                 fprintf(stderr,

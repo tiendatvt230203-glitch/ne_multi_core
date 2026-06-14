@@ -11,7 +11,8 @@ int forwarder_is_wan_only_removal(const struct app_config *old, const struct app
 int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg);
 int forwarder_reload_wan_removal(struct forwarder *fwd, struct app_config *cfg);
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
-                                      enum profile_iface_xdp_reload_mode mode);
+                                      enum profile_iface_xdp_reload_mode mode,
+                                      int trigger_profile_id);
 
 /* Called from middle core while holding forwarder runtime lock. */
 int fwd_reload_apply_if_pending(void);
