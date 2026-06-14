@@ -354,6 +354,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     if (ne_pair_open(&fwd->pair, cfg) != 0)
         return -1;
+    if (profile_iface_xdp_attach_init(&fwd->pair, cfg) != 0) {
+        forwarder_cleanup(fwd);
+        return -1;
+    }
     if (forwarder_should_stop()) {
         forwarder_cleanup(fwd);
         return -1;

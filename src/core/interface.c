@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -43,10 +44,7 @@ void interface_ip_xdp_off(const char *ifname)
         return;
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
-    int st = system(cmd);
-    int ok = (st == 0) || (WIFEXITED(st) && WEXITSTATUS(st) == 0);
-    fprintf(stderr, "[XDP] ip link set dev %s xdp off: %s\n", ifname, ok ? "ok" : "FAILED");
-    fflush(stderr);
+    (void)system(cmd);
 }
 
 void interface_ip_xdp_off_config(const struct app_config *cfg)
@@ -97,9 +95,28 @@ int interface_set_queue_count(const char *ifname, int desired_count)
     if (system(cmd) == 0)
         return 0;
 
-    fprintf(stderr, "[QUEUE] %s unable to force queue_count=%d\n",
-            ifname, desired_count);
     return -1;
+}
+
+int interface_link_is_up(const char *ifname)
+{
+    struct ifreq ifr;
+    int fd;
+
+    if (!ifname || !ifname[0])
+        return 0;
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return 0;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+    return (ifr.ifr_flags & IFF_UP) != 0;
 }
 
 static int interface_set_promisc(const char *ifname)
@@ -109,11 +126,9 @@ static int interface_set_promisc(const char *ifname)
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "ip link set dev %s promisc on >/dev/null 2>&1", ifname);
-    if (system(cmd) == 0) {
+    if (system(cmd) == 0)
         return 0;
-    }
 
-    fprintf(stderr, "[PROMISC] %s unable to enable promisc\n", ifname);
     return -1;
 }
 
@@ -308,55 +323,6 @@ void *ne_packet_data(struct ne_pair *p, uint64_t addr)
     return xsk_umem__get_data(p->bufs, addr);
 }
 
-static int update_xsk_map_queue(struct xsk_socket *xsk, int map_fd, int queue_id)
-{
-    int key = queue_id;
-    int fd = xsk_socket__fd(xsk);
-    if (xsk_socket__update_xskmap(xsk, map_fd) == 0)
-        return 0;
-    return bpf_map_update_elem(map_fd, &key, &fd, BPF_ANY);
-}
-
-static int update_xsk_map_iface(struct ne_iface *iface, int map_fd)
-{
-    for (int q = 0; q < iface->queue_count; q++) {
-        if (!iface->queues[q].xsk)
-            return -1;
-        if (update_xsk_map_queue(iface->queues[q].xsk, map_fd, q) != 0)
-            return -1;
-    }
-    return 0;
-}
-
-static int open_bpf_object(const char *path, struct bpf_object **obj_out,
-                           const char *prog_name, struct bpf_program **prog_out,
-                           const char *map_name, struct bpf_map **map_out)
-{
-    struct bpf_object *obj = bpf_object__open_file(path, NULL);
-    if (libbpf_get_error(obj)) {
-        fprintf(stderr, "[XDP] open failed: %s\n", path);
-        return -1;
-    }
-    if (bpf_object__load(obj) != 0) {
-        fprintf(stderr, "[XDP] load failed: %s\n", path);
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    struct bpf_program *prog = bpf_object__find_program_by_name(obj, prog_name);
-    struct bpf_map *map = bpf_object__find_map_by_name(obj, map_name);
-    if (!prog || !map) {
-        fprintf(stderr, "[XDP] object %s missing program/map\n", path);
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    *obj_out = obj;
-    *prog_out = prog;
-    *map_out = map;
-    return 0;
-}
-
 static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
                              const char *ifname, int queue_count)
 {
@@ -369,10 +335,8 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
     };
 
     iface->ifindex = (int)if_nametoindex(ifname);
-    if (!iface->ifindex) {
-        fprintf(stderr, "[XSK] interface not found: %s\n", ifname);
+    if (!iface->ifindex)
         return -1;
-    }
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
     iface->queue_count = queue_count;
@@ -382,10 +346,8 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
         int ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
                                             &slot->rx, &slot->tx,
                                             &slot->fq, &slot->cq, &cfg);
-        if (ret) {
-            fprintf(stderr, "[XSK] create %s queue=%d failed: %d\n", ifname, q, ret);
+        if (ret)
             return -1;
-        }
     }
     return 0;
 }
@@ -417,17 +379,6 @@ static void prefill_iface(struct ne_pair *p, struct ne_iface *iface, uint32_t wa
 {
     for (int q = 0; q < iface->queue_count; q++)
         prefill_queue(p, &iface->queues[q], want_per_queue);
-}
-
-static void update_wan_fake_ethertype(struct bpf_object *obj, uint16_t fake_ethertype_ipv4)
-{
-    if (!obj || fake_ethertype_ipv4 == 0)
-        return;
-    struct bpf_map *map = bpf_object__find_map_by_name(obj, "wan_config_map");
-    if (!map)
-        return;
-    int key = 0;
-    (void)bpf_map_update_elem(bpf_map__fd(map), &key, &fake_ethertype_ipv4, BPF_ANY);
 }
 
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
@@ -515,27 +466,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
             goto fail;
         NE_TRY(open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
                                  p->wans[di].queue_count));
-    }
-
-    for (int i = 0; i < p->local_count; i++) {
-        struct bpf_program *local_prog = NULL;
-        struct bpf_map *local_map = NULL;
-        NE_TRY(open_bpf_object(cfg->bpf_file, &p->bpf_locals[i],
-                               "xdp_redirect_prog", &local_prog, "xsks_map", &local_map));
-        NE_TRY(bpf_xdp_attach(p->locals[i].ifindex, bpf_program__fd(local_prog), p->xdp_flags, NULL));
-        p->xdp_local_on[i] = 1;
-        NE_TRY(update_xsk_map_iface(&p->locals[i], bpf_map__fd(local_map)));
-    }
-
-    for (int di = 0; di < p->wan_count; di++) {
-        struct bpf_program *wan_prog = NULL;
-        struct bpf_map *wan_map = NULL;
-        NE_TRY(open_bpf_object(cfg->bpf_wan_file, &p->bpf_wans[di],
-                               "xdp_wan_redirect_prog", &wan_prog, "wan_xsks_map", &wan_map));
-        update_wan_fake_ethertype(p->bpf_wans[di], cfg->fake_ethertype_ipv4);
-        NE_TRY(bpf_xdp_attach(p->wans[di].ifindex, bpf_program__fd(wan_prog), p->xdp_flags, NULL));
-        p->xdp_wan_on[di] = 1;
-        NE_TRY(update_xsk_map_iface(&p->wans[di], bpf_map__fd(wan_map)));
     }
 
     uint32_t prefill = NE_RING - 1;

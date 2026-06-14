@@ -20,6 +20,8 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
 {
     if (!cfg)
         return;
+    fprintf(stderr, "[PROFILE-XDP] prepare: detach xdp on configured LAN/WAN\n");
+    fflush(stderr);
     interface_ip_xdp_off_config(cfg);
     interface_reset_redirect_maps();
 }
@@ -284,7 +286,9 @@ static int validate_xdp_attached(const char *ifname, const char *role)
         usleep(50000);
     }
     fprintf(stderr,
-            "[PROFILE-XDP] validate FAIL %s %s: no prog_id\n", role, ifname);
+            "[PROFILE-XDP] validate FAIL %s %s: no prog_id"
+            " (interface down or XDP attach did not stick)\n",
+            role, ifname);
     fflush(stderr);
     return -1;
 }
@@ -375,6 +379,12 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         return -1;
 
     ifname = p->locals[pair_li].ifname;
+    if (!interface_link_is_up(ifname)) {
+        fprintf(stderr,
+                "[PROFILE-XDP] LAN %s is DOWN — bring link up before attach\n",
+                ifname);
+        return -1;
+    }
     skip_attach = lan_iface_has_kernel_xdp(ifname, &existing_id);
 
     if (skip_attach && p->bpf_locals[pair_li]) {
@@ -415,6 +425,12 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
 
     if (!p || !cfg || dp_slot < 0 || dp_slot >= p->wan_count)
         return -1;
+    if (!interface_link_is_up(p->wans[dp_slot].ifname)) {
+        fprintf(stderr,
+                "[PROFILE-XDP] WAN %s is DOWN — bring link up before attach\n",
+                p->wans[dp_slot].ifname);
+        return -1;
+    }
     if (open_bpf_object(cfg->bpf_wan_file, &p->bpf_wans[dp_slot],
                         "xdp_wan_redirect_prog", &prog, "wan_xsks_map", &map) != 0)
         return -1;
@@ -427,6 +443,36 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
         return -1;
     }
     return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map));
+}
+
+int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cfg)
+{
+    if (!p || !cfg)
+        return -1;
+
+    fprintf(stderr, "[PROFILE-XDP] cold attach: %d LAN, %d WAN(dp)\n",
+            p->local_count, p->wan_count);
+    fflush(stderr);
+
+    for (int i = 0; i < p->local_count; i++) {
+        if (profile_iface_xdp_bind_local(p, cfg, i) != 0) {
+            fprintf(stderr, "[PROFILE-XDP] cold attach failed LAN %s (slot %d)\n",
+                    p->locals[i].ifname, i);
+            fflush(stderr);
+            return -1;
+        }
+        p->xdp_local_on[i] = 1;
+    }
+    for (int di = 0; di < p->wan_count; di++) {
+        if (profile_iface_xdp_bind_wan(p, cfg, di, cfg->fake_ethertype_ipv4) != 0) {
+            fprintf(stderr, "[PROFILE-XDP] cold attach failed WAN %s (dp %d)\n",
+                    p->wans[di].ifname, di);
+            fflush(stderr);
+            return -1;
+        }
+        p->xdp_wan_on[di] = 1;
+    }
+    return 0;
 }
 
 /* --- forwarder slot helpers --- */

@@ -12,6 +12,8 @@ enum profile_iface_xdp_reload_mode {
 
 void profile_iface_xdp_prepare_init(const struct app_config *cfg);
 
+int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cfg);
+
 int profile_iface_xdp_can_add(const struct app_config *old, const struct app_config *new);
 int profile_iface_xdp_can_remove(const struct app_config *old, const struct app_config *new);
 int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_config *new);
