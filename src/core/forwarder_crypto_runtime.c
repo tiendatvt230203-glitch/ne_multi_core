@@ -387,9 +387,7 @@ void fwd_crypto_frag_gc_worker_tick(int worker_idx)
     struct timespec ts;
     uint64_t now_ns;
 
-    /* WAN decrypt runs on worker 0 for all core_id buckets; only wi=0 may GC
-     * L2 frag tables or it races with in-flight reassembly on other buckets. */
-    if (worker_idx != 0)
+    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
         return;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -398,12 +396,14 @@ void fwd_crypto_frag_gc_worker_tick(int worker_idx)
     for (int s = 0; s < MAX_PROFILES; s++) {
         if (!profile_flow_table_ready[s])
             continue;
-        flow_table_gc_slice(&profile_flow_tables[s], &profile_flow_gc_cursor[s],
-                            FLOW_GC_BUCKETS_PER_TICK);
-        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-            frag_table_gc_at(&profile_frag_l2[s][w], now_ns);
-        frag_table_gc_at(&profile_frag_l3[s], now_ns);
-        frag_table_gc_at(&profile_frag_l4[s], now_ns);
+        if (worker_idx == 0)
+            flow_table_gc_slice(&profile_flow_tables[s], &profile_flow_gc_cursor[s],
+                                FLOW_GC_BUCKETS_PER_TICK);
+        frag_table_gc_at(&profile_frag_l2[s][worker_idx], now_ns);
+        if (worker_idx == 0)
+            frag_table_gc_at(&profile_frag_l3[s], now_ns);
+        else
+            frag_table_gc_at(&profile_frag_l4[s], now_ns);
     }
 }
 

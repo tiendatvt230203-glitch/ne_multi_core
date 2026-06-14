@@ -11,22 +11,50 @@
 #include "../../inc/core/crypto_route.h"
 
 #include <string.h>
-#include <arpa/inet.h>
+#include <stdio.h>
+#include <time.h>
 
-static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
+#define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
+
+// #region agent log
+static void dbg_l2_core_log(const char *location, const char *message,
+                            int worker, int wire_core, uint32_t len)
 {
-    int wi = dp_crypto_current_worker_idx();
+    FILE *f = fopen(DBG_L2_LOG, "a");
+    if (!f)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long ms = (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    fprintf(f,
+            "{\"sessionId\":\"250a01\",\"location\":\"%s\",\"message\":\"%s\","
+            "\"data\":{\"worker\":%d,\"wire_core\":%d,\"len\":%u},"
+            "\"timestamp\":%ld,\"hypothesisId\":\"l2-aff\",\"runId\":\"l2-core\"}\n",
+            location, message, worker, wire_core, len, ms);
+    fclose(f);
+}
+// #endregion
+
+static int send_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
+{
+    int w = dp_crypto_current_worker_idx();
 
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
-    return dp_ring_push(fwd, &fwd->worker_tx_wan[wan_dp][wi], job);
+    if (ne_tx_send_wan(&fwd->pair, w, wan_dp, job) != 0) {
+        ne_frame_free(&fwd->pair, job->addr);
+        return -1;
+    }
+    return 0;
 }
 
-static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
+static int send_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
                              uint32_t l1, const uint8_t *f2, uint32_t l2, int wan_dp)
 {
-    struct ne_ring *tx = &fwd->worker_tx_wan[wan_dp][dp_crypto_current_worker_idx()];
-    if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap)
+    int w = dp_crypto_current_worker_idx();
+
+    if (wan_dp < 0 || wan_dp >= fwd->wan_count ||
+        !ne_tx_has_room_wan(&fwd->pair, w, wan_dp, 2))
         return -1;
     if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)
         return -1;
@@ -38,11 +66,11 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
     job->len = l1;
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
-    if (ne_ring_try_push(tx, job) != 0) {
+    if (ne_tx_send_wan(&fwd->pair, w, wan_dp, job) != 0) {
         ne_frame_free(&fwd->pair, tail.addr);
         return -1;
     }
-    if (ne_ring_try_push(tx, &tail) != 0)
+    if (ne_tx_send_wan(&fwd->pair, w, wan_dp, &tail) != 0)
         ne_frame_free(&fwd->pair, tail.addr);
     return 0;
 }
@@ -59,19 +87,6 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     uint8_t f2[4096];
     uint32_t l1 = 0, l2 = 0;
 
-    if (cp->action == POLICY_ACTION_ENCRYPT_L2 && len >= 1400) {
-        static uint32_t split_log_budget = 24;
-
-        if (split_log_budget > 0) {
-            int enc_wire = crypto_layer2_enc_wire_len(len);
-            int do_split = frag_need_split_l2(len);
-
-            split_log_budget--;
-            fprintf(stderr,
-                    "[DATAPLANE] l2_split_decision split=%d lan_len=%u enc_wire=%u\n",
-                    do_split, len, (unsigned)enc_wire);
-        }
-    }
     if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(len)) {
         if (frag_split_and_encrypt_l2(pctx, pkt, len, fwd->pair.frame_size, &l1,
                                       f2, fwd->pair.frame_size, &l2) != 0)
@@ -101,7 +116,7 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
         dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         return -1;
-    if (push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) != 0)
+    if (send_split_to_wan(fwd, job, l1, f2, l2, wan_dp) != 0)
         return -1;
     return 1;
 }
@@ -162,59 +177,26 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     int enc;
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                            &profile_idx, &cp) != 0) {
-        // #region agent log
-        dp_agent_log_drop("H1", "dataplane_local.c:no_policy", "no_policy",
-                          ntohl(src_ip), ntohl(dst_ip), src_port, dst_port);
-        // #endregion
+                            &profile_idx, &cp) != 0)
         goto drop;
-    }
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp)) {
-        // #region agent log
-        dp_agent_log_drop("H5", "dataplane_local.c:wan_pick", "wan_pick_or_tx_room",
-                          (uint32_t)wan_dp, (uint32_t)profile_idx, src_port, dst_port);
-        // #endregion
+    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
         goto drop;
-    }
-    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0) {
-        // #region agent log
-        dp_agent_log_drop("H5", "dataplane_local.c:wan_l2", "wan_l2_mac", (uint32_t)wan_dp, job.len, 0, 0);
-        // #endregion
+    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         goto drop;
-    }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
-        if (push_to_wan(fwd, &job, wan_dp) != 0) {
-            // #region agent log
-            dp_agent_log_drop("H5", "dataplane_local.c:bypass_tx", "bypass_tx_ring_full",
-                              (uint32_t)wan_dp, job.len, 0, 0);
-            // #endregion
-            goto drop;
-        }
-        // #region agent log
-        dp_agent_log_fwd("dataplane_local.c:bypass", ntohl(dst_ip), dst_port, job.len);
-        // #endregion
-        dp_stats_inc(DP_STAT_LAN_BYPASS);
+        (void)send_to_wan(fwd, &job, wan_dp);
         return;
     }
-    if (!fwd->cfg->crypto_enabled) {
-        // #region agent log
-        dp_agent_log_drop("H1", "dataplane_local.c:crypto_off", "crypto_disabled", 0, 0, 0, 0);
-        // #endregion
+    if (!fwd->cfg->crypto_enabled)
         goto drop;
-    }
 
     pi = (int)(cp - fwd->cfg->policies);
-    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
-        // #region agent log
-        dp_agent_log_drop("H1", "dataplane_local.c:policy_ready", "policy_not_ready",
-                          (uint32_t)pi, (uint32_t)cp->id, (uint16_t)cp->action, 0);
-        // #endregion
+    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
         goto drop;
-    }
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx)
         goto drop;
@@ -223,33 +205,18 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                          src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
-    if (enc < 0) {
-        // #region agent log
-        dp_agent_log_drop("H1", "dataplane_local.c:encrypt", "encrypt_fail",
-                          (uint32_t)cp->id, (uint32_t)cp->action, src_port, dst_port);
-        // #endregion
+    if (enc < 0)
         goto drop;
-    }
-    if (enc > 0) {
-        // #region agent log
-        dp_agent_log_fwd("dataplane_local.c:encrypt_frag", ntohl(dst_ip), dst_port, job.len);
-        // #endregion
-        dp_stats_inc(DP_STAT_LAN_ENCRYPT_FRAG);
-        return;
-    }
-    (void)push_to_wan(fwd, &job, wan_dp);
-    // #region agent log
-    {
-        uint8_t core_id = 0;
-
+    if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
+        uint8_t wc = 0;
         pkt = ne_packet_data(&fwd->pair, job.addr);
-        (void)crypto_layer2_read_core_id(pkt, job.len, &core_id);
-        dp_agent_log_encrypt_wan(core_id, dp_crypto_current_worker_idx(), wan_dp,
-                                 ntohl(dst_ip), dst_port, job.len);
+        if (crypto_layer2_read_core_id(pkt, job.len, &wc) == 0)
+            dbg_l2_core_log("dataplane_local.c:process_local", "l2 lan encrypt",
+                            dp_crypto_current_worker_idx(), (int)wc, job.len);
     }
-    dp_agent_log_fwd("dataplane_local.c:encrypt", ntohl(dst_ip), dst_port, job.len);
-    // #endregion
-    dp_stats_inc(DP_STAT_LAN_ENCRYPT);
+    if (enc > 0)
+        return;
+    (void)send_to_wan(fwd, &job, wan_dp);
     return;
 
 drop:

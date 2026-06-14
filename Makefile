@@ -4,7 +4,7 @@ CLANG  = clang
 # frag_table x MAX_PROFILES x NE_CRYPTO_WORKERS exceeds ~2GiB .bss; medium model
 # avoids "relocation truncated to fit: R_X86_64_PC32 against .bss" at link time.
 CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 -mcmodel=medium $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
-LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt -ldl
+LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
@@ -19,9 +19,8 @@ APP_SRC = main.c \
           src/core/crypto_route.c \
           src/core/forwarder_wan.c \
           src/core/forwarder_reload.c \
-          src/core/forwarder_pipeline.c \
-          src/core/profile_iface_xdp.c \
           src/core/forwarder_crypto_runtime.c \
+          src/core/profile_iface_xdp.c \
           src/core/dataplane_util.c \
           src/core/dataplane_local.c \
           src/core/dataplane_wan.c \
@@ -64,7 +63,7 @@ $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 bpf/%.o: bpf/%.c
-	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -I./bpf -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
 	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)

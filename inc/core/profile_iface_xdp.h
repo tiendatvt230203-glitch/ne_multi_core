@@ -4,13 +4,12 @@
 #include "config.h"
 #include "forwarder.h"
 
+
 enum profile_iface_xdp_reload_mode {
     PROFILE_IFACE_XDP_ADD = 10,
     PROFILE_IFACE_XDP_REMOVE = 11,
     PROFILE_IFACE_XDP_DELTA = 12,
 };
-
-void profile_iface_xdp_prepare_init(const struct app_config *cfg);
 
 int profile_iface_xdp_can_add(const struct app_config *old, const struct app_config *new);
 int profile_iface_xdp_can_remove(const struct app_config *old, const struct app_config *new);
@@ -20,9 +19,11 @@ int profile_iface_xdp_apply_add(struct forwarder *fwd, struct app_config *cfg);
 int profile_iface_xdp_apply_remove(struct forwarder *fwd, struct app_config *cfg);
 int profile_iface_xdp_apply_delta(struct forwarder *fwd, struct app_config *cfg);
 
+
 int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg, int pair_li);
 int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, int dp_slot,
                                uint16_t fake_ethertype_ipv4);
+
 
 int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
                                   enum profile_iface_xdp_reload_mode mode);

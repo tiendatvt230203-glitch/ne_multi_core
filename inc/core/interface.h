@@ -7,18 +7,12 @@
 #include <signal.h>
 
 #define NE_RING        8192u
-#define NE_INGRESS_RING 16384u
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE  64u
 
-#define NE_CPU_INGRESS      0u
-#define NE_CPU_WORKER0      1u
-#define NE_CPU_WORKER1      2u
-#define NE_CPU_WORKER2      3u
-#define NE_CPU_WORKER3      4u
-#define NE_CRYPTO_WORKERS   4u
-#define NE_TX_SLOTS         4u
+#define NE_CPU_MAIN       0u
+#define NE_CRYPTO_WORKERS 4u
 
 struct bpf_object;
 
@@ -77,17 +71,6 @@ struct ne_packet {
     uint8_t local_idx;
 };
 
-struct ne_ring {
-    struct ne_packet *buf;
-    uint32_t cap;
-    uint32_t mask;
-    __attribute__((aligned(64))) volatile uint32_t head;
-    __attribute__((aligned(64))) volatile uint32_t tail;
-    pthread_spinlock_t push_lock;
-    pthread_spinlock_t pop_lock;
-    uint8_t mpsc_pop;
-};
-
 struct ne_pool {
     uint64_t *buf;
     uint32_t cap;
@@ -136,44 +119,28 @@ struct ne_pair {
     uint32_t xdp_flags;
 };
 
-int ne_ring_init(struct ne_ring *r, uint32_t cap, int mpsc_pop);
-void ne_ring_destroy(struct ne_ring *r);
-int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt);
-int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt);
-uint32_t ne_ring_count(const struct ne_ring *r);
-
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg);
 void ne_pair_close(struct ne_pair *p);
-int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg_local_idx,
-                        int pair_li);
-int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cfg_wan_idx,
-                         int dp_slot);
+
+int ne_pair_local_live(const struct ne_pair *p, int pair_li);
+int ne_pair_wan_live(const struct ne_pair *p, int pair_wi);
+int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg_li, int pair_li);
 void ne_pair_unplumb_local(struct ne_pair *p, int pair_li);
-void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot);
-int ne_pair_local_live(const struct ne_pair *p, int pair_local_idx);
-int ne_pair_wan_live(const struct ne_pair *p, int dp_slot);
+int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cfg_wi, int pair_wi);
+void ne_pair_unplumb_wan_dp(struct ne_pair *p, int pair_wi);
 
-int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-void ne_recv_release_local(struct ne_pair *p);
-void ne_recv_release_wan(struct ne_pair *p);
+int ne_recv_local_worker(struct ne_pair *p, int worker_id, struct ne_packet *out, uint32_t max);
+int ne_recv_wan_worker(struct ne_pair *p, int worker_id, struct ne_packet *out, uint32_t max);
+void ne_recv_release_local_worker(struct ne_pair *p, int worker_id);
+void ne_recv_release_wan_worker(struct ne_pair *p, int worker_id);
 
-void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
-void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
-void ne_refill_fq_local(struct ne_pair *p);
-void ne_refill_fq_wan(struct ne_pair *p);
-void ne_refill_fq_local_slot(struct ne_pair *p, int ingress_slot);
-void ne_refill_fq_wan_slot(struct ne_pair *p, int ingress_slot);
-int ne_recv_local_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int ingress_slot);
-int ne_recv_wan_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int ingress_slot);
-void ne_recv_release_local_slot(struct ne_pair *p, int ingress_slot);
-void ne_recv_release_wan_slot(struct ne_pair *p, int ingress_slot);
-int ne_tx_drain_local(struct ne_pair *p, struct ne_ring *src, int local_idx, int tx_slot);
-int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src, int wan_idx, int tx_slot);
-int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
-                          int local_idx, int tx_slot);
-int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
-                        int wan_idx, int tx_slot);
+void ne_drain_cq_worker(struct ne_pair *p, int worker_id);
+void ne_refill_fq_worker(struct ne_pair *p, int worker_id);
+
+int ne_tx_has_room_wan(struct ne_pair *p, int worker_id, int wan_idx, uint32_t need);
+int ne_tx_has_room_local(struct ne_pair *p, int worker_id, int local_idx, uint32_t need);
+int ne_tx_send_wan(struct ne_pair *p, int worker_id, int wan_idx, const struct ne_packet *job);
+int ne_tx_send_local(struct ne_pair *p, int worker_id, int local_idx, const struct ne_packet *job);
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);

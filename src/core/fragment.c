@@ -8,12 +8,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-#include <stdio.h>
-
+// 
 static atomic_uint_fast32_t g_pkt_id_counter = 0;
-// #region agent log
-static atomic_int frag_evict_log_budget = 30;
-// #endregion
 
 uint16_t frag_next_pkt_id(void) {
     return (uint16_t)(atomic_fetch_add(&g_pkt_id_counter, 1) & 0xFFFF);
@@ -53,41 +49,6 @@ static int frag_require_ipv4(const uint8_t *pkt, uint32_t pkt_len, int *ip_hdr_l
         return -1;
     *ip_hdr_len_out = ihl;
     return 0;
-}
-
-static struct frag_entry *frag_find_slot(struct frag_table *ft, uint16_t pkt_id,
-                                         uint64_t now, int *idx_out) {
-    int start = frag_bucket_index(pkt_id);
-    int idx = start;
-    struct frag_entry *e = &ft->entries[start];
-
-    for (int i = 0; i < FRAG_TABLE_SIZE; i++) {
-        idx = (start + i) % FRAG_TABLE_SIZE;
-        e = &ft->entries[idx];
-
-        if (!e->got_first && !e->got_second)
-            goto found;
-        if (e->pkt_id == pkt_id)
-            goto found;
-        if ((e->got_first || e->got_second) &&
-            (now - e->timestamp_ns) > FRAG_TIMEOUT_NS)
-            goto found;
-    }
-    // #region agent log
-    {
-        int left = atomic_fetch_sub(&frag_evict_log_budget, 1);
-        if (left > 0) {
-            fprintf(stderr, "[DATAPLANE] frag_table_full pkt_id=%u start=%d\n",
-                    (unsigned)pkt_id, start);
-        }
-    }
-    // #endregion
-    *idx_out = start;
-    return &ft->entries[start];
-
-found:
-    *idx_out = idx;
-    return e;
 }
 
 static void frag_prepare_entry(struct frag_entry *entry, uint16_t pkt_id, uint64_t now) {
@@ -248,9 +209,9 @@ int frag_try_reassemble(struct frag_table *ft,
     const uint8_t *payload = pkt_data + 14 + ip_hdr_len;
     uint32_t payload_len = pkt_len - 14 - (uint32_t)ip_hdr_len;
 
+    int idx = pkt_id % FRAG_TABLE_SIZE;
+    struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
-    int idx;
-    struct frag_entry *entry = frag_find_slot(ft, pkt_id, now, &idx);
 
     if (frag_index == 0) {
         if (payload_len < 20 || (payload[0] >> 4) != 4)
@@ -401,9 +362,9 @@ int frag_try_reassemble_l2(struct frag_table *ft,
     const uint8_t *inner = pkt_data + wire_eth;
     uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
 
+    int idx = pkt_id % FRAG_TABLE_SIZE;
+    struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
-    int idx;
-    struct frag_entry *entry = frag_find_slot(ft, pkt_id, now, &idx);
 
     if (frag_index == 0) {
         if (inner_len < 20 || (inner[0] >> 4) != 4)
@@ -552,9 +513,9 @@ int frag_try_reassemble_l4(struct frag_table *ft,
     const uint8_t *payload = pkt_data + 14 + ip_hdr_len;
     uint32_t payload_len = pkt_len - 14 - ip_hdr_len;
 
+    int idx = pkt_id % FRAG_TABLE_SIZE;
+    struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
-    int idx;
-    struct frag_entry *entry = frag_find_slot(ft, pkt_id, now, &idx);
 
     if (frag_index == 0) {
         int wire_ports = crypto_layer4_wire_port_len();

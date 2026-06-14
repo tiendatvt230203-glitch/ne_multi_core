@@ -13,7 +13,9 @@ int forwarder_reload_wan_removal(struct forwarder *fwd, struct app_config *cfg);
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
                                       enum profile_iface_xdp_reload_mode mode);
 
+/* Called from middle core while holding forwarder runtime lock. */
 int fwd_reload_apply_if_pending(void);
+
 void fwd_reload_shutdown(void);
 
 #endif

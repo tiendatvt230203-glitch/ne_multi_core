@@ -19,38 +19,4 @@ int dp_write_l2(uint8_t *pkt, uint32_t len,
 int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
                     const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN]);
 
-int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt);
-
-// #region agent log
-void dp_agent_log_drop(const char *hypothesis_id, const char *path,
-                       const char *reason, uint32_t a, uint32_t b, uint16_t c, uint16_t d);
-
-int dp_dest_is_nonunicast(const struct forwarder *fwd, uint32_t dest_ip);
-
-void dp_agent_log_fwd(const char *path, uint32_t dst_host, uint16_t dst_port, uint32_t len);
-
-void dp_agent_log_wan_route(const char *event, uint8_t core_id,
-                            int recv_wi, int target_wi, uint32_t pkt_len);
-
-void dp_agent_log_encrypt_wan(uint8_t core_id, int wi, int wan_dp,
-                              uint32_t dst_host, uint16_t dst_port, uint32_t len);
-
-void dp_agent_log_wan_tx(int wi, int wan_dp, uint32_t len, int sent);
-
-void dp_agent_log_wan_recv(int wi, int wan_dp, uint32_t len, uint8_t core_id, uint16_t eth_type);
-
-enum dp_stat_kind {
-    DP_STAT_LAN_ENCRYPT = 0,
-    DP_STAT_LAN_BYPASS,
-    DP_STAT_LAN_ENCRYPT_FRAG,
-    DP_STAT_WAN_ETH_ENC,
-    DP_STAT_WAN_ETH_PLAIN,
-    DP_STAT_DECRYPT_OK,
-    DP_STAT_DECRYPT_FAIL,
-    DP_STAT_COUNT
-};
-
-void dp_stats_inc(enum dp_stat_kind kind);
-// #endregion
-
 #endif

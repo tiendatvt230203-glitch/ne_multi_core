@@ -127,6 +127,49 @@ static int find_wan_by_ifname(const struct app_config *cfg, const char *ifname) 
     return -1;
 }
 
+static int find_profile_for_policy_index(const struct app_config *cfg, int policy_idx)
+{
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int j = 0; j < p->policy_count; j++) {
+            if (p->policy_indices[j] == policy_idx)
+                return p->id;
+        }
+    }
+    return -1;
+}
+
+static const char *find_profile_name_for_policy_index(const struct app_config *cfg, int policy_idx)
+{
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int j = 0; j < p->policy_count; j++) {
+            if (p->policy_indices[j] == policy_idx)
+                return p->name;
+        }
+    }
+    return "?";
+}
+
+static void warn_lan_shared_with_existing(const struct app_config *dst, int local_idx,
+                                          int new_profile_id, const char *new_profile_name)
+{
+    const char *ifname = dst->locals[local_idx].ifname;
+
+    for (int pi = 0; pi < dst->profile_count; pi++) {
+        const struct profile_config *p = &dst->profiles[pi];
+        for (int j = 0; j < p->local_count; j++) {
+            if (p->local_indices[j] != local_idx)
+                continue;
+            fprintf(stderr,
+                    "[CONFIG][WARN] LAN %s shared by profile %d (%s) and profile %d (%s)\n",
+                    ifname, p->id, p->name, new_profile_id,
+                    new_profile_name ? new_profile_name : "?");
+            return;
+        }
+    }
+}
+
 static int append_local_unique(struct app_config *dst, const struct local_config *src_loc) {
     int idx = find_local_by_ifname(dst, src_loc->ifname);
     if (idx >= 0)
@@ -156,7 +199,8 @@ static void collect_used_wire_ids(const struct app_config *dst, uint8_t used[256
     }
 }
 
-static int append_policy_unique(struct app_config *dst, const struct crypto_policy *src_cp) {
+static int append_policy_unique(struct app_config *dst, const struct crypto_policy *src_cp,
+                                int src_profile_id, const char *src_profile_name) {
     if (!dst || !src_cp)
         return -1;
 
@@ -168,6 +212,23 @@ static int append_policy_unique(struct app_config *dst, const struct crypto_poli
     collect_used_wire_ids(dst, used);
     int wid = cp.id;
     if (wid < 1 || wid > 255 || used[(size_t)wid]) {
+        if (wid >= 1 && wid <= 255 && used[(size_t)wid]) {
+            for (int j = 0; j < dst->policy_count; j++) {
+                const struct crypto_policy *ep = &dst->policies[j];
+                if (ep->id != wid || ep->action != cp.action)
+                    continue;
+                int owner_id = find_profile_for_policy_index(dst, j);
+                const char *owner_name = find_profile_name_for_policy_index(dst, j);
+                fprintf(stderr,
+                        "[CONFIG][WARN] policy wire id %d (action=%d) from profile %d (%s) "
+                        "ne_policies.id=%d conflicts with profile %d (%s) ne_policies.id=%d — "
+                        "remapping to free wire id\n",
+                        wid, cp.action, src_profile_id,
+                        src_profile_name ? src_profile_name : "?",
+                        cp.db_id, owner_id, owner_name, ep->db_id);
+                break;
+            }
+        }
         int found = -1;
         for (int j = 1; j <= 255; j++) {
             if (!used[(size_t)j]) {
@@ -188,14 +249,19 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
     int local_map[MAX_INTERFACES];
     int wan_map[MAX_INTERFACES];
     int policy_map[MAX_CRYPTO_POLICIES];
+    int src_profile_id = (src->profile_count > 0) ? src->profiles[0].id : -1;
+    const char *src_profile_name = (src->profile_count > 0) ? src->profiles[0].name : "?";
     memset(local_map, -1, sizeof(local_map));
     memset(wan_map, -1, sizeof(wan_map));
     memset(policy_map, -1, sizeof(policy_map));
 
     for (int i = 0; i < src->local_count; i++) {
+        int existing = find_local_by_ifname(dst, src->locals[i].ifname);
         local_map[i] = append_local_unique(dst, &src->locals[i]);
         if (local_map[i] < 0)
             return -1;
+        if (existing >= 0 && dst->profile_count > 0)
+            warn_lan_shared_with_existing(dst, local_map[i], src_profile_id, src_profile_name);
     }
     for (int i = 0; i < src->wan_count; i++) {
         wan_map[i] = append_wan_unique(dst, &src->wans[i]);
@@ -203,7 +269,8 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
             return -1;
     }
     for (int i = 0; i < src->policy_count; i++) {
-        policy_map[i] = append_policy_unique(dst, &src->policies[i]);
+        policy_map[i] = append_policy_unique(dst, &src->policies[i],
+                                             src_profile_id, src_profile_name);
         if (policy_map[i] < 0)
             return -1;
     }
@@ -277,6 +344,8 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
 
     if (config_validate(&merged) != 0)
         return -1;
+    if (merged.profile_count > 1)
+        config_warn_multi_profile_conflicts(&merged);
     *out_cfg = merged;
     return 0;
 }

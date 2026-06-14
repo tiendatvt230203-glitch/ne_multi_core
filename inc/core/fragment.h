@@ -15,16 +15,7 @@
 #define FRAG_MTU            1500
 
 #define FRAG_TABLE_SIZE     4096
-#define FRAG_TIMEOUT_NS     (500ULL * 1000000ULL)
-
-/* Spread sequential pkt_id values across buckets (plain % 4096 collides every 4096 ids). */
-static inline int frag_bucket_index(uint16_t pkt_id) {
-    uint32_t h = (uint32_t)pkt_id * 0x9E3779B9u;
-    h ^= (uint32_t)pkt_id >> 4;
-    h ^= (uint32_t)pkt_id << 6;
-    h ^= h >> 16;
-    return (int)(h % FRAG_TABLE_SIZE);
-}
+#define FRAG_TIMEOUT_NS     (200ULL * 1000000ULL)
 
 struct frag_entry {
     uint16_t pkt_id;
@@ -64,7 +55,8 @@ static inline int frag_need_split_l4(uint32_t pkt_len) {
 
 
 static inline int frag_need_split_l2(uint32_t pkt_len) {
-    return crypto_layer2_enc_wire_len(pkt_len) > FRAG_MTU;
+    int overhead = crypto_layer2_frag_meta_len();
+    return (pkt_len + overhead) > FRAG_MTU;
 }
 
 int frag_split_and_encrypt(struct packet_crypto_ctx *ctx,

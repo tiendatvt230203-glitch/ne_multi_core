@@ -17,10 +17,16 @@ static atomic_int reload_done;
 static struct forwarder *reload_fwd;
 static struct app_config *reload_cfg;
 static int reload_rc;
-enum { RELOAD_CONFIG = 0, RELOAD_WAN_DRAIN = 1 };
-static int reload_mode;
+static int reload_kind;
+static enum profile_iface_xdp_reload_mode reload_profile_iface_mode;
 static pthread_mutex_t reload_wait_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t reload_wait_cv = PTHREAD_COND_INITIALIZER;
+
+enum {
+    RELOAD_KIND_CONFIG = 0,
+    RELOAD_KIND_WAN_DRAIN = 1,
+    RELOAD_KIND_PROFILE_IFACE_XDP = 2,
+};
 
 static int wait_dataplane_workers(struct forwarder *fwd)
 {
@@ -136,6 +142,10 @@ static int forwarder_reload_wan_removal_impl(struct forwarder *fwd, struct app_c
     return forwarder_should_stop() ? -1 : rc;
 }
 
+/*
+ * Hot reload (same LAN/WAN ifnames): Postgres policies/crypto only.
+ * LAN subnet from DB; fwd->locals src MAC refreshed on reload.
+ */
 static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config *cfg)
 {
     if (forwarder_should_stop())
@@ -163,7 +173,7 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
     fwd_crypto_cleanup_stale_profile_slots(cfg);
     return forwarder_should_stop() ? -1 : rc;
 }
-static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg, int mode)
+static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg, int kind)
 {
     if (!fwd || !cfg)
         return -1;
@@ -176,7 +186,7 @@ static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg,
     reload_fwd = fwd;
     reload_cfg = cfg;
     reload_rc = -1;
-    reload_mode = mode;
+    reload_kind = kind;
     atomic_store_explicit(&reload_done, 0, memory_order_release);
     atomic_store_explicit(&reload_pending, 1, memory_order_release);
 
@@ -235,7 +245,7 @@ int forwarder_reload_wan_removal(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     if (!forwarder_is_wan_only_removal(fwd->cfg, cfg))
         return -1;
-    return forwarder_queue_reload(fwd, cfg, RELOAD_WAN_DRAIN);
+    return forwarder_queue_reload(fwd, cfg, RELOAD_KIND_WAN_DRAIN);
 }
 
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
@@ -245,13 +255,8 @@ int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *
         return -1;
     if (forwarder_should_stop())
         return -1;
-    if (mode == PROFILE_IFACE_XDP_ADD && !profile_iface_xdp_can_add(fwd->cfg, cfg))
-        return -1;
-    if (mode == PROFILE_IFACE_XDP_REMOVE && !profile_iface_xdp_can_remove(fwd->cfg, cfg))
-        return -1;
-    if (mode == PROFILE_IFACE_XDP_DELTA && !profile_iface_xdp_can_delta(fwd->cfg, cfg))
-        return -1;
-    return forwarder_queue_reload(fwd, cfg, (int)mode);
+    reload_profile_iface_mode = mode;
+    return forwarder_queue_reload(fwd, cfg, RELOAD_KIND_PROFILE_IFACE_XDP);
 }
 
 int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
@@ -265,7 +270,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
                 "[RELOAD] LAN/WAN set changed (add/remove interface) — hot reload not possible\n");
         return -1;
     }
-    return forwarder_queue_reload(fwd, cfg, RELOAD_CONFIG);
+    return forwarder_queue_reload(fwd, cfg, RELOAD_KIND_CONFIG);
 }
 
 int fwd_reload_apply_if_pending(void)
@@ -276,21 +281,13 @@ int fwd_reload_apply_if_pending(void)
     struct app_config *cfg = reload_cfg;
     if (!fwd || !cfg)
         return 0;
-    switch (reload_mode) {
-    case RELOAD_WAN_DRAIN:
+    if (reload_kind == RELOAD_KIND_WAN_DRAIN)
         reload_rc = forwarder_reload_wan_removal_impl(fwd, cfg);
-        break;
-    case PROFILE_IFACE_XDP_ADD:
-    case PROFILE_IFACE_XDP_REMOVE:
-    case PROFILE_IFACE_XDP_DELTA:
-        reload_rc = profile_iface_xdp_reload_impl(fwd, cfg,
-                                                  (enum profile_iface_xdp_reload_mode)reload_mode);
-        break;
-    default:
+    else if (reload_kind == RELOAD_KIND_PROFILE_IFACE_XDP)
+        reload_rc = profile_iface_xdp_reload_impl(fwd, cfg, reload_profile_iface_mode);
+    else
         reload_rc = forwarder_reload_config_impl(fwd, cfg);
-        break;
-    }
-    reload_mode = RELOAD_CONFIG;
+    reload_kind = RELOAD_KIND_CONFIG;
     atomic_store_explicit(&reload_pending, 0, memory_order_release);
     atomic_store_explicit(&reload_done, 1, memory_order_release);
     pthread_mutex_lock(&reload_wait_mtx);

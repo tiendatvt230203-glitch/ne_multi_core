@@ -12,11 +12,38 @@
 
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
-//
+
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
-#include <arpa/inet.h>
+
+#define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
+
+// #region agent log
+static void dbg_l2_core_log(const char *location, const char *message,
+                            int worker, int wire_core, int ok, uint32_t len)
+{
+    FILE *f = fopen(DBG_L2_LOG, "a");
+    if (!f)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long ms = (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    fprintf(f,
+            "{\"sessionId\":\"250a01\",\"location\":\"%s\",\"message\":\"%s\","
+            "\"data\":{\"worker\":%d,\"wire_core\":%d,\"ok\":%d,\"len\":%u},"
+            "\"timestamp\":%ld,\"hypothesisId\":\"l2-aff\",\"runId\":\"l2-core\"}\n",
+            location, message, worker, wire_core, ok, len, ms);
+    fclose(f);
+}
+// #endregion
+
+static int wan_pkt_is_l2(const uint8_t *pkt, uint32_t len, uint8_t *core_id_out)
+{
+    if (!core_id_out)
+        return 0;
+    return crypto_layer2_read_core_id(pkt, len, core_id_out) == 0;
+}
 
 static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fwd, uint8_t wire_id)
 {
@@ -85,17 +112,6 @@ static int decrypt_l2(uint8_t *pkt, uint32_t *len)
     return 0;
 }
 
-static __thread struct {
-    const char *sub;
-    uint16_t pkt_id;
-    uint8_t fidx;
-    uint16_t bucket;
-    uint32_t len;
-    uint8_t core_id;
-    uint8_t pol;
-    uint8_t frag_mark;
-} last_decrypt_fail;
-
 static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
                          uint8_t policy_id, int *pending)
 {
@@ -105,41 +121,25 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t ofidx;
     uint8_t buf[4096];
     uint32_t blen = 0;
-    int frag_wi;
 
     ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
-    if (!ctx) {
-        last_decrypt_fail.sub = "no_ctx";
+    if (!ctx)
         return -1;
-    }
     slot = fwd_crypto_profile_slot_for_id(
         fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id));
-    if (slot < 0) {
-        last_decrypt_fail.sub = "no_slot";
+    if (slot < 0)
         return -1;
-    }
     nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
-    if (nd < 0) {
-        last_decrypt_fail.sub = "frag_decrypt";
-        last_decrypt_fail.pkt_id = opid;
-        last_decrypt_fail.fidx = ofidx;
-        last_decrypt_fail.bucket = (uint16_t)frag_bucket_index(opid);
+    if (nd < 0)
         return -1;
-    }
-    frag_wi = dp_crypto_frag_idx_for_packet(pkt, *len);
-    last_decrypt_fail.pkt_id = opid;
-    last_decrypt_fail.fidx = ofidx;
-    last_decrypt_fail.bucket = (uint16_t)frag_bucket_index(opid);
-    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, frag_wi),
+    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
                                 pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
-    if (rr != 1) {
-        last_decrypt_fail.sub = "frag_reasm";
+    if (rr != 1)
         return -1;
-    }
     memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
@@ -220,38 +220,30 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     int pending = 0;
     struct crypto_dispatch_ctx dctx;
 
-    last_decrypt_fail.sub = NULL;
-    last_decrypt_fail.pkt_id = 0;
-    last_decrypt_fail.fidx = 0;
-    last_decrypt_fail.bucket = 0;
-    last_decrypt_fail.len = len;
-    last_decrypt_fail.core_id = 0;
-    last_decrypt_fail.pol = 0;
-    last_decrypt_fail.frag_mark = 0;
-    if (len >= CRYPTO_L2_NONCE_OFF)
-        (void)crypto_layer2_read_core_id(pkt, len, &last_decrypt_fail.core_id);
-    if (len > CRYPTO_L2_POLICY_OFF)
-        last_decrypt_fail.pol = pkt[CRYPTO_L2_POLICY_OFF];
-
     {
         int frag_mark = 0;
         int ns = PACKET_CRYPTO_NONCE_BYTES;
         int mark_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
+        uint32_t orig_len = len;
 
         wan_apply_l2_policy(fwd, pkt);
         if (len > (uint32_t)mark_off)
             frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
-        last_decrypt_fail.frag_mark = (uint8_t)frag_mark;
 
-        if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
-            if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
+        int need_backup = frag_mark ||
+            frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
+        if (need_backup && orig_len <= sizeof(scratch))
+            memcpy(scratch, pkt, orig_len);
+        if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
+            if (need_backup)
+                memcpy(pkt, scratch, orig_len);
+            len = orig_len;
+            if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
+                if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
+                    return -1;
+            } else {
                 return -1;
-        } else if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
-            last_decrypt_fail.sub = "l2_crypto";
-            last_decrypt_fail.pkt_id = 0;
-            last_decrypt_fail.fidx = 0;
-            last_decrypt_fail.bucket = 0;
-            return -1;
+            }
         }
     }
     if (pending)
@@ -308,91 +300,38 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     int li;
     int dec;
+    uint8_t wire_core = 0;
+    int worker = dp_crypto_current_worker_idx();
+
+    if (wan_pkt_is_l2(pkt, job.len, &wire_core)) {
+        int ok = dp_crypto_l2_affinity_ok(pkt, job.len);
+        dbg_l2_core_log("dataplane_wan.c:process_wan", "l2 wan affinity", worker,
+                        (int)wire_core, ok, job.len);
+        if (!ok)
+            goto drop;
+    }
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
-        uint8_t log_core_id = 0;
-        int log_wi = dp_crypto_current_worker_idx();
-
-        if (job.len >= CRYPTO_L2_NONCE_OFF)
-            (void)crypto_layer2_read_core_id(pkt, job.len, &log_core_id);
         dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
             ne_frame_free(&fwd->pair, job.addr);
             return;
         }
-        if (dec != 0) {
-            // #region agent log
-            uint8_t core_id = log_core_id;
-            uint32_t mark = 0;
-
-            if (job.len >= 16)
-                mark = ((uint32_t)pkt[12] << 24) | ((uint32_t)pkt[13] << 16) |
-                       ((uint32_t)pkt[14] << 8) | pkt[15];
-            dp_agent_log_drop("H2", "dataplane_wan.c:decrypt", "decrypt_fail",
-                              (uint32_t)core_id, mark, (uint16_t)job.wan_idx, (uint16_t)job.len);
-            if (last_decrypt_fail.sub) {
-                fprintf(stderr,
-                        "[DATAPLANE] decrypt_fail_detail sub=%s len=%u core_id=%u pol=%u "
-                        "frag_mark=%u pkt_id=%u fidx=%u bucket=%u wi=%d\n",
-                        last_decrypt_fail.sub, last_decrypt_fail.len,
-                        (unsigned)last_decrypt_fail.core_id, (unsigned)last_decrypt_fail.pol,
-                        (unsigned)last_decrypt_fail.frag_mark,
-                        (unsigned)last_decrypt_fail.pkt_id,
-                        (unsigned)last_decrypt_fail.fidx, (unsigned)last_decrypt_fail.bucket,
-                        log_wi);
-            }
-            // #endregion
-            dp_stats_inc(DP_STAT_DECRYPT_FAIL);
+        if (dec != 0)
             goto drop;
-        }
-        // #region agent log
-        {
-            static uint32_t ok_budget = 30;
-
-            if (ok_budget > 0) {
-                ok_budget--;
-                fprintf(stderr,
-                        "[DATAPLANE] decrypt_ok core_id=%u wi=%d len=%u\n",
-                        (unsigned)log_core_id, log_wi, job.len);
-            }
-        }
-        // #endregion
-        dp_stats_inc(DP_STAT_DECRYPT_OK);
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
-    {
-        uint32_t dest = dp_dest_ipv4(pkt, job.len);
-
-        if (dp_dest_is_nonunicast(fwd, dest))
-            goto drop;
-    }
-
     li = pick_local(fwd, pkt, job.len);
-    if (li < 0 || li >= fwd->local_count) {
-        // #region agent log
-        dp_agent_log_drop("H4", "dataplane_wan.c:pick_local", "no_local_subnet",
-                          ntohl(dp_dest_ipv4(pkt, job.len)), job.len, 0, 0);
-        // #endregion
+    if (li < 0 || li >= fwd->local_count)
         goto drop;
-    }
-    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0) {
-        // #region agent log
-        dp_agent_log_drop("H4", "dataplane_wan.c:lan_mac", "lan_src_mac_unset",
-                          (uint32_t)li, job.len, 0, 0);
-        // #endregion
+    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
         goto drop;
-    }
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    if (dp_ring_push(fwd, &fwd->worker_tx_local[li][dp_crypto_current_worker_idx()], &job) != 0) {
-        // #region agent log
-        dp_agent_log_drop("H5", "dataplane_wan.c:lan_tx", "lan_tx_ring_full",
-                          (uint32_t)li, job.len, 0, 0);
-        // #endregion
-        return;
-    }
+    if (ne_tx_send_local(&fwd->pair, dp_crypto_current_worker_idx(), li, &job) != 0)
+        goto drop;
     return;
 
 drop:

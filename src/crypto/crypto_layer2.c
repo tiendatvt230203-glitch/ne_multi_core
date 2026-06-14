@@ -10,7 +10,7 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-static __thread uint8_t tls_l2_worker_core_id = NE_CPU_WORKER0;
+static __thread uint8_t tls_l2_worker_core_id;
 
 static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
@@ -20,9 +20,9 @@ static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
     return et == fake;
 }
 
-void crypto_layer2_bind_worker_core(uint8_t cpu_core_id)
+void crypto_layer2_bind_worker_core(uint8_t worker_idx)
 {
-    tls_l2_worker_core_id = cpu_core_id;
+    tls_l2_worker_core_id = worker_idx;
 }
 
 uint8_t crypto_layer2_worker_core_id(void)
@@ -100,19 +100,6 @@ int crypto_layer2_frag_meta_len(void) {
     if (crypto_mode_uses_gcm_tag())
         meta += AES_GCM_TAG_SIZE;
     return meta;
-}
-
-int crypto_layer2_enc_wire_len(uint32_t pkt_len) {
-    if (pkt_len <= ETH_HEADER_SIZE)
-        return (int)pkt_len;
-    int nonce_size = packet_crypto_get_nonce_size();
-    int enc_start = CRYPTO_L2_NONCE_OFF + nonce_size;
-    uint32_t payload = pkt_len - ETH_HEADER_SIZE;
-    uint32_t enc = (uint32_t)enc_start + payload;
-
-    if (crypto_mode_uses_gcm_tag())
-        enc += AES_GCM_TAG_SIZE;
-    return (int)enc;
 }
 
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
@@ -195,6 +182,10 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (unlikely(pkt_len < (size_t)l2_enc_start))
         return -1;
     if (!l2_has_fake_ethertype(packet))
+        return (int)pkt_len;
+
+    if (pkt_len >= (size_t)(l2_frag_magic_offset(wire_ns) + 1) &&
+        packet[l2_frag_magic_offset(wire_ns)] == L2_FRAG_MAGIC)
         return (int)pkt_len;
 
     if (crypto_mode_is_pqc()) {

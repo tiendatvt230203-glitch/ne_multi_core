@@ -2,19 +2,41 @@
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/forwarder_reload.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
-#include "../../inc/core/forwarder_pipeline.h"
+#include "../../inc/core/dataplane.h"
+#include "../../inc/core/crypto_route.h"
+
 #include "../../inc/core/local_hwaddr.h"
-#include "../../inc/core/profile_iface_xdp.h"
+#include "../../inc/core/main_diag.h"
+#include "../../inc/core/interface.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
+#include "../../inc/crypto/crypto_layer2.h"
 
 #include <net/if.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <stdio.h>
+#include <time.h>
 
-atomic_int running = 1;
-pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int running = 1;
+struct forwarder *g_active_fwd;
+static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void pin_cpu(unsigned int cpu)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+
+void forwarder_pin_cpu(void)
+{
+    pin_cpu(NE_CPU_MAIN);
+}
+
+#define IO_BURST_ROUNDS 8
 
 static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
                             const uint8_t src_mac[MAC_LEN],
@@ -32,20 +54,115 @@ static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
     memcpy(iface->dst_mac, dst_mac, MAC_LEN);
 }
 
-void forwarder_pin_cpu(void)
-{
-    cpu_set_t cpuset;
+struct worker_ctx {
+    struct forwarder *fwd;
+    int worker_idx;
+};
 
-    CPU_ZERO(&cpuset);
-    CPU_SET(NE_CPU_INGRESS, &cpuset);
-    (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+static void worker_tick(struct forwarder *fwd)
+{
+    fwd_crypto_maybe_expire_prev_grace();
+    fwd_wan_drain_tick(fwd);
+    fwd_wan_weight_blend_tick();
+    fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
+}
+
+static void *unified_worker_thread(void *arg)
+{
+    struct worker_ctx *ctx = arg;
+    struct forwarder *fwd = ctx->fwd;
+    struct ne_packet batch[NE_BATCH_SIZE];
+    uint32_t gc_tick = 0;
+    uint32_t maint_tick = 0;
+    int w = ctx->worker_idx;
+    int is_primary = (w == 0);
+
+    pin_cpu(dp_crypto_worker_cpu(w));
+    dp_crypto_worker_bind(w);
+    crypto_layer2_bind_worker_core((uint8_t)w);
+
+    // #region agent log
+    {
+        FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
+        if (_df) {
+            struct timespec _ts;
+            clock_gettime(CLOCK_REALTIME, &_ts);
+            long _ms = (long)_ts.tv_sec * 1000L + _ts.tv_nsec / 1000000L;
+            fprintf(_df,
+                    "{\"sessionId\":\"250a01\",\"location\":\"forwarder.c:unified_worker_thread\","
+                    "\"message\":\"worker started\",\"data\":{\"worker\":%d,\"cpu\":%u},"
+                    "\"timestamp\":%ld,\"hypothesisId\":\"unified\",\"runId\":\"post-refactor\"}\n",
+                    w, (unsigned)dp_crypto_worker_cpu(w), _ms);
+            fclose(_df);
+        }
+    }
+    // #endregion
+
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        int did_work = 0;
+
+        for (int i = 0; i < IO_BURST_ROUNDS; i++)
+            ne_refill_fq_worker(&fwd->pair, w);
+
+        int rcvd = ne_recv_local_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
+        for (int i = 0; i < rcvd; i++) {
+            dataplane_process_local(fwd, batch[i]);
+            did_work = 1;
+        }
+        if (rcvd > 0)
+            ne_recv_release_local_worker(&fwd->pair, w);
+
+        rcvd = ne_recv_wan_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
+        for (int i = 0; i < rcvd; i++) {
+            if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
+                ne_frame_free(&fwd->pair, batch[i].addr);
+                continue;
+            }
+            dataplane_process_wan(fwd, batch[i]);
+            did_work = 1;
+        }
+        if (rcvd > 0)
+            ne_recv_release_wan_worker(&fwd->pair, w);
+
+        for (int i = 0; i < IO_BURST_ROUNDS; i++)
+            ne_drain_cq_worker(&fwd->pair, w);
+
+        if (is_primary) {
+            if (pthread_mutex_trylock(&runtime_lock) != 0) {
+                if (!atomic_load_explicit(&running, memory_order_acquire))
+                    break;
+                if (!did_work)
+                    sched_yield();
+                continue;
+            }
+            if (!atomic_load_explicit(&running, memory_order_acquire)) {
+                pthread_mutex_unlock(&runtime_lock);
+                break;
+            }
+            if (fwd_reload_apply_if_pending()) {
+                pthread_mutex_unlock(&runtime_lock);
+                continue;
+            }
+            if ((++maint_tick & 1023u) == 0)
+                worker_tick(fwd);
+            pthread_mutex_unlock(&runtime_lock);
+        }
+
+        if (++gc_tick >= 2048) {
+            fwd_crypto_frag_gc_worker_tick(w);
+            gc_tick = 0;
+        }
+
+        if (!did_work)
+            sched_yield();
+    }
+    return NULL;
 }
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
     if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
         return -1;
-    atomic_store_explicit(&running, 1, memory_order_release);
     if (forwarder_should_stop())
         return -1;
 
@@ -71,7 +188,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
                         cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
     }
 
-    profile_iface_xdp_prepare_init(cfg);
+    interface_ip_xdp_off_config(cfg);
+    interface_reset_redirect_maps();
 
     if (local_hwaddr_prepare(cfg) != 0)
         return -1;
@@ -96,29 +214,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     }
 
-    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-        if (ne_ring_init(&fwd->worker_ingress[w], NE_INGRESS_RING, 1) != 0) {
-            forwarder_cleanup(fwd);
-            return -1;
-        }
-    }
-    for (int i = 0; i < fwd->local_count; i++) {
-        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            if (ne_ring_init(&fwd->worker_tx_local[i][w], NE_RING, 1) != 0) {
-                forwarder_cleanup(fwd);
-                return -1;
-            }
-        }
-    }
-    for (int i = 0; i < fwd->wan_count; i++) {
-        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            if (ne_ring_init(&fwd->worker_tx_wan[i][w], NE_RING, 1) != 0) {
-                forwarder_cleanup(fwd);
-                return -1;
-            }
-        }
-    }
-
     (void)local_hwaddr_install(fwd);
     fwd_wan_reset_on_init(fwd);
 
@@ -130,23 +225,45 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
-    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        ne_ring_destroy(&fwd->worker_ingress[w]);
-    for (int i = 0; i < MAX_INTERFACES; i++) {
-        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            ne_ring_destroy(&fwd->worker_tx_wan[i][w]);
-            ne_ring_destroy(&fwd->worker_tx_local[i][w]);
-        }
-    }
     fwd_crypto_cleanup_all_profile_slots();
     ne_pair_close(&fwd->pair);
 }
 
+static void forwarder_join_workers(struct forwarder *fwd, int started)
+{
+    atomic_store_explicit(&running, 0, memory_order_release);
+    for (int w = 0; w < started; w++)
+        pthread_join(fwd->worker_threads[w], NULL);
+}
+
 void forwarder_run(struct forwarder *fwd)
 {
+    struct worker_ctx ctx[NE_CRYPTO_WORKERS];
+    int started = 0;
+
     if (!fwd || forwarder_should_stop())
         return;
-    forwarder_pipeline_run(fwd);
+
+    g_active_fwd = fwd;
+
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        ctx[w].fwd = fwd;
+        ctx[w].worker_idx = w;
+        if (pthread_create(&fwd->worker_threads[w], NULL, unified_worker_thread, &ctx[w]) != 0) {
+            forwarder_join_workers(fwd, started);
+            return;
+        }
+        started++;
+    }
+
+    fwd->threads_started = 1;
+    if (fwd->cfg)
+        main_diag_log_dataplane_ready(fwd->cfg);
+
+    forwarder_join_workers(fwd, started);
+    fwd->threads_started = 0;
+    if (g_active_fwd == fwd)
+        g_active_fwd = NULL;
 }
 
 void forwarder_stop(void)
