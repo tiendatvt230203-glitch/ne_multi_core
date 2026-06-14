@@ -37,21 +37,3 @@ void crypto_apply_from_policy(const struct crypto_policy *cp) {
     }
     packet_crypto_set_policy_id((uint8_t)cp->id);
 }
-
-const struct crypto_policy *crypto_select_policy_for_local(const struct app_config *cfg,
-                                                            int local_idx,
-                                                            uint32_t src_ip,
-                                                            uint32_t dst_ip,
-                                                            uint16_t src_port,
-                                                            uint16_t dst_port,
-                                                            uint8_t protocol) {
-    if (!cfg)
-        return NULL;
-
-    int pi = config_select_profile_for_local(cfg, local_idx);
-    if (pi < 0 || pi >= cfg->profile_count)
-        return NULL;
-
-    return config_select_crypto_policy(
-        (struct app_config *)cfg, pi, src_ip, dst_ip, src_port, dst_port, protocol);
-}

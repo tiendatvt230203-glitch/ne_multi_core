@@ -15,6 +15,14 @@
 
 /* --- config ifname helpers --- */
 
+void profile_iface_xdp_prepare_init(const struct app_config *cfg)
+{
+    if (!cfg)
+        return;
+    interface_ip_xdp_off_config(cfg);
+    interface_reset_redirect_maps();
+}
+
 static int cfg_has_local_ifname(const struct app_config *cfg, const char *ifname)
 {
     if (!cfg || !ifname)

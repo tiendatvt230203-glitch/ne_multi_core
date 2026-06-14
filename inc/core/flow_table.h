@@ -58,11 +58,4 @@ int flow_table_pick_wan_per_packet(const int *allowed_wans,
                                    const int *allowed_weights,
                                    int allowed_count);
 
-void flow_table_gc(struct flow_table *ft);
-
-void flow_table_add_bytes(struct flow_table *ft,
-                          uint32_t src_ip, uint32_t dst_ip,
-                          uint16_t src_port, uint16_t dst_port,
-                          uint8_t protocol, uint32_t extra_bytes);
-
 #endif

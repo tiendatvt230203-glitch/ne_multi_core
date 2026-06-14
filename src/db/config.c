@@ -115,41 +115,122 @@ static int parse_hex_bytes(const char *str, uint8_t *out, int expected_len) {
     return 0;
 }
 
-static const char *profile_name_by_id(const struct app_config *cfg, int profile_id) {
-    if (!cfg)
-        return "?";
-    for (int i = 0; i < cfg->profile_count; i++) {
-        if (cfg->profiles[i].id == profile_id)
-            return cfg->profiles[i].name;
-    }
-    return "?";
-}
-
-static int config_validate_wan_profile_exclusivity(struct app_config *cfg) {
-    int owner[MAX_INTERFACES];
-
-    for (int i = 0; i < MAX_INTERFACES; i++)
-        owner[i] = -1;
-
+static int config_validate_wan_profile_exclusive(struct app_config *cfg)
+{
     for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        for (int wi = 0; wi < p->wan_count; wi++) {
-            int widx = p->wan_indices[wi];
-            if (widx < 0 || widx >= cfg->wan_count)
+        const struct profile_config *pa = &cfg->profiles[pi];
+        for (int wi = 0; wi < pa->wan_count; wi++) {
+            int wan_idx = pa->wan_indices[wi];
+            if (wan_idx < 0 || wan_idx >= cfg->wan_count)
                 continue;
-            if (owner[widx] >= 0 && owner[widx] != p->id) {
-                const char *ifname = cfg->wans[widx].ifname;
-                fprintf(stderr,
-                        "[CONFIG] WAN %s is used by profile %d (%s) and profile %d (%s) — "
-                        "each WAN may belong to only one profile (LAN may be shared)\n",
-                        ifname, owner[widx], profile_name_by_id(cfg, owner[widx]),
-                        p->id, p->name);
-                return -1;
+            if (!cfg->wans[wan_idx].dataplane)
+                continue;
+            for (int pj = pi + 1; pj < cfg->profile_count; pj++) {
+                const struct profile_config *pb = &cfg->profiles[pj];
+                for (int wj = 0; wj < pb->wan_count; wj++) {
+                    if (pb->wan_indices[wj] != wan_idx)
+                        continue;
+                    fprintf(stderr,
+                            "[VALIDATE] WAN %s dataplane already used by profile %d — "
+                            "profile %d cannot add/share it\n",
+                            cfg->wans[wan_idx].ifname, pa->id, pb->id);
+                    return -1;
+                }
             }
-            owner[widx] = p->id;
         }
     }
     return 0;
+}
+
+static int config_profile_uses_policy(const struct app_config *cfg, int profile_idx,
+                                      int policy_idx)
+{
+    if (profile_idx < 0 || profile_idx >= cfg->profile_count)
+        return 0;
+    const struct profile_config *p = &cfg->profiles[profile_idx];
+    for (int i = 0; i < p->policy_count; i++) {
+        if (p->policy_indices[i] == policy_idx)
+            return 1;
+    }
+    return 0;
+}
+
+static void config_log_policy_profile_owners(const struct app_config *cfg, int policy_idx,
+                                             const char *label)
+{
+    int first = 1;
+
+    fprintf(stderr, "%s profile(s):", label);
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        if (!config_profile_uses_policy(cfg, pi, policy_idx))
+            continue;
+        fprintf(stderr, "%s %d", first ? "" : ",", cfg->profiles[pi].id);
+        first = 0;
+    }
+    if (first)
+        fprintf(stderr, " (none)");
+    fprintf(stderr, "\n");
+}
+
+static int config_validate_policy_ids_per_profile(struct app_config *cfg)
+{
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int i = 0; i < p->policy_count; i++) {
+            int pai = p->policy_indices[i];
+            if (pai < 0 || pai >= cfg->policy_count)
+                continue;
+            const struct crypto_policy *a = &cfg->policies[pai];
+            for (int j = i + 1; j < p->policy_count; j++) {
+                int paj = p->policy_indices[j];
+                if (paj < 0 || paj >= cfg->policy_count)
+                    continue;
+                const struct crypto_policy *b = &cfg->policies[paj];
+                if (a->db_id > 0 && a->db_id == b->db_id) {
+                    fprintf(stderr,
+                            "[VALIDATE] profile %d: duplicate policy db_id=%d "
+                            "(pkt_tag %d vs %d in same profile)\n",
+                            p->id, a->db_id, a->id, b->id);
+                    return -1;
+                }
+                if (a->id == b->id) {
+                    fprintf(stderr,
+                            "[VALIDATE] profile %d: duplicate policy pkt_tag=%d "
+                            "(db_id %d vs %d in same profile)\n",
+                            p->id, a->id, a->db_id, b->db_id);
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int config_validate_policy_ids(struct app_config *cfg)
+{
+    for (int i = 0; i < cfg->policy_count; i++) {
+        const struct crypto_policy *a = &cfg->policies[i];
+        for (int j = i + 1; j < cfg->policy_count; j++) {
+            const struct crypto_policy *b = &cfg->policies[j];
+            if (a->db_id > 0 && a->db_id == b->db_id) {
+                fprintf(stderr,
+                        "[VALIDATE] duplicate policy db_id=%d (pkt_tag %d vs %d)\n",
+                        a->db_id, a->id, b->id);
+                config_log_policy_profile_owners(cfg, i, "[VALIDATE] db_id owner");
+                config_log_policy_profile_owners(cfg, j, "[VALIDATE] db_id conflict");
+                return -1;
+            }
+            if (a->id == b->id) {
+                fprintf(stderr,
+                        "[VALIDATE] duplicate policy pkt_tag=%d (db_id %d vs %d)\n",
+                        a->id, a->db_id, b->db_id);
+                config_log_policy_profile_owners(cfg, i, "[VALIDATE] pkt_tag owner");
+                config_log_policy_profile_owners(cfg, j, "[VALIDATE] pkt_tag conflict");
+                return -1;
+            }
+        }
+    }
+    return config_validate_policy_ids_per_profile(cfg);
 }
 
 int config_validate(struct app_config *cfg) {
@@ -235,91 +316,12 @@ int config_validate(struct app_config *cfg) {
         }
     }
 
-    if (config_validate_wan_profile_exclusivity(cfg) != 0)
+    if (config_validate_wan_profile_exclusive(cfg) != 0)
+        return -1;
+    if (config_validate_policy_ids(cfg) != 0)
         return -1;
 
     return 0;
-}
-
-static int profile_uses_local_idx(const struct profile_config *p, int local_idx)
-{
-    for (int i = 0; i < p->local_count; i++) {
-        if (p->local_indices[i] == local_idx)
-            return 1;
-    }
-    return 0;
-}
-
-void config_warn_multi_profile_conflicts(const struct app_config *cfg)
-{
-    if (!cfg || cfg->profile_count < 2)
-        return;
-
-    for (int li = 0; li < cfg->local_count; li++) {
-        int owners[MAX_PROFILES];
-        int owner_count = 0;
-
-        for (int pi = 0; pi < cfg->profile_count; pi++) {
-            if (!profile_uses_local_idx(&cfg->profiles[pi], li))
-                continue;
-            if (owner_count >= MAX_PROFILES)
-                break;
-            owners[owner_count++] = pi;
-        }
-        if (owner_count < 2)
-            continue;
-
-        fprintf(stderr, "[CONFIG][WARN] LAN %s shared by %d profiles:",
-                cfg->locals[li].ifname, owner_count);
-        for (int k = 0; k < owner_count; k++) {
-            const struct profile_config *p = &cfg->profiles[owners[k]];
-            fprintf(stderr, " %d (%s)", p->id, p->name);
-        }
-        fprintf(stderr, "\n");
-    }
-
-    for (int action = POLICY_ACTION_ENCRYPT_L2; action <= POLICY_ACTION_ENCRYPT_L4; action++) {
-        for (int wid = 1; wid <= 255; wid++) {
-            int hit_profiles[MAX_PROFILES];
-            int hit_db_ids[MAX_PROFILES];
-            int hit_count = 0;
-
-            for (int pi = 0; pi < cfg->profile_count; pi++) {
-                const struct profile_config *p = &cfg->profiles[pi];
-                int matched = 0;
-
-                for (int j = 0; j < p->policy_count; j++) {
-                    int pidx = p->policy_indices[j];
-                    if (pidx < 0 || pidx >= cfg->policy_count)
-                        continue;
-                    const struct crypto_policy *cp = &cfg->policies[pidx];
-                    if (cp->action != action || cp->id != wid)
-                        continue;
-                    if (hit_count >= MAX_PROFILES)
-                        break;
-                    hit_profiles[hit_count] = pi;
-                    hit_db_ids[hit_count] = cp->db_id;
-                    hit_count++;
-                    matched = 1;
-                    break;
-                }
-                (void)matched;
-            }
-            if (hit_count < 2)
-                continue;
-
-            fprintf(stderr,
-                    "[CONFIG][WARN] policy wire id collision action=%d wire_id=%d:",
-                    action, wid);
-            for (int k = 0; k < hit_count; k++) {
-                const struct profile_config *p = &cfg->profiles[hit_profiles[k]];
-                fprintf(stderr, " profile %d (%s) ne_policies.id=%d;",
-                        p->id, p->name, hit_db_ids[k]);
-            }
-            fprintf(stderr,
-                    " traffic for this wire id may bind to one profile only at runtime\n");
-        }
-    }
 }
 
 int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip) {
@@ -354,68 +356,6 @@ int config_select_profile_for_local(const struct app_config *cfg, int local_idx)
         }
     }
     return -1;
-}
-
-static uint32_t flow_hash_u32(uint32_t src_ip, uint32_t dst_ip,
-                              uint16_t src_port, uint16_t dst_port, uint8_t protocol) {
-    uint32_t h = src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ dst_port ^ protocol;
-    h ^= h >> 16;
-    h *= 0x7feb352dU;
-    h ^= h >> 15;
-    h *= 0x846ca68bU;
-    h ^= h >> 16;
-    return h;
-}
-
-int config_select_wan_for_profile(struct app_config *cfg, int profile_idx,
-                                  uint32_t src_ip, uint32_t dst_ip,
-                                  uint16_t src_port, uint16_t dst_port,
-                                  uint8_t protocol) {
-    if (!cfg)
-        return -1;
-    if (profile_idx < 0 || profile_idx >= cfg->profile_count)
-        return -1;
-
-    struct profile_config *p = &cfg->profiles[profile_idx];
-    if (p->wan_count <= 0)
-        return -1;
-
-    uint32_t h = flow_hash_u32(src_ip, dst_ip, src_port, dst_port, protocol);
-
-    int sumw = 0;
-    for (int i = 0; i < p->wan_count; i++) {
-        int w = p->wan_bandwidth_weight[i];
-        if (w > 0)
-            sumw += w;
-    }
-
-    if (sumw <= 0) {
-        int slot = (int)(h % (uint32_t)p->wan_count);
-        int wan_idx = p->wan_indices[slot];
-        if (wan_idx < 0 || wan_idx >= cfg->wan_count)
-            return -1;
-        return wan_idx;
-    }
-
-    uint32_t r = h % (uint32_t)sumw;
-    int acc = 0;
-    for (int i = 0; i < p->wan_count; i++) {
-        int w = p->wan_bandwidth_weight[i];
-        if (w <= 0)
-            continue;
-        acc += w;
-        if (r < (uint32_t)acc) {
-            int wan_idx = p->wan_indices[i];
-            if (wan_idx < 0 || wan_idx >= cfg->wan_count)
-                return -1;
-            return wan_idx;
-        }
-    }
-
-    int wan_idx = p->wan_indices[p->wan_count - 1];
-    if (wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return -1;
-    return wan_idx;
 }
 
 static int crypto_policy_match_packet(const struct crypto_policy *cp,

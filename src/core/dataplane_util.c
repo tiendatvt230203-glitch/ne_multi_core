@@ -49,3 +49,53 @@ uint32_t dp_dest_ipv4(void *pkt, uint32_t len)
         return 0;
     return dst;
 }
+
+int dp_write_l2_src_only(uint8_t *pkt, uint32_t len, const uint8_t src[MAC_LEN])
+{
+    static const uint8_t zero[MAC_LEN];
+
+    if (!pkt || len < sizeof(struct ether_header))
+        return -1;
+    if (memcmp(src, zero, MAC_LEN) == 0)
+        return -1;
+    memcpy(pkt + MAC_LEN, src, MAC_LEN);
+    return 0;
+}
+
+int dp_write_l2(uint8_t *pkt, uint32_t len,
+                const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN],
+                int allow_empty_src)
+{
+    static const uint8_t zero[MAC_LEN];
+
+    if (!pkt || len < sizeof(struct ether_header))
+        return -1;
+    if (memcmp(dst, zero, MAC_LEN) == 0)
+        return -1;
+    if (!allow_empty_src && memcmp(src, zero, MAC_LEN) == 0)
+        return -1;
+    memcpy(pkt, dst, MAC_LEN);
+    memcpy(pkt + MAC_LEN, src, MAC_LEN);
+    return 0;
+}
+
+int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
+                    const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN])
+{
+    static const uint8_t zero[MAC_LEN];
+
+    if (!pkt || len < sizeof(struct ether_header))
+        return -1;
+    if (memcmp(dst, zero, MAC_LEN) == 0 || memcmp(src, zero, MAC_LEN) == 0)
+        return 0;
+    return dp_write_l2(pkt, len, dst, src, 0);
+}
+
+int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
+{
+    if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(ring, pkt) != 0) {
+        ne_frame_free(&fwd->pair, pkt->addr);
+        return -1;
+    }
+    return 0;
+}

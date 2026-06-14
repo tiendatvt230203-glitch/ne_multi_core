@@ -15,6 +15,7 @@
 #include "db_env.h"
 #include "db_runtime.h"
 #include "forwarder.h"
+#include "forwarder_reload.h"
 #include "interface.h"
 #include "main_diag.h"
 #include "profile_iface_xdp.h"
@@ -147,22 +148,6 @@ static int active_ids_remove(int *active_ids, int *active_id_count, int id) {
     }
     *active_id_count = w;
     return removed;
-}
-
-/* Drop profiles still in memory but deleted from Postgres (avoids merge failure on reload). */
-static void active_ids_prune_missing_from_db(int *active_ids, int *active_id_count) {
-    int w = 0;
-
-    for (int i = 0; i < *active_id_count; i++) {
-        int id = active_ids[i];
-        if (ne_profile_id_exists(id) == 0) {
-            active_ids[w++] = id;
-            continue;
-        }
-        fprintf(stderr,
-                "[DB] profile %d dropped from active set (deleted from Postgres)\n", id);
-    }
-    *active_id_count = w;
 }
 
 static int libbpf_print_silent(enum libbpf_print_level level,
@@ -519,59 +504,14 @@ static int runtime_tuning_only_change(const struct app_config *old,
     return profiles_fully_unchanged(old, new);
 }
 
-static int try_profile_iface_xdp_reload(struct runtime_state *rt, int next_slot, int trigger_id,
-                                        const struct app_config *prev_cfg,
-                                        enum profile_iface_xdp_reload_mode mode,
-                                        const char *tag)
-{
-    int rc = -1;
-
-    (void)prev_cfg;
-    switch (mode) {
-    case PROFILE_IFACE_XDP_REMOVE:
-        rc = profile_iface_xdp_apply_remove(&rt->fwd, &rt->cfg_slots[next_slot]);
-        break;
-    case PROFILE_IFACE_XDP_ADD:
-        rc = profile_iface_xdp_apply_add(&rt->fwd, &rt->cfg_slots[next_slot]);
-        break;
-    case PROFILE_IFACE_XDP_DELTA:
-        rc = profile_iface_xdp_apply_delta(&rt->fwd, &rt->cfg_slots[next_slot]);
-        break;
-    default:
-        return -1;
-    }
-    if (rc != 0)
-        return -1;
-
-    rt->active_slot = next_slot;
-    fprintf(stderr, "[RELOAD] OK profile %d — applied (%s)\n", trigger_id, tag);
-    main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
-    fflush(stderr);
-    return 0;
-}
-
-static int apply_active_configs(struct runtime_state *rt, int *active_ids,
-                                int *active_id_count, int trigger_id) {
-    active_ids_prune_missing_from_db(active_ids, active_id_count);
-    if (*active_id_count == 0) {
-        if (rt->has_thread)
-            return runtime_stop_forwarder(rt);
-        fprintf(stderr, "[ERR] profile %d: no active profiles to load\n", trigger_id);
-        return -1;
-    }
-
-    fprintf(stderr, "[LOAD] merging Postgres profiles:");
-    for (int i = 0; i < *active_id_count; i++)
-        fprintf(stderr, " %d", active_ids[i]);
-    fprintf(stderr, " (triggered by notify %d)\n", trigger_id);
-    fflush(stderr);
-
+static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
+                                int active_id_count, int trigger_id) {
     struct app_config *merged_cfg = calloc(1, sizeof(*merged_cfg));
     if (!merged_cfg) {
         fprintf(stderr, "[FATAL] out of memory building merged config\n");
         return -1;
     }
-    if (build_merged_config(merged_cfg, active_ids, *active_id_count, NULL) != 0) {
+    if (build_merged_config(merged_cfg, active_ids, active_id_count, NULL) != 0) {
         fprintf(stderr,
                 "[ERR] profile %d: failed to load config from Postgres (see [DB] lines above)\n",
                 trigger_id);
@@ -581,7 +521,7 @@ static int apply_active_configs(struct runtime_state *rt, int *active_ids,
 
     if (!rt->has_thread) {
         fprintf(stderr, "[LOAD] active:");
-        for (int i = 0; i < *active_id_count; i++)
+        for (int i = 0; i < active_id_count; i++)
             fprintf(stderr, " %d", active_ids[i]);
         fprintf(stderr, "\n");
         main_diag_log_db_apply(merged_cfg, trigger_id, NULL);
@@ -603,7 +543,7 @@ static int apply_active_configs(struct runtime_state *rt, int *active_ids,
         fflush(stderr);
         usleep(500000);
         if (build_merged_config(&rt->cfg_slots[next_slot], active_ids,
-                                *active_id_count, NULL) != 0) {
+                                active_id_count, NULL) != 0) {
             fprintf(stderr,
                     "[ERR] profile %d: DB reload retry failed (see [DB] lines above)\n",
                     trigger_id);
@@ -627,12 +567,61 @@ static int apply_active_configs(struct runtime_state *rt, int *active_ids,
         main_diag_log_db_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
 
     if (!topo_ok) {
-        if (forwarder_is_wan_only_removal(prev_cfg, &rt->cfg_slots[next_slot])) {
+        struct app_config *new_cfg = &rt->cfg_slots[next_slot];
+        if (profile_iface_xdp_can_delta(prev_cfg, new_cfg)) {
+            fprintf(stderr,
+                    "[RELOAD] profile %d — incremental LAN/WAN delta\n",
+                    trigger_id);
+            fflush(stderr);
+            if (profile_iface_xdp_apply_delta(&rt->fwd, new_cfg) == 0) {
+                rt->active_slot = next_slot;
+                fprintf(stderr, "[RELOAD] OK profile %d — applied (incremental delta)\n",
+                        trigger_id);
+                main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id,
+                                             1, 0);
+                fflush(stderr);
+                return 0;
+            }
+            fprintf(stderr, "[RELOAD] incremental delta failed; full dataplane restart\n");
+            fflush(stderr);
+        } else if (profile_iface_xdp_can_add(prev_cfg, new_cfg)) {
+            fprintf(stderr,
+                    "[RELOAD] profile %d — incremental LAN/WAN attach\n",
+                    trigger_id);
+            fflush(stderr);
+            if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg) == 0) {
+                rt->active_slot = next_slot;
+                fprintf(stderr, "[RELOAD] OK profile %d — applied (incremental attach)\n",
+                        trigger_id);
+                main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id,
+                                             1, 0);
+                fflush(stderr);
+                return 0;
+            }
+            fprintf(stderr, "[RELOAD] incremental attach failed; full dataplane restart\n");
+            fflush(stderr);
+        } else if (profile_iface_xdp_can_remove(prev_cfg, new_cfg)) {
+            fprintf(stderr,
+                    "[RELOAD] profile %d — incremental LAN/WAN detach\n",
+                    trigger_id);
+            fflush(stderr);
+            if (profile_iface_xdp_apply_remove(&rt->fwd, new_cfg) == 0) {
+                rt->active_slot = next_slot;
+                fprintf(stderr, "[RELOAD] OK profile %d — applied (incremental detach)\n",
+                        trigger_id);
+                main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id,
+                                             1, 0);
+                fflush(stderr);
+                return 0;
+            }
+            fprintf(stderr, "[RELOAD] incremental detach failed; full dataplane restart\n");
+            fflush(stderr);
+        } else if (forwarder_is_wan_only_removal(prev_cfg, new_cfg)) {
             fprintf(stderr,
                     "[RELOAD] profile %d — WAN removed, drain %.1fs then detach (no hard cut)\n",
                     trigger_id, (double)FORWARDER_WAN_DRAIN_SEC);
             fflush(stderr);
-            if (forwarder_reload_wan_removal(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
+            if (forwarder_reload_wan_removal(&rt->fwd, new_cfg) == 0) {
                 rt->active_slot = next_slot;
                 fprintf(stderr, "[RELOAD] OK profile %d — applied (WAN drain reload)\n",
                         trigger_id);
@@ -644,45 +633,9 @@ static int apply_active_configs(struct runtime_state *rt, int *active_ids,
             fprintf(stderr,
                     "[RELOAD] WAN drain reload failed; full dataplane restart\n");
             fflush(stderr);
-        } else if (profile_iface_xdp_can_delta(prev_cfg, &rt->cfg_slots[next_slot])) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — iface add/remove (hot profile-xdp delta)\n",
-                    trigger_id);
-            fflush(stderr);
-            if (try_profile_iface_xdp_reload(rt, next_slot, trigger_id, prev_cfg,
-                                             PROFILE_IFACE_XDP_DELTA,
-                                             "profile-xdp delta") == 0)
-                return 0;
-            fprintf(stderr,
-                    "[RELOAD] profile-xdp delta failed; full dataplane restart\n");
-            fflush(stderr);
-        } else if (profile_iface_xdp_can_remove(prev_cfg, &rt->cfg_slots[next_slot])) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — iface removal (hot profile-xdp remove)\n",
-                    trigger_id);
-            fflush(stderr);
-            if (try_profile_iface_xdp_reload(rt, next_slot, trigger_id, prev_cfg,
-                                             PROFILE_IFACE_XDP_REMOVE,
-                                             "profile-xdp remove") == 0)
-                return 0;
-            fprintf(stderr,
-                    "[RELOAD] profile-xdp remove failed; full dataplane restart\n");
-            fflush(stderr);
-        } else if (profile_iface_xdp_can_add(prev_cfg, &rt->cfg_slots[next_slot])) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — iface addition (hot profile-xdp add)\n",
-                    trigger_id);
-            fflush(stderr);
-            if (try_profile_iface_xdp_reload(rt, next_slot, trigger_id, prev_cfg,
-                                             PROFILE_IFACE_XDP_ADD,
-                                             "profile-xdp add") == 0)
-                return 0;
-            fprintf(stderr,
-                    "[RELOAD] profile-xdp add failed; full dataplane restart\n");
-            fflush(stderr);
         } else {
             fprintf(stderr,
-                    "[RELOAD] profile %d — LAN/WAN topology changed (add/remove interface) — full dataplane restart\n",
+                    "[RELOAD] profile %d — LAN/WAN topology changed — full dataplane restart\n",
                     trigger_id);
             fflush(stderr);
         }
@@ -746,7 +699,7 @@ static int apply_active_configs(struct runtime_state *rt, int *active_ids,
         rt->active_slot = next_slot;
         fprintf(stderr, "[RELOAD] OK profile %d — applied (hot reload)\n", trigger_id);
         fprintf(stderr, "[RELOAD] active:");
-        for (int i = 0; i < *active_id_count; i++)
+        for (int i = 0; i < active_id_count; i++)
             fprintf(stderr, " %d", active_ids[i]);
         fprintf(stderr, "\n");
         main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 1);
@@ -812,7 +765,7 @@ static int load_profile_and_run(struct runtime_state *rt,
     if (added < 0)
         return -1;
     /* Even if profile is already active, force rebuild to apply DB updates. */
-    if (apply_active_configs(rt, active_ids, active_id_count, profile_id) != 0) {
+    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
         if (added == 1)
             active_ids_remove(active_ids, active_id_count, profile_id);
         return -1;
@@ -846,7 +799,7 @@ static int handle_profile_notify(struct runtime_state *rt,
     if (*active_id_count == 0)
         return runtime_stop_forwarder(rt);
 
-    if (apply_active_configs(rt, active_ids, active_id_count, profile_id) != 0) {
+    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
         fprintf(stderr, "[ERR] profile %d: unload reload failed\n", profile_id);
         return -1;
     }

@@ -379,94 +379,6 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     return wan_idx;
 }
 
-void flow_table_add_bytes(struct flow_table *ft,
-                          uint32_t src_ip, uint32_t dst_ip,
-                          uint16_t src_port, uint16_t dst_port,
-                          uint8_t protocol, uint32_t extra_bytes) {
-    normalize_flow_5tuple(&src_ip, &dst_ip, &src_port, &dst_port);
-
-    uint32_t idx_exact = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
-    uint32_t idx_ip = flow_hash_ips(src_ip, dst_ip);
-
-    if (idx_exact == idx_ip) {
-        pthread_mutex_lock(&ft->locks[idx_exact]);
-        struct flow_entry *entry = ft->buckets[idx_exact];
-        while (entry) {
-            if (entry->ip_only_key) {
-                if (entry->key.src_ip == src_ip && entry->key.dst_ip == dst_ip) {
-                    entry->byte_count += extra_bytes;
-                }
-            } else {
-                if (entry->key.src_ip == src_ip &&
-                    entry->key.dst_ip == dst_ip &&
-                    entry->key.src_port == src_port &&
-                    entry->key.dst_port == dst_port &&
-                    entry->key.protocol == protocol) {
-                    entry->byte_count += extra_bytes;
-
-                    if (!entry->profile_wan_pool) {
-                        uint32_t cur_limit = 0;
-                        if (entry->current_wan >= 0 && entry->current_wan < ft->wan_count)
-                            cur_limit = ft->wan_window_sizes[entry->current_wan];
-
-                        if (cur_limit > 0 && entry->byte_count >= cur_limit) {
-                            entry->byte_count = 0;
-                            entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
-                        }
-                    }
-                    break;
-                }
-            }
-            entry = entry->next;
-        }
-        pthread_mutex_unlock(&ft->locks[idx_exact]);
-        return;
-    }
-
-
-    pthread_mutex_lock(&ft->locks[idx_exact]);
-    struct flow_entry *entry = ft->buckets[idx_exact];
-    while (entry) {
-        if (!entry->ip_only_key &&
-            entry->key.src_ip == src_ip &&
-            entry->key.dst_ip == dst_ip &&
-            entry->key.src_port == src_port &&
-            entry->key.dst_port == dst_port &&
-            entry->key.protocol == protocol) {
-
-            entry->byte_count += extra_bytes;
-
-            if (!entry->profile_wan_pool) {
-                uint32_t cur_limit = 0;
-                if (entry->current_wan >= 0 && entry->current_wan < ft->wan_count)
-                    cur_limit = ft->wan_window_sizes[entry->current_wan];
-
-                if (cur_limit > 0 && entry->byte_count >= cur_limit) {
-                    entry->byte_count = 0;
-                    entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
-                }
-            }
-            break;
-        }
-        entry = entry->next;
-    }
-    pthread_mutex_unlock(&ft->locks[idx_exact]);
-
-
-    pthread_mutex_lock(&ft->locks[idx_ip]);
-    entry = ft->buckets[idx_ip];
-    while (entry) {
-        if (entry->ip_only_key &&
-            entry->key.src_ip == src_ip &&
-            entry->key.dst_ip == dst_ip) {
-            entry->byte_count += extra_bytes;
-            break;
-        }
-        entry = entry->next;
-    }
-    pthread_mutex_unlock(&ft->locks[idx_ip]);
-}
-
 void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets)
 {
     uint64_t now;
@@ -495,11 +407,4 @@ void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets)
         pthread_mutex_unlock(&ft->locks[i]);
     }
     *bucket_cursor = (start + buckets) % FLOW_TABLE_SIZE;
-}
-
-void flow_table_gc(struct flow_table *ft)
-{
-    int cursor = 0;
-
-    flow_table_gc_slice(ft, &cursor, FLOW_TABLE_SIZE);
 }

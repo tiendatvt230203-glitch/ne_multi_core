@@ -10,7 +10,7 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-static __thread uint8_t tls_l2_worker_core_id;
+static __thread uint8_t tls_l2_worker_core_id = NE_CPU_MID1;
 
 static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
@@ -20,9 +20,9 @@ static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
     return et == fake;
 }
 
-void crypto_layer2_bind_worker_core(uint8_t worker_idx)
+void crypto_layer2_bind_worker_core(uint8_t cpu_core_id)
 {
-    tls_l2_worker_core_id = worker_idx;
+    tls_l2_worker_core_id = cpu_core_id;
 }
 
 uint8_t crypto_layer2_worker_core_id(void)
@@ -233,7 +233,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     uint8_t *work_ptr = packet + l2_enc_start;
 
-    if (likely(is_gcm)) {   
+    if (likely(is_gcm)) {
         if (unlikely(crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) != 0))
             return -1;
     } else {

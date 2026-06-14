@@ -15,7 +15,7 @@
 #define CRYPTO_L2_CORE_ID_LEN    1
 #define CRYPTO_L2_NONCE_OFF      (CRYPTO_L2_CORE_ID_OFF + CRYPTO_L2_CORE_ID_LEN)
 
-void crypto_layer2_bind_worker_core(uint8_t worker_idx);
+void crypto_layer2_bind_worker_core(uint8_t cpu_core_id);
 uint8_t crypto_layer2_worker_core_id(void);
 
 int crypto_layer2_read_core_id(const uint8_t *packet, uint32_t pkt_len, uint8_t *core_id_out);

@@ -5,8 +5,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#include "ne_flow_hash.h"
-
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __uint(max_entries, 64);
@@ -26,7 +24,6 @@ struct {
 #define IPPROTO_UDP_VAL 17
 #define IPPROTO_OSPF_VAL 89
 #define IPPROTO_CUSTOM_VAL 99
-#define CRYPTO_L2_CORE_ID_OFF 15
 
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
@@ -40,23 +37,19 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 
     __u16 proto = eth->h_proto;
 
-    if (proto == __constant_htons(ETH_P_ARP))
+    if (proto == __constant_htons(ETH_P_ARP)) {
         return XDP_PASS;
+    }
 
     if (proto == __constant_htons(ETH_P_IP)) {
         struct iphdr *ip = (void *)(eth + 1);
-        int worker;
-
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 
         if (ip->protocol == IPPROTO_ICMP_VAL || ip->protocol == IPPROTO_TCP_VAL ||
             ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_OSPF_VAL ||
             ip->protocol == IPPROTO_CUSTOM_VAL) {
-            worker = ne_ipv4_flow_worker(ip, data_end);
-            if (worker >= 0 && worker < NE_CRYPTO_WORKERS_BPF)
-                return bpf_redirect_map(&wan_xsks_map, worker, 0);
-            return bpf_redirect_map(&wan_xsks_map, ctx->rx_queue_index, 0);
+            goto redirect;
         }
 
         return XDP_PASS;
@@ -64,18 +57,15 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 
     int key0 = 0;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
-    if (fake4 && *fake4 != 0 && proto == bpf_htons(*fake4)) {
-        /* L2 crypto: redirect by wire core_id (byte 15). */
-        __u8 *p = (__u8 *)eth;
-        if (p + CRYPTO_L2_CORE_ID_OFF + 1 > (__u8 *)data_end)
-            return XDP_PASS;
-        __u32 wkey = p[CRYPTO_L2_CORE_ID_OFF];
-        if (wkey >= NE_CRYPTO_WORKERS_BPF)
-            return XDP_PASS;
-        return bpf_redirect_map(&wan_xsks_map, wkey, 0);
-    }
+    if (fake4 && *fake4 != 0 && proto == bpf_htons(*fake4))
+        goto redirect;
 
     return XDP_PASS;
+
+redirect:
+    ;
+    __u32 qid = ctx->rx_queue_index;
+    return bpf_redirect_map(&wan_xsks_map, qid, 0);
 }
 
 char _license[] SEC("license") = "GPL";

@@ -110,11 +110,6 @@ struct wan_config {
     int dataplane; /* 0 = có dst_ip (peer IP), chỉ PQC handshake; 1 = L2 traffic (enp7/enp8) */
 };
 
-static inline int wan_is_handshake_only(const struct wan_config *w)
-{
-    return w && w->dst_ip != 0;
-}
-
 struct app_config {
     uint32_t global_frame_size;
     uint32_t global_batch_size;
@@ -185,12 +180,7 @@ int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
 int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip);
 int config_validate(struct app_config *cfg);
-void config_warn_multi_profile_conflicts(const struct app_config *cfg);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
-int config_select_wan_for_profile(struct app_config *cfg, int profile_idx,
-                                  uint32_t src_ip, uint32_t dst_ip,
-                                  uint16_t src_port, uint16_t dst_port,
-                                  uint8_t protocol);
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
