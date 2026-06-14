@@ -9,7 +9,6 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
-#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -96,27 +95,6 @@ int interface_set_queue_count(const char *ifname, int desired_count)
         return 0;
 
     return -1;
-}
-
-int interface_link_is_up(const char *ifname)
-{
-    struct ifreq ifr;
-    int fd;
-
-    if (!ifname || !ifname[0])
-        return 0;
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return 0;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
-    if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
-        close(fd);
-        return 0;
-    }
-    close(fd);
-    return (ifr.ifr_flags & IFF_UP) != 0;
 }
 
 static int interface_set_promisc(const char *ifname)

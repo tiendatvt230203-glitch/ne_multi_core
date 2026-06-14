@@ -12,7 +12,6 @@
 #include <net/if.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 /* --- config ifname helpers --- */
 
@@ -240,109 +239,20 @@ int profile_iface_xdp_is_add_only(const struct app_config *old, const struct app
 
 /* --- BPF / XDP bind --- */
 
-static int read_xdp_prog_id_ip_link(const char *ifname, uint32_t *out_id)
+static int profile_iface_ifindex(const char *ifname, const char *role)
 {
-    char cmd[160];
-    FILE *f;
-    char line[512];
+    unsigned int idx;
 
-    snprintf(cmd, sizeof(cmd), "ip -o link show dev %s 2>/dev/null", ifname);
-    f = popen(cmd, "r");
-    if (!f)
-        return -1;
-    while (fgets(line, sizeof(line), f)) {
-        const char *tag = strstr(line, "xdp/id:");
-        if (!tag)
-            continue;
-        unsigned int id = 0;
-        if (sscanf(tag + 7, "%u", &id) == 1 && id > 0) {
-            *out_id = (uint32_t)id;
-            pclose(f);
-            return 0;
-        }
-    }
-    pclose(f);
-    return -1;
-}
-
-static int read_xdp_prog_id_sysfs(const char *ifname, const char *suffix, uint32_t *out_id)
-{
-    char path[128];
-    FILE *f;
-
-    snprintf(path, sizeof(path), "/sys/class/net/%s/%s", ifname, suffix);
-    f = fopen(path, "r");
-    if (!f)
-        return -1;
-    if (fscanf(f, "%u", out_id) != 1 || *out_id == 0) {
-        fclose(f);
+    if (!ifname || !ifname[0]) {
+        fprintf(stderr, "[PROFILE-XDP] %s: missing interface name\n", role);
         return -1;
     }
-    fclose(f);
-    return 0;
-}
-
-static int read_xdp_prog_id_ifindex(int ifindex, uint32_t xdp_flags, uint32_t *out_id)
-{
-    char ifname[IF_NAMESIZE];
-
-    (void)xdp_flags;
-    if (ifindex <= 0 || !out_id)
+    idx = if_nametoindex(ifname);
+    if (idx == 0) {
+        fprintf(stderr, "[PROFILE-XDP] %s %s: interface not found\n", role, ifname);
         return -1;
-    if (!if_indextoname((unsigned int)ifindex, ifname))
-        return -1;
-    if (read_xdp_prog_id_sysfs(ifname, "xdp/prog_id", out_id) == 0)
-        return 0;
-    if (read_xdp_prog_id_sysfs(ifname, "xdp_id", out_id) == 0)
-        return 0;
-    return read_xdp_prog_id_ip_link(ifname, out_id);
-}
-
-static int read_xdp_prog_id(const char *ifname, uint32_t xdp_flags, uint32_t *out_id)
-{
-    (void)xdp_flags;
-    if (!ifname || !out_id)
-        return -1;
-    if (read_xdp_prog_id_sysfs(ifname, "xdp/prog_id", out_id) == 0)
-        return 0;
-    if (read_xdp_prog_id_sysfs(ifname, "xdp_id", out_id) == 0)
-        return 0;
-    return read_xdp_prog_id_ip_link(ifname, out_id);
-}
-
-static int lan_iface_has_kernel_xdp(const char *ifname, uint32_t xdp_flags, uint32_t *prog_id_out)
-{
-    uint32_t prog_id = 0;
-
-    if (!ifname)
-        return 0;
-    if (read_xdp_prog_id(ifname, xdp_flags, &prog_id) != 0)
-        return 0;
-    if (prog_id_out)
-        *prog_id_out = prog_id;
-    return 1;
-}
-
-static int validate_xdp_attached(int ifindex, uint32_t xdp_flags,
-                                 const char *ifname, const char *role)
-{
-    uint32_t prog_id = 0;
-
-    for (int attempt = 0; attempt < 20; attempt++) {
-        if (read_xdp_prog_id_ifindex(ifindex, xdp_flags, &prog_id) == 0) {
-            fprintf(stderr, "[PROFILE-XDP] validate OK %s %s prog_id=%u (xdp/id:%u)\n",
-                    role, ifname, prog_id, prog_id);
-            fflush(stderr);
-            return 0;
-        }
-        usleep(50000);
     }
-    fprintf(stderr,
-            "[PROFILE-XDP] validate FAIL %s %s: no prog_id"
-            " (interface down or XDP attach did not stick)\n",
-            role, ifname);
-    fflush(stderr);
-    return -1;
+    return (int)idx;
 }
 
 static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
@@ -356,7 +266,9 @@ static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
         fflush(stderr);
         return -1;
     }
-    return validate_xdp_attached(ifindex, flags, ifname, role);
+    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s\n", role, ifname);
+    fflush(stderr);
+    return 0;
 }
 
 static int open_bpf_object(const char *path, struct bpf_object **obj_out,
@@ -424,37 +336,22 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     struct bpf_program *prog = NULL;
     struct bpf_map *map = NULL;
     const char *ifname;
-    uint32_t existing_id = 0;
-    int skip_attach;
 
     if (!p || !cfg || pair_li < 0 || pair_li >= p->local_count)
         return -1;
 
     ifname = p->locals[pair_li].ifname;
-    if (!interface_link_is_up(ifname)) {
-        fprintf(stderr,
-                "[PROFILE-XDP] LAN %s is DOWN — bring link up before attach\n",
-                ifname);
+    if (profile_iface_ifindex(ifname, "LAN") < 0)
         return -1;
-    }
-    skip_attach = lan_iface_has_kernel_xdp(ifname, p->xdp_flags, &existing_id);
 
-    if (skip_attach && p->bpf_locals[pair_li]) {
+    if (p->bpf_locals[pair_li] && p->xdp_local_on[pair_li]) {
         map = bpf_object__find_map_by_name(p->bpf_locals[pair_li], "xsks_map");
         if (!map)
             return -1;
         fprintf(stderr,
-                "[PROFILE-XDP] LAN %s xdp/id:%u — skip attach, refresh xsks_map (shared)\n",
-                ifname, existing_id);
+                "[PROFILE-XDP] LAN %s — refresh xsks_map (shared, no re-attach)\n",
+                ifname);
         return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
-    }
-
-    if (skip_attach) {
-        fprintf(stderr,
-                "[PROFILE-XDP] LAN %s stale xdp/id:%u — detach and re-attach\n",
-                ifname, existing_id);
-        interface_ip_xdp_off(ifname);
-        skip_attach = 0;
     }
 
     if (open_bpf_object(cfg->bpf_file, &p->bpf_locals[pair_li],
@@ -467,6 +364,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         p->bpf_locals[pair_li] = NULL;
         return -1;
     }
+    p->xdp_local_on[pair_li] = 1;
     return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
 }
 
@@ -478,12 +376,8 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
 
     if (!p || !cfg || dp_slot < 0 || dp_slot >= p->wan_count)
         return -1;
-    if (!interface_link_is_up(p->wans[dp_slot].ifname)) {
-        fprintf(stderr,
-                "[PROFILE-XDP] WAN %s is DOWN — bring link up before attach\n",
-                p->wans[dp_slot].ifname);
+    if (profile_iface_ifindex(p->wans[dp_slot].ifname, "WAN") < 0)
         return -1;
-    }
     if (open_bpf_object(cfg->bpf_wan_file, &p->bpf_wans[dp_slot],
                         "xdp_wan_redirect_prog", &prog, "wan_xsks_map", &map) != 0)
         return -1;
@@ -495,6 +389,7 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
         p->bpf_wans[dp_slot] = NULL;
         return -1;
     }
+    p->xdp_wan_on[dp_slot] = 1;
     return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map));
 }
 
@@ -514,7 +409,6 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
             fflush(stderr);
             return -1;
         }
-        p->xdp_local_on[i] = 1;
     }
     for (int di = 0; di < p->wan_count; di++) {
         if (profile_iface_xdp_bind_wan(p, cfg, di, cfg->fake_ethertype_ipv4) != 0) {
@@ -523,7 +417,6 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
             fflush(stderr);
             return -1;
         }
-        p->xdp_wan_on[di] = 1;
     }
     return 0;
 }
@@ -671,7 +564,6 @@ static int attach_new_lan_rows(struct forwarder *fwd, const struct app_config *n
             ne_pair_unplumb_local(&fwd->pair, li);
             return -1;
         }
-        fwd->pair.xdp_local_on[li] = 1;
         init_fwd_local_meta(fwd, li, new_cfg, ci);
         fwd->local_count++;
         fprintf(stderr, "[PROFILE-XDP] LAN %s first use — attach xdp/id (slot %d)\n",

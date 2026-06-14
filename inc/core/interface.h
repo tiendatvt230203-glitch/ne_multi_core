@@ -198,6 +198,5 @@ void interface_ip_xdp_off_config(const struct app_config *cfg);
 void interface_promisc_off_config(const struct app_config *cfg);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
-int interface_link_is_up(const char *ifname);
 
 #endif
