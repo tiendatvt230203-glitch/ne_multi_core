@@ -277,9 +277,14 @@ void forwarder_cleanup(struct forwarder *fwd)
 
 static void forwarder_join_workers(struct forwarder *fwd, int started)
 {
-    atomic_store_explicit(&running, 0, memory_order_release);
     for (int w = 0; w < started; w++)
         pthread_join(fwd->worker_threads[w], NULL);
+}
+
+static void forwarder_abort_workers(struct forwarder *fwd, int started)
+{
+    atomic_store_explicit(&running, 0, memory_order_release);
+    forwarder_join_workers(fwd, started);
 }
 
 void forwarder_run(struct forwarder *fwd)
@@ -296,7 +301,7 @@ void forwarder_run(struct forwarder *fwd)
         ctx[w].fwd = fwd;
         ctx[w].worker_idx = w;
         if (pthread_create(&fwd->worker_threads[w], NULL, unified_worker_thread, &ctx[w]) != 0) {
-            forwarder_join_workers(fwd, started);
+            forwarder_abort_workers(fwd, started);
             return;
         }
         started++;
