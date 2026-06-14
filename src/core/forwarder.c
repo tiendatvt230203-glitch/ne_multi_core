@@ -74,6 +74,7 @@ static void *unified_worker_thread(void *arg)
     struct ne_packet batch[NE_BATCH_SIZE];
     uint32_t gc_tick = 0;
     uint32_t maint_tick = 0;
+    uint64_t idle_loops = 0;
     int w = ctx->worker_idx;
     int is_primary = (w == 0);
 
@@ -104,16 +105,16 @@ static void *unified_worker_thread(void *arg)
         for (int i = 0; i < IO_BURST_ROUNDS; i++)
             ne_refill_fq_worker(&fwd->pair, w);
 
-        int rcvd = ne_recv_local_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
-        for (int i = 0; i < rcvd; i++) {
+        int rcvd_local = ne_recv_local_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
+        for (int i = 0; i < rcvd_local; i++) {
             dataplane_process_local(fwd, batch[i]);
             did_work = 1;
         }
-        if (rcvd > 0)
+        if (rcvd_local > 0)
             ne_recv_release_local_worker(&fwd->pair, w);
 
-        rcvd = ne_recv_wan_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
-        for (int i = 0; i < rcvd; i++) {
+        int rcvd_wan = ne_recv_wan_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
+        for (int i = 0; i < rcvd_wan; i++) {
             if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 continue;
@@ -121,8 +122,38 @@ static void *unified_worker_thread(void *arg)
             dataplane_process_wan(fwd, batch[i]);
             did_work = 1;
         }
-        if (rcvd > 0)
+        if (rcvd_wan > 0)
             ne_recv_release_wan_worker(&fwd->pair, w);
+
+        // #region agent log
+        if (rcvd_local > 0 || rcvd_wan > 0) {
+            FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
+            if (_df) {
+                struct timespec _ts;
+                clock_gettime(CLOCK_REALTIME, &_ts);
+                long _ms = (long)_ts.tv_sec * 1000L + _ts.tv_nsec / 1000000L;
+                fprintf(_df,
+                        "{\"sessionId\":\"250a01\",\"location\":\"forwarder.c:worker_loop\","
+                        "\"message\":\"recv batch\",\"data\":{\"worker\":%d,\"local\":%d,\"wan\":%d},"
+                        "\"timestamp\":%ld,\"hypothesisId\":\"poll\",\"runId\":\"post-fix\"}\n",
+                        w, rcvd_local, rcvd_wan, _ms);
+                fclose(_df);
+            }
+        } else if ((++idle_loops & 0xFFFFFu) == 0) {
+            FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
+            if (_df) {
+                struct timespec _ts;
+                clock_gettime(CLOCK_REALTIME, &_ts);
+                long _ms = (long)_ts.tv_sec * 1000L + _ts.tv_nsec / 1000000L;
+                fprintf(_df,
+                        "{\"sessionId\":\"250a01\",\"location\":\"forwarder.c:worker_loop\","
+                        "\"message\":\"busy poll idle\",\"data\":{\"worker\":%d,\"idle_loops\":%lu},"
+                        "\"timestamp\":%ld,\"hypothesisId\":\"poll\",\"runId\":\"post-fix\"}\n",
+                        w, (unsigned long)idle_loops, _ms);
+                fclose(_df);
+            }
+        }
+        // #endregion
 
         for (int i = 0; i < IO_BURST_ROUNDS; i++)
             ne_drain_cq_worker(&fwd->pair, w);
@@ -131,8 +162,6 @@ static void *unified_worker_thread(void *arg)
             if (pthread_mutex_trylock(&runtime_lock) != 0) {
                 if (!atomic_load_explicit(&running, memory_order_acquire))
                     break;
-                if (!did_work)
-                    sched_yield();
                 continue;
             }
             if (!atomic_load_explicit(&running, memory_order_acquire)) {
@@ -153,8 +182,7 @@ static void *unified_worker_thread(void *arg)
             gc_tick = 0;
         }
 
-        if (!did_work)
-            sched_yield();
+        (void)did_work;
     }
     return NULL;
 }

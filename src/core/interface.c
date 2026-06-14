@@ -13,6 +13,14 @@
 #include <ctype.h>
 #include <dirent.h>
 
+static void kick_xsk_rx(struct ne_xsk_queue *slot)
+{
+    if (!slot || !slot->xsk)
+        return;
+    if (xsk_ring_prod__needs_wakeup(&slot->fq))
+        (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+}
+
 static uint32_t next_pow2_u32(uint32_t v)
 {
     if (v <= 1)
@@ -639,7 +647,10 @@ static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t
                       uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
     uint32_t idx = 0;
-    uint32_t n = xsk_ring_cons__peek(&slot->rx, max, &idx);
+    uint32_t n;
+
+    kick_xsk_rx(slot);
+    n = xsk_ring_cons__peek(&slot->rx, max, &idx);
     for (uint32_t i = 0; i < n; i++) {
         const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + i);
         out[i].addr = d->addr;
@@ -767,6 +778,7 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     for (uint32_t i = 0; i < got; i++)
         *xsk_ring_prod__fill_addr(&slot->fq, idx + i) = addrs[i];
     xsk_ring_prod__submit(&slot->fq, got);
+    kick_xsk_rx(slot);
 }
 
 static void refill_fq_worker_queue(struct ne_pair *p, struct ne_xsk_queue *slot)
@@ -782,12 +794,16 @@ void ne_refill_fq_worker(struct ne_pair *p, int worker_id)
     for (int i = 0; i < p->local_count; i++) {
         if (!p->local_live[i])
             continue;
-        refill_fq_worker_queue(p, worker_queue(&p->locals[i], worker_id));
+        struct ne_xsk_queue *slot = worker_queue(&p->locals[i], worker_id);
+        refill_fq_worker_queue(p, slot);
+        kick_xsk_rx(slot);
     }
     for (int i = 0; i < p->wan_count; i++) {
         if (!p->wan_live[i])
             continue;
-        refill_fq_worker_queue(p, worker_queue(&p->wans[i], worker_id));
+        struct ne_xsk_queue *slot = worker_queue(&p->wans[i], worker_id);
+        refill_fq_worker_queue(p, slot);
+        kick_xsk_rx(slot);
     }
 }
 
