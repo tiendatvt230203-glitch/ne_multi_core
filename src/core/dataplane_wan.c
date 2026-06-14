@@ -405,17 +405,18 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         static _Atomic uint64_t wan_lan_ok;
         uint64_t wo = atomic_fetch_add(&wan_lan_ok, 1);
         if (wo < 20 || (wo & 0xFFu) == 0) {
-            uint32_t dip = ntohl(dp_dest_ipv4(pkt, job.len));
-            uint32_t sip = 0;
+            uint32_t sip = 0, dip = 0;
             uint16_t sp = 0, dport = 0;
             uint8_t proto = 0;
             (void)dp_parse_flow(pkt, job.len, &sip, &dip, &sp, &dport, &proto);
+            dip = ntohl(dip);
+            sip = ntohl(sip);
             fprintf(stderr,
                     "[DP-WAN] worker=%d -> LAN li=%d proto=%u "
                     "src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u len=%u\n",
                     worker, li, (unsigned)proto,
-                    (ntohl(sip) >> 24) & 0xff, (ntohl(sip) >> 16) & 0xff,
-                    (ntohl(sip) >> 8) & 0xff, ntohl(sip) & 0xff, (unsigned)sp,
+                    (sip >> 24) & 0xff, (sip >> 16) & 0xff,
+                    (sip >> 8) & 0xff, sip & 0xff, (unsigned)sp,
                     (dip >> 24) & 0xff, (dip >> 16) & 0xff,
                     (dip >> 8) & 0xff, dip & 0xff, (unsigned)dport, job.len);
         }
