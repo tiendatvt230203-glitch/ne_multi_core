@@ -16,8 +16,23 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
+
+static _Atomic uint64_t dp_wan_drop_affinity;
+static _Atomic uint64_t dp_wan_drop_decrypt;
+static _Atomic uint64_t dp_wan_drop_local;
+static _Atomic uint64_t dp_wan_drop_tx;
+
+static void dp_wan_drop_log(const char *reason, _Atomic uint64_t *ctr, uint32_t len,
+                            uint8_t wire_core, int worker)
+{
+    uint64_t n = atomic_fetch_add(ctr, 1) + 1;
+    if (n <= 10 || (n & 0x3FFu) == 0)
+        fprintf(stderr, "[DP-DROP-WAN] %s worker=%d wire_core=%u len=%u total=%lu\n",
+                reason, worker, (unsigned)wire_core, len, (unsigned long)n);
+}
 
 // #region agent log
 static void dbg_l2_core_log(const char *location, const char *message,
@@ -307,8 +322,10 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         int ok = dp_crypto_l2_affinity_ok(pkt, job.len);
         dbg_l2_core_log("dataplane_wan.c:process_wan", "l2 wan affinity", worker,
                         (int)wire_core, ok, job.len);
-        if (!ok)
+        if (!ok) {
+            dp_wan_drop_log("l2_affinity", &dp_wan_drop_affinity, job.len, wire_core, worker);
             goto drop;
+        }
     }
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
@@ -317,21 +334,47 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             ne_frame_free(&fwd->pair, job.addr);
             return;
         }
-        if (dec != 0)
+        if (dec != 0) {
+            dp_wan_drop_log("decrypt", &dp_wan_drop_decrypt, job.len, wire_core, worker);
             goto drop;
+        }
         pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
     li = pick_local(fwd, pkt, job.len);
-    if (li < 0 || li >= fwd->local_count)
+    if (li < 0 || li >= fwd->local_count) {
+        uint32_t dip = dp_dest_ipv4(pkt, job.len);
+        static _Atomic uint64_t pick_local_fail;
+        uint64_t pf = atomic_fetch_add(&pick_local_fail, 1);
+        if (pf < 10)
+            fprintf(stderr, "[DP-DROP-WAN] pick_local worker=%d dest_ip=%u.%u.%u.%u\n",
+                    worker, (dip >> 24) & 0xff, (dip >> 16) & 0xff,
+                    (dip >> 8) & 0xff, dip & 0xff);
+        dp_wan_drop_log("pick_local", &dp_wan_drop_local, job.len, wire_core, worker);
         goto drop;
+    }
     if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
         goto drop;
 
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    if (ne_tx_send_local(&fwd->pair, dp_crypto_current_worker_idx(), li, &job) != 0)
+    if (ne_tx_send_local(&fwd->pair, dp_crypto_current_worker_idx(), li, &job) != 0) {
+        dp_wan_drop_log("lan_tx_fail", &dp_wan_drop_tx, job.len, wire_core, worker);
         goto drop;
+    }
+    // #region agent log
+    {
+        static _Atomic uint64_t wan_lan_ok;
+        uint64_t wo = atomic_fetch_add(&wan_lan_ok, 1);
+        if (wo < 20 || (wo & 0xFFu) == 0) {
+            uint32_t dip = dp_dest_ipv4(pkt, job.len);
+            fprintf(stderr,
+                    "[DP-WAN] worker=%d -> LAN li=%d dest=%u.%u.%u.%u len=%u\n",
+                    worker, li, (dip >> 24) & 0xff, (dip >> 16) & 0xff,
+                    (dip >> 8) & 0xff, dip & 0xff, job.len);
+        }
+    }
+    // #endregion
     return;
 
 drop:

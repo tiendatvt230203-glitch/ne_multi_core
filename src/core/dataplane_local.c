@@ -31,6 +31,48 @@ static void dp_drop_log(const char *reason, _Atomic uint64_t *ctr)
 }
 
 // #region agent log
+static void dp_dbg_ndjson(const char *location, const char *message, const char *hypothesis_id,
+                          int worker, const char *extra_json)
+{
+    FILE *f = fopen(DBG_L2_LOG, "a");
+    if (f) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        long ms = (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+        fprintf(f,
+                "{\"sessionId\":\"250a01\",\"location\":\"%s\",\"message\":\"%s\","
+                "\"data\":{\"worker\":%d%s%s},\"timestamp\":%ld,"
+                "\"hypothesisId\":\"%s\",\"runId\":\"tcp-handshake\"}\n",
+                location, message, worker,
+                extra_json ? "," : "", extra_json ? extra_json : "", ms, hypothesis_id);
+        fclose(f);
+    }
+}
+
+static void dp_lan_tcp_log(uint8_t proto, uint16_t dst_port, uint16_t src_port,
+                           int policy_id, int wan_dp, int enc_rc, int flow_ok)
+{
+    static _Atomic uint64_t lan_tcp_log_count;
+    uint64_t n = atomic_fetch_add(&lan_tcp_log_count, 1);
+    if (n >= 30 && (n & 0xFFu) != 0)
+        return;
+    int w = dp_crypto_current_worker_idx();
+    fprintf(stderr,
+            "[DP-LAN] worker=%d flow_ok=%d proto=%u sport=%u dport=%u policy=%d wan_dp=%d enc=%d\n",
+            w, flow_ok, (unsigned)proto, (unsigned)src_port, (unsigned)dst_port,
+            policy_id, wan_dp, enc_rc);
+    char extra[160];
+    snprintf(extra, sizeof(extra),
+             "\"flow_ok\":%d,\"proto\":%u,\"sport\":%u,\"dport\":%u,"
+             "\"policy\":%d,\"wan_dp\":%d,\"enc\":%d",
+             flow_ok, (unsigned)proto, (unsigned)src_port, (unsigned)dst_port,
+             policy_id, wan_dp, enc_rc);
+    dp_dbg_ndjson("dataplane_local.c:process_local", "lan tcp path", "A-port-policy",
+                  w, extra);
+}
+// #endregion
+
+// #region agent log
 static void dbg_l2_core_log(const char *location, const char *message,
                             int worker, int wire_core, uint32_t len)
 {
@@ -192,13 +234,38 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     int enc;
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                            &profile_idx, &cp) != 0)
+                            &profile_idx, &cp) != 0) {
+        // #region agent log
+        if (proto == 6 || proto == 17) {
+            static _Atomic uint64_t no_policy_tcp;
+            uint64_t np = atomic_fetch_add(&no_policy_tcp, 1);
+            if (np < 15)
+                fprintf(stderr,
+                        "[DP-DROP] no_policy worker=%d proto=%u dport=%u sport=%u flow_ok=%d\n",
+                        dp_crypto_current_worker_idx(), (unsigned)proto,
+                        (unsigned)dst_port, (unsigned)src_port, flow_ok);
+        }
+        // #endregion
         goto drop_policy;
+    }
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
         goto drop_wan;
+    {
+        static const uint8_t zero_mac[MAC_LEN];
+        // #region agent log
+        if (memcmp(fwd->wans[wan_dp].dst_mac, zero_mac, MAC_LEN) == 0 ||
+            memcmp(fwd->wans[wan_dp].src_mac, zero_mac, MAC_LEN) == 0) {
+            static _Atomic int wan_mac_warn_once;
+            if (atomic_exchange(&wan_mac_warn_once, 1) == 0)
+                fprintf(stderr,
+                        "[DP-WARN] WAN dp=%d (%s) missing src/dst MAC in DB — L2 header not rewritten\n",
+                        wan_dp, fwd->wans[wan_dp].ifname);
+        }
+        // #endregion
+    }
     if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         goto drop;
 
@@ -222,6 +289,10 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                          src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
     if (enc < 0)
         goto drop_crypto;
+    // #region agent log
+    if (proto == 6 || proto == 17)
+        dp_lan_tcp_log(proto, dst_port, src_port, (int)cp->id, wan_dp, enc, flow_ok);
+    // #endregion
     if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
         uint8_t wc = 0;
         pkt = ne_packet_data(&fwd->pair, job.addr);
