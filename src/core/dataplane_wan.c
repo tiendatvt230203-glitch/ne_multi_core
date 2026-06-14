@@ -535,10 +535,11 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         static _Atomic uint64_t core_lan_tx;
         if (dp_core_log_ok(&core_lan_tx)) {
+            uint32_t sip = 0, dip = 0;
             uint16_t dport = 0;
             uint16_t sport = 0;
             uint8_t proto = 0;
-            (void)dp_parse_flow(pkt, job.len, NULL, NULL, &sport, &dport, &proto);
+            (void)dp_parse_flow(pkt, job.len, &sip, &dip, &sport, &dport, &proto);
             fprintf(stderr,
                     "[DP-CORE] LAN-TX worker=%d local=%s li=%d wire_tag=%u len=%u\n",
                     worker,
