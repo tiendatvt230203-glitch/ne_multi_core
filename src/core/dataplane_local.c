@@ -49,24 +49,32 @@ static void dp_dbg_ndjson(const char *location, const char *message, const char 
     }
 }
 
-static void dp_lan_tcp_log(uint8_t proto, uint16_t dst_port, uint16_t src_port,
-                           int policy_id, int wan_dp, int enc_rc, int flow_ok)
+static void dp_lan_tcp_log(struct forwarder *fwd, uint8_t proto,
+                           uint16_t dst_port, uint16_t src_port,
+                           const struct crypto_policy *cp, int wan_dp,
+                           int enc_rc, int flow_ok)
 {
     static _Atomic uint64_t lan_tcp_log_count;
     uint64_t n = atomic_fetch_add(&lan_tcp_log_count, 1);
     if (n >= 30 && (n & 0xFFu) != 0)
         return;
     int w = dp_crypto_current_worker_idx();
+    const char *mode = (cp->crypto_mode == CRYPTO_MODE_PQC) ? "pqc"
+                     : (cp->action == POLICY_ACTION_BYPASS) ? "bypass"
+                     : "gcm/ctr";
+    const char *wan_if = (fwd && wan_dp >= 0 && wan_dp < fwd->wan_count)
+                         ? fwd->wans[wan_dp].ifname : "?";
     fprintf(stderr,
-            "[DP-LAN] worker=%d flow_ok=%d proto=%u sport=%u dport=%u policy=%d wan_dp=%d enc=%d\n",
-            w, flow_ok, (unsigned)proto, (unsigned)src_port, (unsigned)dst_port,
-            policy_id, wan_dp, enc_rc);
-    char extra[160];
+            "[DP-LAN] worker=%d proto=%u sport=%u dport=%u pkt_tag=%d db_id=%d "
+            "crypto=%s wan=%s enc=%d\n",
+            w, (unsigned)proto, (unsigned)src_port, (unsigned)dst_port,
+            cp ? (int)cp->id : -1, cp ? cp->db_id : -1, mode, wan_if, enc_rc);
+    char extra[192];
     snprintf(extra, sizeof(extra),
              "\"flow_ok\":%d,\"proto\":%u,\"sport\":%u,\"dport\":%u,"
-             "\"policy\":%d,\"wan_dp\":%d,\"enc\":%d",
+             "\"pkt_tag\":%d,\"db_id\":%d,\"wan_dp\":%d,\"enc\":%d",
              flow_ok, (unsigned)proto, (unsigned)src_port, (unsigned)dst_port,
-             policy_id, wan_dp, enc_rc);
+             cp ? (int)cp->id : -1, cp ? cp->db_id : -1, wan_dp, enc_rc);
     dp_dbg_ndjson("dataplane_local.c:process_local", "lan tcp path", "A-port-policy",
                   w, extra);
 }
@@ -291,7 +299,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop_crypto;
     // #region agent log
     if (proto == 6 || proto == 17)
-        dp_lan_tcp_log(proto, dst_port, src_port, (int)cp->id, wan_dp, enc, flow_ok);
+        dp_lan_tcp_log(fwd, proto, dst_port, src_port, cp, wan_dp, enc, flow_ok);
     // #endregion
     if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
         uint8_t wc = 0;

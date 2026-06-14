@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <arpa/inet.h>
 
 #define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
 
@@ -343,7 +344,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     li = pick_local(fwd, pkt, job.len);
     if (li < 0 || li >= fwd->local_count) {
-        uint32_t dip = dp_dest_ipv4(pkt, job.len);
+        uint32_t dip = ntohl(dp_dest_ipv4(pkt, job.len));
         static _Atomic uint64_t pick_local_fail;
         uint64_t pf = atomic_fetch_add(&pick_local_fail, 1);
         if (pf < 10)
@@ -367,7 +368,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         static _Atomic uint64_t wan_lan_ok;
         uint64_t wo = atomic_fetch_add(&wan_lan_ok, 1);
         if (wo < 20 || (wo & 0xFFu) == 0) {
-            uint32_t dip = dp_dest_ipv4(pkt, job.len);
+            uint32_t dip = ntohl(dp_dest_ipv4(pkt, job.len));
             fprintf(stderr,
                     "[DP-WAN] worker=%d -> LAN li=%d dest=%u.%u.%u.%u len=%u\n",
                     worker, li, (dip >> 24) & 0xff, (dip >> 16) & 0xff,
