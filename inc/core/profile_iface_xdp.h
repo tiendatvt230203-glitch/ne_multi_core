@@ -15,6 +15,7 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg);
 int profile_iface_xdp_can_add(const struct app_config *old, const struct app_config *new);
 int profile_iface_xdp_can_remove(const struct app_config *old, const struct app_config *new);
 int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_config *new);
+int profile_iface_xdp_is_add_only(const struct app_config *old, const struct app_config *new);
 
 int profile_iface_xdp_apply_add(struct forwarder *fwd, struct app_config *cfg);
 int profile_iface_xdp_apply_remove(struct forwarder *fwd, struct app_config *cfg);

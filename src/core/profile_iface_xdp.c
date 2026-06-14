@@ -12,6 +12,7 @@
 #include <net/if.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 /* --- config ifname helpers --- */
 
@@ -228,6 +229,13 @@ int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_c
     return 1;
 }
 
+int profile_iface_xdp_is_add_only(const struct app_config *old, const struct app_config *new)
+{
+    if (!profile_iface_xdp_can_add(old, new))
+        return 0;
+    return cfg_has_iface_addition(old, new) && !cfg_has_iface_removal(old, new);
+}
+
 /* --- BPF / XDP bind --- */
 
 static int read_xdp_prog_id(const char *ifname, uint32_t *out_id)
@@ -266,15 +274,19 @@ static int validate_xdp_attached(const char *ifname, const char *role)
 {
     uint32_t prog_id = 0;
 
-    if (read_xdp_prog_id(ifname, &prog_id) != 0 || prog_id == 0) {
-        fprintf(stderr,
-                "[PROFILE-XDP] validate FAIL %s %s: no prog_id\n", role, ifname);
-        return -1;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (read_xdp_prog_id(ifname, &prog_id) == 0 && prog_id != 0) {
+            fprintf(stderr, "[PROFILE-XDP] validate OK %s %s prog_id=%u (xdp/id:%u)\n",
+                    role, ifname, prog_id, prog_id);
+            fflush(stderr);
+            return 0;
+        }
+        usleep(50000);
     }
-    fprintf(stderr, "[PROFILE-XDP] validate OK %s %s prog_id=%u (xdp/id:%u)\n",
-            role, ifname, prog_id, prog_id);
+    fprintf(stderr,
+            "[PROFILE-XDP] validate FAIL %s %s: no prog_id\n", role, ifname);
     fflush(stderr);
-    return 0;
+    return -1;
 }
 
 static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
@@ -385,9 +397,13 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     if (open_bpf_object(cfg->bpf_file, &p->bpf_locals[pair_li],
                         "xdp_redirect_prog", &prog, "xsks_map", &map) != 0)
         return -1;
+    interface_ip_xdp_off(ifname);
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
-                        p->xdp_flags, ifname, "LAN") != 0)
+                        p->xdp_flags, ifname, "LAN") != 0) {
+        bpf_object__close(p->bpf_locals[pair_li]);
+        p->bpf_locals[pair_li] = NULL;
         return -1;
+    }
     return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
 }
 
@@ -403,9 +419,13 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
                         "xdp_wan_redirect_prog", &prog, "wan_xsks_map", &map) != 0)
         return -1;
     update_wan_fake_ethertype(p->bpf_wans[dp_slot], fake_ethertype_ipv4);
+    interface_ip_xdp_off(p->wans[dp_slot].ifname);
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
-                        p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0)
+                        p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0) {
+        bpf_object__close(p->bpf_wans[dp_slot]);
+        p->bpf_wans[dp_slot] = NULL;
         return -1;
+    }
     return update_xsk_map_iface(&p->wans[dp_slot], bpf_map__fd(map));
 }
 
@@ -494,12 +514,12 @@ static int detach_removed_lan_rows(struct forwarder *fwd, const struct app_confi
             continue;
         if (lan_still_in_merged_cfg(new_cfg, ifname)) {
             fprintf(stderr,
-                    "[PROFILE-XDP] REMOVE LAN row: %s other profile(s) still use — keep xdp/id\n",
+                    "[PROFILE-XDP] LAN %s still in merged config — keep xdp/id (shared)\n",
                     ifname);
             continue;
         }
         fprintf(stderr,
-                "[PROFILE-XDP] REMOVE LAN row: %s no profile left — detach xdp/id\n",
+                "[PROFILE-XDP] LAN %s last profile removed — detach xdp/id\n",
                 ifname);
         ne_pair_unplumb_local(&fwd->pair, li);
     }
@@ -538,7 +558,7 @@ static int attach_new_lan_rows(struct forwarder *fwd, const struct app_config *n
 
         if (!lan_is_new_to_merged(old_cfg, new_cfg, ifname)) {
             fprintf(stderr,
-                    "[PROFILE-XDP] ADD LAN row: %s already used by other profile — skip xdp/id\n",
+                    "[PROFILE-XDP] LAN %s already live (shared) — skip xdp/id attach\n",
                     ifname);
             continue;
         }
@@ -548,12 +568,14 @@ static int attach_new_lan_rows(struct forwarder *fwd, const struct app_config *n
             return -1;
         if (ne_pair_plumb_local(&fwd->pair, new_cfg, ci, li) != 0)
             return -1;
-        if (profile_iface_xdp_bind_local(&fwd->pair, new_cfg, li) != 0)
+        if (profile_iface_xdp_bind_local(&fwd->pair, new_cfg, li) != 0) {
+            ne_pair_unplumb_local(&fwd->pair, li);
             return -1;
+        }
         fwd->pair.xdp_local_on[li] = 1;
         init_fwd_local_meta(fwd, li, new_cfg, ci);
         fwd->local_count++;
-        fprintf(stderr, "[PROFILE-XDP] ADD LAN row: %s first use — attach xdp/id (slot %d)\n",
+        fprintf(stderr, "[PROFILE-XDP] LAN %s first use — attach xdp/id (slot %d)\n",
                 ifname, li);
     }
     return 0;
@@ -575,8 +597,10 @@ static int attach_new_wan_rows(struct forwarder *fwd, const struct app_config *n
             return -1;
         if (ne_pair_plumb_wan_dp(&fwd->pair, new_cfg, ci, di) != 0)
             return -1;
-        if (profile_iface_xdp_bind_wan(&fwd->pair, new_cfg, di, new_cfg->fake_ethertype_ipv4) != 0)
+        if (profile_iface_xdp_bind_wan(&fwd->pair, new_cfg, di, new_cfg->fake_ethertype_ipv4) != 0) {
+            ne_pair_unplumb_wan_dp(&fwd->pair, di);
             return -1;
+        }
         fwd->pair.xdp_wan_on[di] = 1;
         init_fwd_wan_meta(fwd, di, new_cfg, ci);
         fwd->wan_cfg_idx[di] = ci;
