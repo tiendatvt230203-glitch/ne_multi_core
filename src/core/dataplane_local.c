@@ -13,8 +13,22 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
+
+static _Atomic uint64_t dp_drop_policy;
+static _Atomic uint64_t dp_drop_wan;
+static _Atomic uint64_t dp_drop_crypto;
+static _Atomic uint64_t dp_drop_tx;
+
+static void dp_drop_log(const char *reason, _Atomic uint64_t *ctr)
+{
+    uint64_t n = atomic_fetch_add(ctr, 1) + 1;
+    if (n <= 10 || (n & 0x3FFu) == 0)
+        fprintf(stderr, "[DP-DROP] %s worker=%d total=%lu\n",
+                reason, dp_crypto_current_worker_idx(), (unsigned long)n);
+}
 
 // #region agent log
 static void dbg_l2_core_log(const char *location, const char *message,
@@ -42,6 +56,7 @@ static int send_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
     if (ne_tx_send_wan(&fwd->pair, w, wan_dp, job) != 0) {
+        dp_drop_log("wan_tx_fail", &dp_drop_tx);
         ne_frame_free(&fwd->pair, job->addr);
         return -1;
     }
@@ -178,12 +193,12 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)
-        goto drop;
+        goto drop_policy;
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
-        goto drop;
+        goto drop_wan;
     if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         goto drop;
 
@@ -192,21 +207,21 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         return;
     }
     if (!fwd->cfg->crypto_enabled)
-        goto drop;
+        goto drop_crypto;
 
     pi = (int)(cp - fwd->cfg->policies);
     if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
-        goto drop;
+        goto drop_crypto;
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx)
-        goto drop;
+        goto drop_crypto;
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
     pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
     crypto_apply_from_policy(cp);
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                          src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
     if (enc < 0)
-        goto drop;
+        goto drop_crypto;
     if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
         uint8_t wc = 0;
         pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -219,6 +234,14 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     (void)send_to_wan(fwd, &job, wan_dp);
     return;
 
+drop_policy:
+    dp_drop_log("no_policy", &dp_drop_policy);
+    goto drop;
+drop_wan:
+    dp_drop_log("no_wan_or_tx_room", &dp_drop_wan);
+    goto drop;
+drop_crypto:
+    dp_drop_log("crypto", &dp_drop_crypto);
 drop:
     ne_frame_free(&fwd->pair, job.addr);
 }

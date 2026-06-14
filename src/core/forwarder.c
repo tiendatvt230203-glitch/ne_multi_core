@@ -15,8 +15,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 static atomic_int running = 1;
@@ -82,6 +82,17 @@ static void *unified_worker_thread(void *arg)
     dp_crypto_worker_bind(w);
     crypto_layer2_bind_worker_core((uint8_t)w);
 
+    {
+        int lq = 0, wq = 0;
+        if (fwd->pair.local_count > 0)
+            lq = fwd->pair.locals[0].queue_count;
+        if (fwd->pair.wan_count > 0)
+            wq = fwd->pair.wans[0].queue_count;
+        fprintf(stderr, "[WORKER] %d started cpu=%u (need queue>=%d, local_q=%d wan_q=%d)\n",
+                w, (unsigned)dp_crypto_worker_cpu(w), w, lq, wq);
+        fflush(stderr);
+    }
+
     // #region agent log
     {
         FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
@@ -101,6 +112,9 @@ static void *unified_worker_thread(void *arg)
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
+
+        for (int i = 0; i < IO_BURST_ROUNDS; i++)
+            ne_drain_cq_worker(&fwd->pair, w);
 
         for (int i = 0; i < IO_BURST_ROUNDS; i++)
             ne_refill_fq_worker(&fwd->pair, w);
@@ -127,6 +141,10 @@ static void *unified_worker_thread(void *arg)
 
         // #region agent log
         if (rcvd_local > 0 || rcvd_wan > 0) {
+            static _Atomic uint64_t recv_log_count;
+            uint64_t rn = atomic_fetch_add(&recv_log_count, 1);
+            if (rn < 20 || (rn & 0xFFFu) == 0)
+                fprintf(stderr, "[WORKER] %d recv local=%d wan=%d\n", w, rcvd_local, rcvd_wan);
             FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
             if (_df) {
                 struct timespec _ts;

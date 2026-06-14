@@ -227,6 +227,30 @@ static uint32_t pool_pop(struct ne_pool *p, uint64_t *addrs, uint32_t n)
     return got;
 }
 
+static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
+{
+    uint64_t addrs[NE_BATCH_SIZE];
+    uint32_t idx = 0;
+    uint32_t free_slots = xsk_prod_nb_free(&slot->fq, NE_BATCH_SIZE);
+    uint32_t want;
+
+    if (!free_slots)
+        return;
+
+    want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    uint32_t got = pool_pop(pool, addrs, want);
+    if (!got)
+        return;
+    if (xsk_ring_prod__reserve(&slot->fq, got, &idx) != got) {
+        (void)pool_push(pool, addrs, got);
+        return;
+    }
+    for (uint32_t i = 0; i < got; i++)
+        *xsk_ring_prod__fill_addr(&slot->fq, idx + i) = addrs[i];
+    xsk_ring_prod__submit(&slot->fq, got);
+    kick_xsk_rx(slot);
+}
+
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
 {
     return (p && addr_out && pool_pop(&p->pool, addr_out, 1) == 1) ? 0 : -1;
@@ -591,6 +615,20 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(update_xsk_map_iface(&p->wans[di], bpf_map__fd(wan_map)));
     }
 
+    for (int i = 0; i < p->local_count; i++)
+        fprintf(stderr, "[XSK] LAN %s queues=%d xdp=on\n",
+                p->locals[i].ifname, p->locals[i].queue_count);
+    for (int i = 0; i < p->wan_count; i++)
+        fprintf(stderr, "[XSK] WAN %s queues=%d xdp=on\n",
+                p->wans[i].ifname, p->wans[i].queue_count);
+    if ((int)NE_CRYPTO_WORKERS > p->locals[0].queue_count ||
+        (p->wan_count > 0 && (int)NE_CRYPTO_WORKERS > p->wans[0].queue_count))
+        fprintf(stderr,
+                "[XSK][WARN] NE_CRYPTO_WORKERS=%u but iface queues lower — workers above "
+                "min(queue_count)-1 will idle\n",
+                (unsigned)NE_CRYPTO_WORKERS);
+    fflush(stderr);
+
     uint32_t prefill = NE_RING - 1;
     if (prefill == 0)
         prefill = 1;
@@ -758,27 +796,6 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
             break;
         }
     }
-}
-
-static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
-{
-    uint64_t addrs[NE_BATCH_SIZE];
-    uint32_t idx = 0;
-    uint32_t free_slots = xsk_prod_nb_free(&slot->fq, NE_BATCH_SIZE);
-    if (free_slots < NE_BATCH_SIZE)
-        return;
-
-    uint32_t got = pool_pop(pool, addrs, NE_BATCH_SIZE);
-    if (!got)
-        return;
-    if (xsk_ring_prod__reserve(&slot->fq, got, &idx) != got) {
-        (void)pool_push(pool, addrs, got);
-        return;
-    }
-    for (uint32_t i = 0; i < got; i++)
-        *xsk_ring_prod__fill_addr(&slot->fq, idx + i) = addrs[i];
-    xsk_ring_prod__submit(&slot->fq, got);
-    kick_xsk_rx(slot);
 }
 
 static void refill_fq_worker_queue(struct ne_pair *p, struct ne_xsk_queue *slot)
