@@ -19,4 +19,7 @@ int dp_write_l2(uint8_t *pkt, uint32_t len,
 int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
                     const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN]);
 
+/* Bridge WAN (dst_ip unset): flood on tunnel link using local WAN MAC as src. */
+int dp_apply_bridge_wan_eth(uint8_t *pkt, uint32_t len, const uint8_t wan_src[MAC_LEN]);
+
 #endif

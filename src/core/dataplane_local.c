@@ -102,15 +102,66 @@ static void dbg_l2_core_log(const char *location, const char *message,
 static int send_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
     int w = dp_crypto_current_worker_idx();
+    uint8_t wire_core = 0;
+    const char *wan_if = (fwd && wan_dp >= 0 && wan_dp < fwd->wan_count)
+                         ? fwd->wans[wan_dp].ifname : "?";
 
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
+    // #region agent log
+    {
+        uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
+        if (pkt && crypto_layer2_read_core_id(pkt, job->len, &wire_core) == 0) {
+            static _Atomic uint64_t wan_tx_log;
+            uint64_t n = atomic_fetch_add(&wan_tx_log, 1);
+            if (n < 40 || (n & 0xFFu) == 0)
+                fprintf(stderr,
+                        "[DP-WAN-TX] worker=%d wan=%s wire_core=%u len=%u\n",
+                        w, wan_if, (unsigned)wire_core, job->len);
+        }
+    }
+    // #endregion
     if (ne_tx_send_wan(&fwd->pair, w, wan_dp, job) != 0) {
         dp_drop_log("wan_tx_fail", &dp_drop_tx);
         ne_frame_free(&fwd->pair, job->addr);
         return -1;
     }
     return 0;
+}
+
+static int wan_is_bridge(const struct forwarder *fwd, int wan_dp)
+{
+    int ci;
+
+    if (!fwd || wan_dp < 0 || wan_dp >= fwd->wan_count)
+        return 0;
+    ci = fwd->wan_cfg_idx[wan_dp];
+    return ci >= 0 && ci < fwd->cfg->wan_count && fwd->cfg->wans[ci].dst_ip == 0;
+}
+
+static void dp_patch_l2_flow_core(uint8_t *pkt, uint32_t len,
+                                  uint32_t src_ip, uint32_t dst_ip,
+                                  uint16_t src_port, uint16_t dst_port,
+                                  uint8_t proto)
+{
+    uint8_t ignore;
+
+    if (!pkt || crypto_layer2_read_core_id(pkt, len, &ignore) != 0)
+        return;
+    pkt[CRYPTO_L2_CORE_ID_OFF] = dp_crypto_flow_core_id(src_ip, dst_ip,
+                                                        src_port, dst_port, proto);
+}
+
+static void dp_finish_wan_packet(struct forwarder *fwd, uint8_t *pkt, uint32_t len,
+                                 int wan_dp, int is_l2,
+                                 uint32_t src_ip, uint32_t dst_ip,
+                                 uint16_t src_port, uint16_t dst_port,
+                                 uint8_t proto)
+{
+    if (wan_is_bridge(fwd, wan_dp))
+        (void)dp_apply_bridge_wan_eth(pkt, len, fwd->wans[wan_dp].src_mac);
+    if (is_l2)
+        dp_patch_l2_flow_core(pkt, len, src_ip, dst_ip, src_port, dst_port, proto);
 }
 
 static int send_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
@@ -181,6 +232,10 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
         dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         return -1;
+    dp_finish_wan_packet(fwd, pkt, l1, wan_dp, cp->action == POLICY_ACTION_ENCRYPT_L2,
+                         src_ip, dst_ip, src_port, dst_port, proto);
+    dp_finish_wan_packet(fwd, f2, l2, wan_dp, cp->action == POLICY_ACTION_ENCRYPT_L2,
+                         src_ip, dst_ip, src_port, dst_port, proto);
     if (send_split_to_wan(fwd, job, l1, f2, l2, wan_dp) != 0)
         return -1;
     return 1;
@@ -282,6 +337,8 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {
+        dp_finish_wan_packet(fwd, pkt, job.len, wan_dp, 0,
+                             src_ip, dst_ip, src_port, dst_port, proto);
         (void)send_to_wan(fwd, &job, wan_dp);
         return;
     }
@@ -314,6 +371,10 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
     if (enc > 0)
         return;
+    pkt = ne_packet_data(&fwd->pair, job.addr);
+    dp_finish_wan_packet(fwd, pkt, job.len, wan_dp,
+                          cp->action == POLICY_ACTION_ENCRYPT_L2,
+                          src_ip, dst_ip, src_port, dst_port, proto);
     (void)send_to_wan(fwd, &job, wan_dp);
     return;
 

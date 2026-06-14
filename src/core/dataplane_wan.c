@@ -327,8 +327,10 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             static _Atomic uint64_t wan_l2_in;
             uint64_t n = atomic_fetch_add(&wan_l2_in, 1);
             if (n < 40 || (n & 0xFFu) == 0)
-                fprintf(stderr, "[DP-WAN-IN] worker=%d wire_tag=%u core=%u len=%u\n",
-                        worker, (unsigned)wire_tag, (unsigned)wire_core, job.len);
+                fprintf(stderr, "[DP-WAN-IN] worker=%d wan=%s wire_tag=%u core=%u len=%u\n",
+                        worker,
+                        (job.wan_idx < fwd->wan_count) ? fwd->wans[job.wan_idx].ifname : "?",
+                        (unsigned)wire_tag, (unsigned)wire_core, job.len);
         }
         // #endregion
         int ok = dp_crypto_l2_affinity_ok(pkt, job.len);
