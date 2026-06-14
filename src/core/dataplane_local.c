@@ -256,9 +256,6 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
         return 0;
     }
 
-    if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
-        dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
-        return -1;
     if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
         dp_finish_wan_l2_packet(fwd, pkt, l1, wan_dp,
                                 src_ip, dst_ip, src_port, dst_port, proto);
@@ -345,25 +342,6 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                                     src_port, dst_port, proto, job.len);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
         goto drop_wan;
-    {
-        static const uint8_t zero_mac[MAC_LEN];
-        // #region agent log
-        int wan_ci = (wan_dp >= 0 && wan_dp < MAX_INTERFACES) ? fwd->wan_cfg_idx[wan_dp] : -1;
-        int wan_routed = (wan_ci >= 0 && wan_ci < fwd->cfg->wan_count &&
-                          fwd->cfg->wans[wan_ci].dst_ip != 0);
-        if (wan_routed &&
-            (memcmp(fwd->wans[wan_dp].dst_mac, zero_mac, MAC_LEN) == 0 ||
-             memcmp(fwd->wans[wan_dp].src_mac, zero_mac, MAC_LEN) == 0)) {
-            static _Atomic int wan_mac_warn_once;
-            if (atomic_exchange(&wan_mac_warn_once, 1) == 0)
-                fprintf(stderr,
-                        "[DP-WARN] routed WAN dp=%d (%s) missing src/dst MAC — need MAC for L3/PQC WAN\n",
-                        wan_dp, fwd->wans[wan_dp].ifname);
-        }
-        // #endregion
-    }
-    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
-        goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {
         if (proto == 6 || proto == 17)

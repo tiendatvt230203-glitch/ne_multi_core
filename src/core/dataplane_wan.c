@@ -424,9 +424,6 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         dp_wan_drop_log("pick_local", &dp_wan_drop_local, job.len, wire_core, worker);
         goto drop;
     }
-    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
-        goto drop;
-
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
     if (ne_tx_send_local(&fwd->pair, dp_crypto_current_worker_idx(), li, &job) != 0) {

@@ -9,14 +9,4 @@ int dp_parse_flow(void *pkt, uint32_t len,
 
 uint32_t dp_dest_ipv4(void *pkt, uint32_t len);
 
-int dp_write_l2_src_only(uint8_t *pkt, uint32_t len, const uint8_t src[MAC_LEN]);
-
-int dp_write_l2(uint8_t *pkt, uint32_t len,
-                const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN],
-                int allow_empty_src);
-
-/* LAN→WAN: skip rewrite if either MAC unset (bridge transparent L2). */
-int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
-                    const uint8_t dst[MAC_LEN], const uint8_t src[MAC_LEN]);
-
 #endif
