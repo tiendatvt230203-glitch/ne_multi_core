@@ -367,6 +367,25 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (wan_dp < 0 || !wan_tx_room_wait(fwd, wan_dp, 1))
         goto drop_wan;
 
+    // #region agent log
+    if (flow_ok && (proto == 6 || proto == 17) &&
+        cp->action != POLICY_ACTION_BYPASS) {
+        uint8_t expect_core = dp_crypto_flow_core_id(src_ip, dst_ip,
+                                                     src_port, dst_port, proto);
+        int worker = dp_crypto_current_worker_idx();
+        if ((int)expect_core != worker) {
+            static _Atomic uint64_t lan_core_mismatch;
+            uint64_t mm = atomic_fetch_add(&lan_core_mismatch, 1);
+            if (mm < 20)
+                fprintf(stderr,
+                        "[DP-WARN] lan_core_mismatch worker=%d expect_core=%u "
+                        "proto=%u sport=%u dport=%u\n",
+                        worker, (unsigned)expect_core, (unsigned)proto,
+                        (unsigned)src_port, (unsigned)dst_port);
+        }
+    }
+    // #endregion
+
     if (cp->action == POLICY_ACTION_BYPASS) {
         if (proto == 6 || proto == 17)
             dp_lan_tcp_log(fwd, proto, dst_port, src_port, cp, wan_dp, 0, flow_ok);
