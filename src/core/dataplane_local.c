@@ -2,6 +2,7 @@
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/core/interface.h"
 
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_layer3.h"
@@ -17,10 +18,17 @@
 
 #define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
 
-static _Atomic uint64_t dp_drop_policy;
-static _Atomic uint64_t dp_drop_wan;
-static _Atomic uint64_t dp_drop_crypto;
-static _Atomic uint64_t dp_drop_tx;
+extern _Atomic uint64_t dp_wan_drop_affinity;
+extern _Atomic uint64_t dp_wan_drop_decrypt;
+extern _Atomic uint64_t dp_wan_drop_local;
+extern _Atomic uint64_t dp_wan_drop_tx;
+extern _Atomic uint64_t dp_lan_tx_room_retry_ok;
+
+_Atomic uint64_t dp_drop_policy;
+_Atomic uint64_t dp_drop_wan;
+_Atomic uint64_t dp_drop_crypto;
+_Atomic uint64_t dp_drop_tx;
+static _Atomic uint64_t dp_tx_room_retry_ok;
 
 static void dp_drop_log(const char *reason, _Atomic uint64_t *ctr)
 {
@@ -149,6 +157,22 @@ static void dp_wan_tx_log(struct forwarder *fwd, int worker, int wan_dp,
     }
 }
 
+static int wan_tx_room_wait(struct forwarder *fwd, int wan_dp, uint32_t need)
+{
+    int w = dp_crypto_current_worker_idx();
+
+    if (ne_tx_has_room_wan(&fwd->pair, w, wan_dp, need))
+        return 1;
+    for (int i = 0; i < 64; i++) {
+        ne_drain_cq_worker(&fwd->pair, w);
+        if (ne_tx_has_room_wan(&fwd->pair, w, wan_dp, need)) {
+            atomic_fetch_add(&dp_tx_room_retry_ok, 1);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int send_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp, int bypass)
 {
     int w = dp_crypto_current_worker_idx();
@@ -197,7 +221,7 @@ static int send_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
     int w = dp_crypto_current_worker_idx();
 
     if (wan_dp < 0 || wan_dp >= fwd->wan_count ||
-        !ne_tx_has_room_wan(&fwd->pair, w, wan_dp, 2))
+        !wan_tx_room_wait(fwd, wan_dp, 2))
         return -1;
     if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)
         return -1;
@@ -340,7 +364,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
+    if (wan_dp < 0 || !wan_tx_room_wait(fwd, wan_dp, 1))
         goto drop_wan;
 
     if (cp->action == POLICY_ACTION_BYPASS) {
@@ -395,4 +419,49 @@ drop_crypto:
     dp_drop_log("crypto", &dp_drop_crypto);
 drop:
     ne_frame_free(&fwd->pair, job.addr);
+}
+
+void dataplane_dump_stats(void)
+{
+    uint64_t policy = atomic_load(&dp_drop_policy);
+    uint64_t wan = atomic_load(&dp_drop_wan);
+    uint64_t crypto = atomic_load(&dp_drop_crypto);
+    uint64_t tx = atomic_load(&dp_drop_tx);
+    uint64_t retry = atomic_load(&dp_tx_room_retry_ok);
+    uint64_t aff = atomic_load(&dp_wan_drop_affinity);
+    uint64_t dec = atomic_load(&dp_wan_drop_decrypt);
+    uint64_t pick = atomic_load(&dp_wan_drop_local);
+    uint64_t lan_tx = atomic_load(&dp_wan_drop_tx);
+    uint64_t lan_retry = atomic_load(&dp_lan_tx_room_retry_ok);
+
+    fprintf(stderr,
+            "[DP-STATS] lan: policy=%lu wan_tx_room=%lu crypto=%lu tx_fail=%lu wan_retry_ok=%lu | "
+            "wan: affinity=%lu decrypt=%lu pick_local=%lu lan_tx=%lu lan_retry_ok=%lu\n",
+            (unsigned long)policy, (unsigned long)wan, (unsigned long)crypto,
+            (unsigned long)tx, (unsigned long)retry,
+            (unsigned long)aff, (unsigned long)dec, (unsigned long)pick,
+            (unsigned long)lan_tx, (unsigned long)lan_retry);
+    fflush(stderr);
+    // #region agent log
+    {
+        FILE *f = fopen(DBG_L2_LOG, "a");
+        if (f) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            long ms = (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+            fprintf(f,
+                    "{\"sessionId\":\"250a01\",\"location\":\"dataplane_local.c:dump_stats\","
+                    "\"message\":\"periodic stats\",\"data\":{"
+                    "\"policy\":%lu,\"wan_tx_room\":%lu,\"crypto\":%lu,\"tx_fail\":%lu,"
+                    "\"tx_retry_ok\":%lu,\"affinity\":%lu,\"decrypt\":%lu,\"pick_local\":%lu,"
+                    "\"lan_tx\":%lu,\"lan_retry_ok\":%lu},\"timestamp\":%ld,\"hypothesisId\":\"load\","
+                    "\"runId\":\"100conn\"}\n",
+                    (unsigned long)policy, (unsigned long)wan, (unsigned long)crypto,
+                    (unsigned long)tx, (unsigned long)retry,
+                    (unsigned long)aff, (unsigned long)dec, (unsigned long)pick,
+                    (unsigned long)lan_tx, (unsigned long)lan_retry, ms);
+            fclose(f);
+        }
+    }
+    // #endregion
 }

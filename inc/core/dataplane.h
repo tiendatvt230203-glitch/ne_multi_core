@@ -5,5 +5,6 @@
 
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job);
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job);
+void dataplane_dump_stats(void);
 
 #endif

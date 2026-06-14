@@ -75,6 +75,7 @@ static void *unified_worker_thread(void *arg)
     uint32_t gc_tick = 0;
     uint32_t maint_tick = 0;
     uint64_t idle_loops = 0;
+    uint64_t last_stats_ms = 0;
     int w = ctx->worker_idx;
     int is_primary = (w == 0);
 
@@ -145,17 +146,19 @@ static void *unified_worker_thread(void *arg)
             uint64_t rn = atomic_fetch_add(&recv_log_count, 1);
             if (rn < 200 || (rn & 0xFFFu) == 0)
                 fprintf(stderr, "[WORKER] %d recv local=%d wan=%d\n", w, rcvd_local, rcvd_wan);
-            FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
-            if (_df) {
-                struct timespec _ts;
-                clock_gettime(CLOCK_REALTIME, &_ts);
-                long _ms = (long)_ts.tv_sec * 1000L + _ts.tv_nsec / 1000000L;
-                fprintf(_df,
-                        "{\"sessionId\":\"250a01\",\"location\":\"forwarder.c:worker_loop\","
-                        "\"message\":\"recv batch\",\"data\":{\"worker\":%d,\"local\":%d,\"wan\":%d},"
-                        "\"timestamp\":%ld,\"hypothesisId\":\"poll\",\"runId\":\"post-fix\"}\n",
-                        w, rcvd_local, rcvd_wan, _ms);
-                fclose(_df);
+            if (rn < 64 || (rn & 0x3Fu) == 0) {
+                FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
+                if (_df) {
+                    struct timespec _ts;
+                    clock_gettime(CLOCK_REALTIME, &_ts);
+                    long _ms = (long)_ts.tv_sec * 1000L + _ts.tv_nsec / 1000000L;
+                    fprintf(_df,
+                            "{\"sessionId\":\"250a01\",\"location\":\"forwarder.c:worker_loop\","
+                            "\"message\":\"recv batch\",\"data\":{\"worker\":%d,\"local\":%d,\"wan\":%d},"
+                            "\"timestamp\":%ld,\"hypothesisId\":\"poll\",\"runId\":\"post-fix\"}\n",
+                            w, rcvd_local, rcvd_wan, _ms);
+                    fclose(_df);
+                }
             }
         } else if ((++idle_loops & 0xFFFFFu) == 0) {
             FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
@@ -177,6 +180,15 @@ static void *unified_worker_thread(void *arg)
             ne_drain_cq_worker(&fwd->pair, w);
 
         if (is_primary) {
+            struct timespec _now_ts;
+            clock_gettime(CLOCK_MONOTONIC, &_now_ts);
+            uint64_t now_ms = (uint64_t)_now_ts.tv_sec * 1000ULL +
+                              (uint64_t)_now_ts.tv_nsec / 1000000ULL;
+            if (now_ms - last_stats_ms >= 5000) {
+                dataplane_dump_stats();
+                last_stats_ms = now_ms;
+            }
+
             if (pthread_mutex_trylock(&runtime_lock) != 0) {
                 if (!atomic_load_explicit(&running, memory_order_acquire))
                     break;

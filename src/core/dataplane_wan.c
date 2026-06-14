@@ -12,6 +12,7 @@
 
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/interface.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -21,10 +22,11 @@
 
 #define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
 
-static _Atomic uint64_t dp_wan_drop_affinity;
-static _Atomic uint64_t dp_wan_drop_decrypt;
-static _Atomic uint64_t dp_wan_drop_local;
-static _Atomic uint64_t dp_wan_drop_tx;
+_Atomic uint64_t dp_wan_drop_affinity;
+_Atomic uint64_t dp_wan_drop_decrypt;
+_Atomic uint64_t dp_wan_drop_local;
+_Atomic uint64_t dp_wan_drop_tx;
+_Atomic uint64_t dp_lan_tx_room_retry_ok;
 
 static void dp_wan_drop_log(const char *reason, _Atomic uint64_t *ctr, uint32_t len,
                             uint8_t wire_core, int worker)
@@ -303,6 +305,22 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     return 0;
 }
 
+static int lan_tx_room_wait(struct forwarder *fwd, int li, uint32_t need)
+{
+    int w = dp_crypto_current_worker_idx();
+
+    if (ne_tx_has_room_local(&fwd->pair, w, li, need))
+        return 1;
+    for (int i = 0; i < 64; i++) {
+        ne_drain_cq_worker(&fwd->pair, w);
+        if (ne_tx_has_room_local(&fwd->pair, w, li, need)) {
+            atomic_fetch_add(&dp_lan_tx_room_retry_ok, 1);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
 {
     uint32_t dest_ip = dp_dest_ipv4(pkt, len);
@@ -426,7 +444,8 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     }
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
-    if (ne_tx_send_local(&fwd->pair, dp_crypto_current_worker_idx(), li, &job) != 0) {
+    if (!lan_tx_room_wait(fwd, li, 1) ||
+        ne_tx_send_local(&fwd->pair, dp_crypto_current_worker_idx(), li, &job) != 0) {
         dp_wan_drop_log("lan_tx_fail", &dp_wan_drop_tx, job.len, wire_core, worker);
         goto drop;
     }
