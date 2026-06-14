@@ -147,27 +147,33 @@ static int append_wan_unique(struct app_config *dst, const struct wan_config *sr
     return dst->wan_count++;
 }
 
-static int append_policy_unique(struct app_config *dst, const struct crypto_policy *src_cp) {
+static int append_policy_skip_dup(struct app_config *dst, const struct crypto_policy *src_cp,
+                                  int src_profile_id)
+{
     if (!dst || !src_cp)
         return -1;
 
-    if (dst->policy_count >= MAX_CRYPTO_POLICIES)
+    if (dst->policy_count >= MAX_CRYPTO_POLICIES) {
+        fprintf(stderr,
+                "[VALIDATE] profile %d: skip policy db_id=%d pkt_tag=%d (policy table full)\n",
+                src_profile_id, src_cp->db_id, src_cp->id);
         return -1;
+    }
 
     for (int i = 0; i < dst->policy_count; i++) {
         const struct crypto_policy *existing = &dst->policies[i];
         if (src_cp->db_id > 0 && existing->db_id == src_cp->db_id) {
             fprintf(stderr,
-                    "[VALIDATE] merge rejected: policy db_id=%d already exists "
-                    "(existing pkt_tag=%d, new pkt_tag=%d)\n",
-                    src_cp->db_id, existing->id, src_cp->id);
+                    "[VALIDATE] profile %d: skip policy db_id=%d pkt_tag=%d "
+                    "(db_id already used, existing pkt_tag=%d)\n",
+                    src_profile_id, src_cp->db_id, src_cp->id, existing->id);
             return -1;
         }
         if (existing->id == src_cp->id) {
             fprintf(stderr,
-                    "[VALIDATE] merge rejected: policy pkt_tag=%d already exists "
-                    "(existing db_id=%d, new db_id=%d)\n",
-                    src_cp->id, existing->db_id, src_cp->db_id);
+                    "[VALIDATE] profile %d: skip policy pkt_tag=%d db_id=%d "
+                    "(pkt_tag already used, existing db_id=%d)\n",
+                    src_profile_id, src_cp->id, src_cp->db_id, existing->db_id);
             return -1;
         }
     }
@@ -184,6 +190,8 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
     memset(wan_map, -1, sizeof(wan_map));
     memset(policy_map, -1, sizeof(policy_map));
 
+    int src_profile_id = src->profile_count > 0 ? src->profiles[0].id : -1;
+
     for (int i = 0; i < src->local_count; i++) {
         local_map[i] = append_local_unique(dst, &src->locals[i]);
         if (local_map[i] < 0)
@@ -194,11 +202,8 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
         if (wan_map[i] < 0)
             return -1;
     }
-    for (int i = 0; i < src->policy_count; i++) {
-        policy_map[i] = append_policy_unique(dst, &src->policies[i]);
-        if (policy_map[i] < 0)
-            return -1;
-    }
+    for (int i = 0; i < src->policy_count; i++)
+        policy_map[i] = append_policy_skip_dup(dst, &src->policies[i], src_profile_id);
 
     for (int pi = 0; pi < src->profile_count; pi++) {
         if (dst->profile_count >= MAX_PROFILES)
@@ -232,9 +237,12 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
             int spi = sp->policy_indices[i];
             if (spi < 0 || spi >= src->policy_count)
                 continue;
+            int mpi = policy_map[spi];
+            if (mpi < 0)
+                continue;
             if (dp->policy_count >= MAX_CRYPTO_POLICIES)
                 break;
-            dp->policy_indices[dp->policy_count++] = policy_map[spi];
+            dp->policy_indices[dp->policy_count++] = mpi;
         }
     }
     return 0;

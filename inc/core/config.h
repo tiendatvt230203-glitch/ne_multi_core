@@ -180,6 +180,8 @@ int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
 int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip);
 int config_validate(struct app_config *cfg);
+int config_policy_db_id_taken(const struct app_config *cfg, int db_id);
+int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,

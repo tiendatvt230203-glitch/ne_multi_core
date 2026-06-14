@@ -142,95 +142,26 @@ static int config_validate_wan_profile_exclusive(struct app_config *cfg)
     return 0;
 }
 
-static int config_profile_uses_policy(const struct app_config *cfg, int profile_idx,
-                                      int policy_idx)
+int config_policy_db_id_taken(const struct app_config *cfg, int db_id)
 {
-    if (profile_idx < 0 || profile_idx >= cfg->profile_count)
+    if (!cfg || db_id <= 0)
         return 0;
-    const struct profile_config *p = &cfg->profiles[profile_idx];
-    for (int i = 0; i < p->policy_count; i++) {
-        if (p->policy_indices[i] == policy_idx)
+    for (int i = 0; i < cfg->policy_count; i++) {
+        if (cfg->policies[i].db_id == db_id)
             return 1;
     }
     return 0;
 }
 
-static void config_log_policy_profile_owners(const struct app_config *cfg, int policy_idx,
-                                             const char *label)
+int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag)
 {
-    int first = 1;
-
-    fprintf(stderr, "%s profile(s):", label);
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        if (!config_profile_uses_policy(cfg, pi, policy_idx))
-            continue;
-        fprintf(stderr, "%s %d", first ? "" : ",", cfg->profiles[pi].id);
-        first = 0;
-    }
-    if (first)
-        fprintf(stderr, " (none)");
-    fprintf(stderr, "\n");
-}
-
-static int config_validate_policy_ids_per_profile(struct app_config *cfg)
-{
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        for (int i = 0; i < p->policy_count; i++) {
-            int pai = p->policy_indices[i];
-            if (pai < 0 || pai >= cfg->policy_count)
-                continue;
-            const struct crypto_policy *a = &cfg->policies[pai];
-            for (int j = i + 1; j < p->policy_count; j++) {
-                int paj = p->policy_indices[j];
-                if (paj < 0 || paj >= cfg->policy_count)
-                    continue;
-                const struct crypto_policy *b = &cfg->policies[paj];
-                if (a->db_id > 0 && a->db_id == b->db_id) {
-                    fprintf(stderr,
-                            "[VALIDATE] profile %d: duplicate policy db_id=%d "
-                            "(pkt_tag %d vs %d in same profile)\n",
-                            p->id, a->db_id, a->id, b->id);
-                    return -1;
-                }
-                if (a->id == b->id) {
-                    fprintf(stderr,
-                            "[VALIDATE] profile %d: duplicate policy pkt_tag=%d "
-                            "(db_id %d vs %d in same profile)\n",
-                            p->id, a->id, a->db_id, b->db_id);
-                    return -1;
-                }
-            }
-        }
+    if (!cfg)
+        return 0;
+    for (int i = 0; i < cfg->policy_count; i++) {
+        if (cfg->policies[i].id == pkt_tag)
+            return 1;
     }
     return 0;
-}
-
-static int config_validate_policy_ids(struct app_config *cfg)
-{
-    for (int i = 0; i < cfg->policy_count; i++) {
-        const struct crypto_policy *a = &cfg->policies[i];
-        for (int j = i + 1; j < cfg->policy_count; j++) {
-            const struct crypto_policy *b = &cfg->policies[j];
-            if (a->db_id > 0 && a->db_id == b->db_id) {
-                fprintf(stderr,
-                        "[VALIDATE] duplicate policy db_id=%d (pkt_tag %d vs %d)\n",
-                        a->db_id, a->id, b->id);
-                config_log_policy_profile_owners(cfg, i, "[VALIDATE] db_id owner");
-                config_log_policy_profile_owners(cfg, j, "[VALIDATE] db_id conflict");
-                return -1;
-            }
-            if (a->id == b->id) {
-                fprintf(stderr,
-                        "[VALIDATE] duplicate policy pkt_tag=%d (db_id %d vs %d)\n",
-                        a->id, a->db_id, b->db_id);
-                config_log_policy_profile_owners(cfg, i, "[VALIDATE] pkt_tag owner");
-                config_log_policy_profile_owners(cfg, j, "[VALIDATE] pkt_tag conflict");
-                return -1;
-            }
-        }
-    }
-    return config_validate_policy_ids_per_profile(cfg);
 }
 
 int config_validate(struct app_config *cfg) {
@@ -317,8 +248,6 @@ int config_validate(struct app_config *cfg) {
     }
 
     if (config_validate_wan_profile_exclusive(cfg) != 0)
-        return -1;
-    if (config_validate_policy_ids(cfg) != 0)
         return -1;
 
     return 0;

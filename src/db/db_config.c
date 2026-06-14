@@ -572,6 +572,19 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
             }
         }
 
+        if (config_policy_db_id_taken(cfg, cp_base.db_id)) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: skip policy db_id=%d (duplicate db_id)\n",
+                    p->id, cp_base.db_id);
+            continue;
+        }
+        if (config_policy_pkt_tag_taken(cfg, cp_base.id)) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: skip policy pkt_tag=%d db_id=%d (duplicate pkt_tag)\n",
+                    p->id, cp_base.id, cp_base.db_id);
+            continue;
+        }
+
         char src_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
         char dst_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
         char sp_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
