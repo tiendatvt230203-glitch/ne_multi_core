@@ -240,18 +240,41 @@ int profile_iface_xdp_is_add_only(const struct app_config *old, const struct app
 
 /* --- BPF / XDP bind --- */
 
-static int read_xdp_prog_id(const char *ifname, uint32_t *out_id)
+static int read_xdp_prog_id_ip_link(const char *ifname, uint32_t *out_id)
+{
+    char cmd[160];
+    FILE *f;
+    char line[512];
+
+    snprintf(cmd, sizeof(cmd), "ip -o link show dev %s 2>/dev/null", ifname);
+    f = popen(cmd, "r");
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof(line), f)) {
+        const char *tag = strstr(line, "xdp/id:");
+        if (!tag)
+            continue;
+        unsigned int id = 0;
+        if (sscanf(tag + 7, "%u", &id) == 1 && id > 0) {
+            *out_id = (uint32_t)id;
+            pclose(f);
+            return 0;
+        }
+    }
+    pclose(f);
+    return -1;
+}
+
+static int read_xdp_prog_id_sysfs(const char *ifname, const char *suffix, uint32_t *out_id)
 {
     char path[128];
     FILE *f;
 
-    if (!ifname || !out_id)
-        return -1;
-    snprintf(path, sizeof(path), "/sys/class/net/%s/xdp/prog_id", ifname);
+    snprintf(path, sizeof(path), "/sys/class/net/%s/%s", ifname, suffix);
     f = fopen(path, "r");
     if (!f)
         return -1;
-    if (fscanf(f, "%u", out_id) != 1) {
+    if (fscanf(f, "%u", out_id) != 1 || *out_id == 0) {
         fclose(f);
         return -1;
     }
@@ -259,25 +282,54 @@ static int read_xdp_prog_id(const char *ifname, uint32_t *out_id)
     return 0;
 }
 
-static int lan_iface_has_kernel_xdp(const char *ifname, uint32_t *prog_id_out)
+static int read_xdp_prog_id_ifindex(int ifindex, uint32_t xdp_flags, uint32_t *out_id)
+{
+    char ifname[IF_NAMESIZE];
+
+    (void)xdp_flags;
+    if (ifindex <= 0 || !out_id)
+        return -1;
+    if (!if_indextoname((unsigned int)ifindex, ifname))
+        return -1;
+    if (read_xdp_prog_id_sysfs(ifname, "xdp/prog_id", out_id) == 0)
+        return 0;
+    if (read_xdp_prog_id_sysfs(ifname, "xdp_id", out_id) == 0)
+        return 0;
+    return read_xdp_prog_id_ip_link(ifname, out_id);
+}
+
+static int read_xdp_prog_id(const char *ifname, uint32_t xdp_flags, uint32_t *out_id)
+{
+    (void)xdp_flags;
+    if (!ifname || !out_id)
+        return -1;
+    if (read_xdp_prog_id_sysfs(ifname, "xdp/prog_id", out_id) == 0)
+        return 0;
+    if (read_xdp_prog_id_sysfs(ifname, "xdp_id", out_id) == 0)
+        return 0;
+    return read_xdp_prog_id_ip_link(ifname, out_id);
+}
+
+static int lan_iface_has_kernel_xdp(const char *ifname, uint32_t xdp_flags, uint32_t *prog_id_out)
 {
     uint32_t prog_id = 0;
 
     if (!ifname)
         return 0;
-    if (read_xdp_prog_id(ifname, &prog_id) != 0 || prog_id == 0)
+    if (read_xdp_prog_id(ifname, xdp_flags, &prog_id) != 0)
         return 0;
     if (prog_id_out)
         *prog_id_out = prog_id;
     return 1;
 }
 
-static int validate_xdp_attached(const char *ifname, const char *role)
+static int validate_xdp_attached(int ifindex, uint32_t xdp_flags,
+                                 const char *ifname, const char *role)
 {
     uint32_t prog_id = 0;
 
     for (int attempt = 0; attempt < 20; attempt++) {
-        if (read_xdp_prog_id(ifname, &prog_id) == 0 && prog_id != 0) {
+        if (read_xdp_prog_id_ifindex(ifindex, xdp_flags, &prog_id) == 0) {
             fprintf(stderr, "[PROFILE-XDP] validate OK %s %s prog_id=%u (xdp/id:%u)\n",
                     role, ifname, prog_id, prog_id);
             fflush(stderr);
@@ -304,7 +356,7 @@ static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
         fflush(stderr);
         return -1;
     }
-    return validate_xdp_attached(ifname, role);
+    return validate_xdp_attached(ifindex, flags, ifname, role);
 }
 
 static int open_bpf_object(const char *path, struct bpf_object **obj_out,
@@ -385,7 +437,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
                 ifname);
         return -1;
     }
-    skip_attach = lan_iface_has_kernel_xdp(ifname, &existing_id);
+    skip_attach = lan_iface_has_kernel_xdp(ifname, p->xdp_flags, &existing_id);
 
     if (skip_attach && p->bpf_locals[pair_li]) {
         map = bpf_object__find_map_by_name(p->bpf_locals[pair_li], "xsks_map");
@@ -399,9 +451,10 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
 
     if (skip_attach) {
         fprintf(stderr,
-                "[PROFILE-XDP] LAN %s xdp/id:%u — skip attach (shared, other profile owns xdp)\n",
+                "[PROFILE-XDP] LAN %s stale xdp/id:%u — detach and re-attach\n",
                 ifname, existing_id);
-        return 0;
+        interface_ip_xdp_off(ifname);
+        skip_attach = 0;
     }
 
     if (open_bpf_object(cfg->bpf_file, &p->bpf_locals[pair_li],
