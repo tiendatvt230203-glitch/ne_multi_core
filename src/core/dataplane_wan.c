@@ -22,6 +22,12 @@
 
 #define DBG_L2_LOG "/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log"
 
+static int dp_core_log_ok(_Atomic uint64_t *ctr)
+{
+    uint64_t n = atomic_fetch_add(ctr, 1);
+    return n < 100 || (n & 0xFFu) == 0;
+}
+
 _Atomic uint64_t dp_wan_drop_affinity;
 _Atomic uint64_t dp_wan_drop_decrypt;
 _Atomic uint64_t dp_wan_drop_local;
@@ -340,21 +346,44 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     if (wan_pkt_is_l2(pkt, job.len, &wire_core)) {
         wire_tag = pkt[CRYPTO_L2_POLICY_OFF];
+        const char *wan_if = (job.wan_idx < fwd->wan_count)
+                             ? fwd->wans[job.wan_idx].ifname : "?";
+        int bpf_ok = ((int)wire_core == worker);
         // #region agent log
         {
             static _Atomic uint64_t wan_l2_in;
             uint64_t n = atomic_fetch_add(&wan_l2_in, 1);
             if (n < 200 || (n & 0xFFu) == 0)
                 fprintf(stderr, "[DP-WAN-IN] worker=%d wan=%s wire_tag=%u core=%u len=%u\n",
-                        worker,
-                        (job.wan_idx < fwd->wan_count) ? fwd->wans[job.wan_idx].ifname : "?",
-                        (unsigned)wire_tag, (unsigned)wire_core, job.len);
+                        worker, wan_if, (unsigned)wire_tag, (unsigned)wire_core, job.len);
+            static _Atomic uint64_t core_wan_in;
+            if (dp_core_log_ok(&core_wan_in)) {
+                fprintf(stderr,
+                        "[DP-CORE] WAN-IN worker=%d wire_core=%u bpf_ok=%d "
+                        "wan=%s tag=%u len=%u\n",
+                        worker, (unsigned)wire_core, bpf_ok, wan_if,
+                        (unsigned)wire_tag, job.len);
+                fprintf(stderr,
+                        "[DP-FLOW] NE2 tag=%u step=5-WAN-IN worker=%d wire_core=%u "
+                        "bpf_ok=%d wan=%s len=%u\n",
+                        (unsigned)wire_tag, worker, (unsigned)wire_core,
+                        bpf_ok, wan_if, job.len);
+            }
         }
         // #endregion
         int ok = dp_crypto_l2_affinity_ok(pkt, job.len);
         dbg_l2_core_log("dataplane_wan.c:process_wan", "l2 wan affinity", worker,
                         (int)wire_core, ok, job.len);
         if (!ok) {
+            // #region agent log
+            fprintf(stderr,
+                    "[DP-CORE] WAN-IN DROP affinity worker=%d wire_core=%u wan=%s tag=%u\n",
+                    worker, (unsigned)wire_core, wan_if, (unsigned)wire_tag);
+            fprintf(stderr,
+                    "[DP-FLOW] NE2 tag=%u step=5-WAN-IN-DROP worker=%d wire_core=%u "
+                    "reason=affinity wan=%s\n",
+                    (unsigned)wire_tag, worker, (unsigned)wire_core, wan_if);
+            // #endregion
             dp_wan_drop_log("l2_affinity", &dp_wan_drop_affinity, job.len, wire_core, worker);
             goto drop;
         }
@@ -385,7 +414,31 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
                             worker,
                             (job.wan_idx < fwd->wan_count) ? fwd->wans[job.wan_idx].ifname : "?",
                             job.len);
+                if (dp_parse_flow(pkt, job.len, &sip, &dip, &sp, &dp, &proto) == 0) {
+                    static _Atomic uint64_t core_bypass_in;
+                    uint8_t flow_core = dp_crypto_flow_core_id(sip, dip, sp, dp, proto);
+                    if (dp_core_log_ok(&core_bypass_in))
+                        fprintf(stderr,
+                                "[DP-CORE] WAN-IN bypass worker=%d flow_core=%u bpf_ok=%d "
+                                "proto=%u sport=%u dport=%u len=%u\n",
+                                worker, (unsigned)flow_core,
+                                (int)flow_core == worker, (unsigned)proto,
+                                (unsigned)sp, (unsigned)dp, job.len);
+                }
                 fflush(stderr);
+            }
+        }
+        // #endregion
+    } else {
+        // #region agent log
+        {
+            static _Atomic uint64_t wan_unknown;
+            if (dp_core_log_ok(&wan_unknown)) {
+                uint16_t eth = (uint16_t)((pkt[12] << 8) | pkt[13]);
+                fprintf(stderr,
+                        "[DP-CORE] WAN-IN unknown worker=%d eth=0x%04x len=%u wan=%s\n",
+                        worker, (unsigned)eth, job.len,
+                        (job.wan_idx < fwd->wan_count) ? fwd->wans[job.wan_idx].ifname : "?");
             }
         }
         // #endregion
@@ -399,9 +452,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         if (dec != 0) {
             // #region agent log
-            if (wire_tag)
+            if (wire_tag) {
                 fprintf(stderr, "[DP-DROP-WAN] decrypt worker=%d wire_tag=%u len=%u\n",
                         worker, (unsigned)wire_tag, job.len);
+                fprintf(stderr,
+                        "[DP-FLOW] NE2 tag=%u step=6-WAN-DEC-DROP worker=%d reason=decrypt\n",
+                        (unsigned)wire_tag, worker);
+            }
             // #endregion
             dp_wan_drop_log("decrypt", &dp_wan_drop_decrypt, job.len, wire_core, worker);
             goto drop;
@@ -425,6 +482,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
                             (ntohl(dip) >> 24) & 0xff, (ntohl(dip) >> 16) & 0xff,
                             (ntohl(dip) >> 8) & 0xff, ntohl(dip) & 0xff, (unsigned)dp,
                             job.len);
+                static _Atomic uint64_t flow_dec;
+                if (dp_core_log_ok(&flow_dec))
+                    fprintf(stderr,
+                            "[DP-FLOW] NE2 dport=%u step=6-WAN-DEC worker=%d tag=%u "
+                            "sport=%u proto=%u len=%u\n",
+                            (unsigned)dp, worker, (unsigned)wire_tag,
+                            (unsigned)sp, (unsigned)proto, job.len);
             }
         }
         // #endregion
@@ -468,6 +532,24 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
                     (sip >> 8) & 0xff, sip & 0xff, (unsigned)sp,
                     (dip >> 24) & 0xff, (dip >> 16) & 0xff,
                     (dip >> 8) & 0xff, dip & 0xff, (unsigned)dport, job.len);
+        }
+        static _Atomic uint64_t core_lan_tx;
+        if (dp_core_log_ok(&core_lan_tx)) {
+            uint16_t dport = 0;
+            uint16_t sport = 0;
+            uint8_t proto = 0;
+            (void)dp_parse_flow(pkt, job.len, NULL, NULL, &sport, &dport, &proto);
+            fprintf(stderr,
+                    "[DP-CORE] LAN-TX worker=%d local=%s li=%d wire_tag=%u len=%u\n",
+                    worker,
+                    (li >= 0 && li < fwd->local_count) ? fwd->locals[li].ifname : "?",
+                    li, (unsigned)wire_tag, job.len);
+            fprintf(stderr,
+                    "[DP-FLOW] NE2 dport=%u step=7-LAN-TX worker=%d local=%s "
+                    "tag=%u sport=%u len=%u\n",
+                    (unsigned)dport, worker,
+                    (li >= 0 && li < fwd->local_count) ? fwd->locals[li].ifname : "?",
+                    (unsigned)wire_tag, (unsigned)sport, job.len);
         }
     }
     // #endregion

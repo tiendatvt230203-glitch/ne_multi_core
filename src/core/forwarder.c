@@ -141,6 +141,12 @@ static void *unified_worker_thread(void *arg)
             static _Atomic int first_wan_recv;
             if (atomic_exchange(&first_wan_recv, 1) == 0)
                 fprintf(stderr, "[DP-FIRST] wan recv worker=%d batch=%d\n", w, rcvd_wan);
+            static _Atomic uint64_t wan_batch_core;
+            if (atomic_fetch_add(&wan_batch_core, 1) < 100) {
+                fprintf(stderr, "[DP-CORE] wan-batch worker=%d n=%d\n", w, rcvd_wan);
+                fprintf(stderr, "[DP-FLOW] NE2 step=4-WAN-BATCH worker=%d n=%d\n",
+                        w, rcvd_wan);
+            }
         }
         // #endregion
         for (int i = 0; i < rcvd_wan; i++) {

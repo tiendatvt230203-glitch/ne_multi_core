@@ -30,6 +30,10 @@ _Atomic uint64_t dp_drop_crypto;
 _Atomic uint64_t dp_drop_tx;
 static _Atomic uint64_t dp_tx_room_retry_ok;
 
+/* Per-packet trace key for single-flow debug (same worker thread). */
+static __thread uint16_t dbg_trace_dport;
+static __thread uint8_t dbg_trace_tag;
+
 static void dp_drop_log(const char *reason, _Atomic uint64_t *ctr)
 {
     uint64_t n = atomic_fetch_add(ctr, 1) + 1;
@@ -108,6 +112,12 @@ static void dbg_l2_core_log(const char *location, const char *message,
 }
 // #endregion
 
+static int dp_core_log_ok(_Atomic uint64_t *ctr)
+{
+    uint64_t n = atomic_fetch_add(ctr, 1);
+    return n < 100 || (n & 0xFFu) == 0;
+}
+
 static void dp_wan_tx_log(struct forwarder *fwd, int worker, int wan_dp,
                           const struct ne_packet *job, int bypass)
 {
@@ -153,6 +163,24 @@ static void dp_wan_tx_log(struct forwarder *fwd, int worker, int wan_dp,
         fprintf(stderr,
                 "[DP-WAN-TX] worker=%d wan=%s wire_core=%u len=%u\n",
                 worker, wan_if, (unsigned)wire_core, job->len);
+        // #region agent log
+        {
+            static _Atomic uint64_t core_tx;
+            if (dp_core_log_ok(&core_tx)) {
+                fprintf(stderr,
+                        "[DP-CORE] WAN-TX worker=%d wire_core=%u bpf_ok=%d wan=%s tag=%u len=%u\n",
+                        worker, (unsigned)wire_core,
+                        (int)wire_core == worker, wan_if,
+                        (unsigned)pkt[CRYPTO_L2_POLICY_OFF], job->len);
+                fprintf(stderr,
+                        "[DP-FLOW] NE1 dport=%u step=3-WAN-TX worker=%d wire_core=%u "
+                        "bpf_ok=%d wan=%s tag=%u len=%u\n",
+                        (unsigned)dbg_trace_dport, worker, (unsigned)wire_core,
+                        (int)wire_core == worker, wan_if,
+                        (unsigned)pkt[CRYPTO_L2_POLICY_OFF], job->len);
+            }
+        }
+        // #endregion
         fflush(stderr);
     }
 }
@@ -338,6 +366,8 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     uint16_t src_port = 0, dst_port = 0;
     uint8_t proto = 0;
     int flow_ok = dp_parse_flow(pkt, job.len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0;
+    dbg_trace_dport = flow_ok ? dst_port : 0;
+    dbg_trace_tag = 0;
     int li = job.local_idx < fwd->local_count ? (int)job.local_idx : 0;
     int profile_idx;
     const struct crypto_policy *cp;
@@ -373,6 +403,20 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         uint8_t expect_core = dp_crypto_flow_core_id(src_ip, dst_ip,
                                                      src_port, dst_port, proto);
         int worker = dp_crypto_current_worker_idx();
+        static _Atomic uint64_t lan_core_in;
+        if (dp_core_log_ok(&lan_core_in)) {
+            fprintf(stderr,
+                    "[DP-CORE] LAN-IN worker=%d flow_core=%u bpf_ok=%d "
+                    "proto=%u sport=%u dport=%u wan_dp=%d\n",
+                    worker, (unsigned)expect_core,
+                    (int)expect_core == worker, (unsigned)proto,
+                    (unsigned)src_port, (unsigned)dst_port, wan_dp);
+            fprintf(stderr,
+                    "[DP-FLOW] NE1 dport=%u step=1-LAN-IN worker=%d flow_core=%u "
+                    "bpf_ok=%d sport=%u wan_dp=%d\n",
+                    (unsigned)dst_port, worker, (unsigned)expect_core,
+                    (int)expect_core == worker, (unsigned)src_port, wan_dp);
+        }
         if ((int)expect_core != worker) {
             static _Atomic uint64_t lan_core_mismatch;
             uint64_t mm = atomic_fetch_add(&lan_core_mismatch, 1);
@@ -422,9 +466,40 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (enc > 0)
         return;
     pkt = ne_packet_data(&fwd->pair, job.addr);
-    if (cp->action == POLICY_ACTION_ENCRYPT_L2)
+    if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
+        uint8_t wire_core = 0;
+        uint8_t flow_core = dp_crypto_flow_core_id(src_ip, dst_ip,
+                                                   src_port, dst_port, proto);
+        int worker = dp_crypto_current_worker_idx();
+        const char *wan_if = (wan_dp >= 0 && wan_dp < fwd->wan_count)
+                             ? fwd->wans[wan_dp].ifname : "?";
+
         dp_finish_wan_l2_packet(fwd, pkt, job.len, wan_dp,
                                 src_ip, dst_ip, src_port, dst_port, proto);
+        pkt = ne_packet_data(&fwd->pair, job.addr);
+        crypto_layer2_read_core_id(pkt, job.len, &wire_core);
+        dbg_trace_tag = pkt[CRYPTO_L2_POLICY_OFF];
+        // #region agent log
+        {
+            static _Atomic uint64_t lan_l2_out;
+            if (dp_core_log_ok(&lan_l2_out)) {
+                fprintf(stderr,
+                        "[DP-CORE] LAN-TX worker=%d flow_core=%u wire_core=%u "
+                        "bpf_ok=%d wan=%s tag=%u sport=%u dport=%u\n",
+                        worker, (unsigned)flow_core, (unsigned)wire_core,
+                        (int)wire_core == worker, wan_if,
+                        (unsigned)dbg_trace_tag,
+                        (unsigned)src_port, (unsigned)dst_port);
+                fprintf(stderr,
+                        "[DP-FLOW] NE1 dport=%u step=2-LAN-TX worker=%d wire_core=%u "
+                        "bpf_ok=%d wan=%s tag=%u sport=%u\n",
+                        (unsigned)dst_port, worker, (unsigned)wire_core,
+                        (int)wire_core == worker, wan_if,
+                        (unsigned)dbg_trace_tag, (unsigned)src_port);
+            }
+        }
+        // #endregion
+    }
     (void)send_to_wan(fwd, &job, wan_dp, 0);
     return;
 
