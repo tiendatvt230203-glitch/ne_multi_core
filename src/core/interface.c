@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -308,6 +309,13 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
         fprintf(stderr, "[XDP] object %s missing program/map\n", path);
         bpf_object__close(obj);
         return -1;
+    }
+
+    {
+        struct stat st;
+        if (stat(path, &st) == 0)
+            fprintf(stderr, "[XDP] loaded %s size=%ld mtime=%ld\n",
+                    path, (long)st.st_size, (long)st.st_mtime);
     }
 
     *obj_out = obj;

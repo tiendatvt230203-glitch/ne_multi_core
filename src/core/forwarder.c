@@ -121,6 +121,13 @@ static void *unified_worker_thread(void *arg)
             ne_refill_fq_worker(&fwd->pair, w);
 
         int rcvd_local = ne_recv_local_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
+        // #region agent log
+        if (rcvd_local > 0) {
+            static _Atomic int first_lan_recv;
+            if (atomic_exchange(&first_lan_recv, 1) == 0)
+                fprintf(stderr, "[DP-FIRST] lan recv worker=%d batch=%d\n", w, rcvd_local);
+        }
+        // #endregion
         for (int i = 0; i < rcvd_local; i++) {
             dataplane_process_local(fwd, batch[i]);
             did_work = 1;
@@ -129,6 +136,13 @@ static void *unified_worker_thread(void *arg)
             ne_recv_release_local_worker(&fwd->pair, w);
 
         int rcvd_wan = ne_recv_wan_worker(&fwd->pair, w, batch, NE_BATCH_SIZE);
+        // #region agent log
+        if (rcvd_wan > 0) {
+            static _Atomic int first_wan_recv;
+            if (atomic_exchange(&first_wan_recv, 1) == 0)
+                fprintf(stderr, "[DP-FIRST] wan recv worker=%d batch=%d\n", w, rcvd_wan);
+        }
+        // #endregion
         for (int i = 0; i < rcvd_wan; i++) {
             if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
                 ne_frame_free(&fwd->pair, batch[i].addr);

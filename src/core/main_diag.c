@@ -338,6 +338,9 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
         return;
 
     fprintf(stderr, "+-- DATAPLANE ready --+\n");
+    fprintf(stderr,
+            "[BUILD] flow-hash-bpf workers=4 (LAN/WAN redirect by 5-tuple hash)\n");
+    fflush(stderr);
     print_iface_table(cfg);
     print_profile_bindings(cfg);
     fprintf(stderr, "\n");
