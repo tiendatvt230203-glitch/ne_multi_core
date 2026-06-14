@@ -264,12 +264,16 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     {
         static const uint8_t zero_mac[MAC_LEN];
         // #region agent log
-        if (memcmp(fwd->wans[wan_dp].dst_mac, zero_mac, MAC_LEN) == 0 ||
-            memcmp(fwd->wans[wan_dp].src_mac, zero_mac, MAC_LEN) == 0) {
+        int wan_ci = (wan_dp >= 0 && wan_dp < MAX_INTERFACES) ? fwd->wan_cfg_idx[wan_dp] : -1;
+        int wan_routed = (wan_ci >= 0 && wan_ci < fwd->cfg->wan_count &&
+                          fwd->cfg->wans[wan_ci].dst_ip != 0);
+        if (wan_routed &&
+            (memcmp(fwd->wans[wan_dp].dst_mac, zero_mac, MAC_LEN) == 0 ||
+             memcmp(fwd->wans[wan_dp].src_mac, zero_mac, MAC_LEN) == 0)) {
             static _Atomic int wan_mac_warn_once;
             if (atomic_exchange(&wan_mac_warn_once, 1) == 0)
                 fprintf(stderr,
-                        "[DP-WARN] WAN dp=%d (%s) missing src/dst MAC in DB — L2 header not rewritten\n",
+                        "[DP-WARN] routed WAN dp=%d (%s) missing src/dst MAC — need MAC for L3/PQC WAN\n",
                         wan_dp, fwd->wans[wan_dp].ifname);
         }
         // #endregion
