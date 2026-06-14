@@ -90,17 +90,3 @@ int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
         return 0;
     return dp_write_l2(pkt, len, dst, src, 0);
 }
-
-int dp_apply_bridge_wan_eth(uint8_t *pkt, uint32_t len, const uint8_t wan_src[MAC_LEN])
-{
-    static const uint8_t bcast[MAC_LEN] = {
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    };
-    static const uint8_t zero[MAC_LEN];
-
-    if (!pkt || len < sizeof(struct ether_header))
-        return -1;
-    if (!wan_src || memcmp(wan_src, zero, MAC_LEN) == 0)
-        return 0;
-    return dp_write_l2(pkt, len, bcast, wan_src, 1);
-}

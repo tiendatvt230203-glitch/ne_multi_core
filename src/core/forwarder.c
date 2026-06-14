@@ -143,7 +143,7 @@ static void *unified_worker_thread(void *arg)
         if (rcvd_local > 0 || rcvd_wan > 0) {
             static _Atomic uint64_t recv_log_count;
             uint64_t rn = atomic_fetch_add(&recv_log_count, 1);
-            if (rn < 20 || (rn & 0xFFFu) == 0)
+            if (rn < 200 || (rn & 0xFFFu) == 0)
                 fprintf(stderr, "[WORKER] %d recv local=%d wan=%d\n", w, rcvd_local, rcvd_wan);
             FILE *_df = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-250a01.log", "a");
             if (_df) {

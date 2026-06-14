@@ -326,7 +326,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         {
             static _Atomic uint64_t wan_l2_in;
             uint64_t n = atomic_fetch_add(&wan_l2_in, 1);
-            if (n < 40 || (n & 0xFFu) == 0)
+            if (n < 200 || (n & 0xFFu) == 0)
                 fprintf(stderr, "[DP-WAN-IN] worker=%d wan=%s wire_tag=%u core=%u len=%u\n",
                         worker,
                         (job.wan_idx < fwd->wan_count) ? fwd->wans[job.wan_idx].ifname : "?",
@@ -340,6 +340,37 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             dp_wan_drop_log("l2_affinity", &dp_wan_drop_affinity, job.len, wire_core, worker);
             goto drop;
         }
+    } else if (wan_l2_plain_ipv4(pkt, job.len)) {
+        // #region agent log
+        {
+            static _Atomic uint64_t wan_bypass_in;
+            uint64_t n = atomic_fetch_add(&wan_bypass_in, 1);
+            if (n < 200 || (n & 0x3Fu) == 0) {
+                uint32_t sip = 0, dip = 0;
+                uint16_t sp = 0, dp = 0;
+                uint8_t proto = 0;
+                if (dp_parse_flow(pkt, job.len, &sip, &dip, &sp, &dp, &proto) == 0)
+                    fprintf(stderr,
+                            "[DP-WAN-IN] worker=%d wan=%s bypass proto=%u "
+                            "src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u len=%u\n",
+                            worker,
+                            (job.wan_idx < fwd->wan_count) ? fwd->wans[job.wan_idx].ifname : "?",
+                            (unsigned)proto,
+                            (ntohl(sip) >> 24) & 0xff, (ntohl(sip) >> 16) & 0xff,
+                            (ntohl(sip) >> 8) & 0xff, ntohl(sip) & 0xff, (unsigned)sp,
+                            (ntohl(dip) >> 24) & 0xff, (ntohl(dip) >> 16) & 0xff,
+                            (ntohl(dip) >> 8) & 0xff, ntohl(dip) & 0xff, (unsigned)dp,
+                            job.len);
+                else
+                    fprintf(stderr,
+                            "[DP-WAN-IN] worker=%d wan=%s bypass len=%u\n",
+                            worker,
+                            (job.wan_idx < fwd->wan_count) ? fwd->wans[job.wan_idx].ifname : "?",
+                            job.len);
+                fflush(stderr);
+            }
+        }
+        // #endregion
     }
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
@@ -406,7 +437,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     {
         static _Atomic uint64_t wan_lan_ok;
         uint64_t wo = atomic_fetch_add(&wan_lan_ok, 1);
-        if (wo < 20 || (wo & 0xFFu) == 0) {
+        if (wo < 200 || (wo & 0xFFu) == 0) {
             uint32_t sip = 0, dip = 0;
             uint16_t sp = 0, dport = 0;
             uint8_t proto = 0;

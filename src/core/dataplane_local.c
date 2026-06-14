@@ -56,7 +56,7 @@ static void dp_lan_tcp_log(struct forwarder *fwd, uint8_t proto,
 {
     static _Atomic uint64_t lan_tcp_log_count;
     uint64_t n = atomic_fetch_add(&lan_tcp_log_count, 1);
-    if (n >= 30 && (n & 0xFFu) != 0)
+    if (n >= 200 && (n & 0xFFu) != 0)
         return;
     int w = dp_crypto_current_worker_idx();
     const char *mode = (cp->crypto_mode == CRYPTO_MODE_PQC) ? "pqc"
@@ -77,6 +77,7 @@ static void dp_lan_tcp_log(struct forwarder *fwd, uint8_t proto,
              cp ? (int)cp->id : -1, cp ? cp->db_id : -1, wan_dp, enc_rc);
     dp_dbg_ndjson("dataplane_local.c:process_local", "lan tcp path", "A-port-policy",
                   w, extra);
+    fflush(stderr);
 }
 // #endregion
 
@@ -99,27 +100,63 @@ static void dbg_l2_core_log(const char *location, const char *message,
 }
 // #endregion
 
-static int send_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
+static void dp_wan_tx_log(struct forwarder *fwd, int worker, int wan_dp,
+                          const struct ne_packet *job, int bypass)
 {
-    int w = dp_crypto_current_worker_idx();
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint8_t wire_core = 0;
     const char *wan_if = (fwd && wan_dp >= 0 && wan_dp < fwd->wan_count)
                          ? fwd->wans[wan_dp].ifname : "?";
 
+    if (!pkt)
+        return;
+
+    if (bypass) {
+        static _Atomic uint64_t wan_tx_bypass;
+        uint64_t n = atomic_fetch_add(&wan_tx_bypass, 1);
+        if (n >= 200 && (n & 0x3Fu) != 0)
+            return;
+        uint32_t sip = 0, dip = 0;
+        uint16_t sp = 0, dp = 0;
+        uint8_t proto = 0;
+        if (dp_parse_flow(pkt, job->len, &sip, &dip, &sp, &dp, &proto) == 0)
+            fprintf(stderr,
+                    "[DP-WAN-TX] worker=%d wan=%s bypass proto=%u "
+                    "src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u len=%u\n",
+                    worker, wan_if, (unsigned)proto,
+                    (ntohl(sip) >> 24) & 0xff, (ntohl(sip) >> 16) & 0xff,
+                    (ntohl(sip) >> 8) & 0xff, ntohl(sip) & 0xff, (unsigned)sp,
+                    (ntohl(dip) >> 24) & 0xff, (ntohl(dip) >> 16) & 0xff,
+                    (ntohl(dip) >> 8) & 0xff, ntohl(dip) & 0xff, (unsigned)dp,
+                    job->len);
+        else
+            fprintf(stderr,
+                    "[DP-WAN-TX] worker=%d wan=%s bypass len=%u\n",
+                    worker, wan_if, job->len);
+        fflush(stderr);
+        return;
+    }
+
+    if (crypto_layer2_read_core_id(pkt, job->len, &wire_core) == 0) {
+        static _Atomic uint64_t wan_tx_l2;
+        uint64_t n = atomic_fetch_add(&wan_tx_l2, 1);
+        if (n >= 200 && (n & 0xFFu) != 0)
+            return;
+        fprintf(stderr,
+                "[DP-WAN-TX] worker=%d wan=%s wire_core=%u len=%u\n",
+                worker, wan_if, (unsigned)wire_core, job->len);
+        fflush(stderr);
+    }
+}
+
+static int send_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp, int bypass)
+{
+    int w = dp_crypto_current_worker_idx();
+
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
     // #region agent log
-    {
-        uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
-        if (pkt && crypto_layer2_read_core_id(pkt, job->len, &wire_core) == 0) {
-            static _Atomic uint64_t wan_tx_log;
-            uint64_t n = atomic_fetch_add(&wan_tx_log, 1);
-            if (n < 40 || (n & 0xFFu) == 0)
-                fprintf(stderr,
-                        "[DP-WAN-TX] worker=%d wan=%s wire_core=%u len=%u\n",
-                        w, wan_if, (unsigned)wire_core, job->len);
-        }
-    }
+    dp_wan_tx_log(fwd, w, wan_dp, job, bypass);
     // #endregion
     if (ne_tx_send_wan(&fwd->pair, w, wan_dp, job) != 0) {
         dp_drop_log("wan_tx_fail", &dp_drop_tx);
@@ -127,16 +164,6 @@ static int send_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
         return -1;
     }
     return 0;
-}
-
-static int wan_is_bridge(const struct forwarder *fwd, int wan_dp)
-{
-    int ci;
-
-    if (!fwd || wan_dp < 0 || wan_dp >= fwd->wan_count)
-        return 0;
-    ci = fwd->wan_cfg_idx[wan_dp];
-    return ci >= 0 && ci < fwd->cfg->wan_count && fwd->cfg->wans[ci].dst_ip == 0;
 }
 
 static void dp_patch_l2_flow_core(uint8_t *pkt, uint32_t len,
@@ -152,16 +179,16 @@ static void dp_patch_l2_flow_core(uint8_t *pkt, uint32_t len,
                                                         src_port, dst_port, proto);
 }
 
-static void dp_finish_wan_packet(struct forwarder *fwd, uint8_t *pkt, uint32_t len,
-                                 int wan_dp, int is_l2,
-                                 uint32_t src_ip, uint32_t dst_ip,
-                                 uint16_t src_port, uint16_t dst_port,
-                                 uint8_t proto)
+static void dp_finish_wan_l2_packet(struct forwarder *fwd, uint8_t *pkt, uint32_t len,
+                                    int wan_dp,
+                                    uint32_t src_ip, uint32_t dst_ip,
+                                    uint16_t src_port, uint16_t dst_port,
+                                    uint8_t proto)
 {
-    if (wan_is_bridge(fwd, wan_dp))
-        (void)dp_apply_bridge_wan_eth(pkt, len, fwd->wans[wan_dp].src_mac);
-    if (is_l2)
-        dp_patch_l2_flow_core(pkt, len, src_ip, dst_ip, src_port, dst_port, proto);
+    (void)fwd;
+    (void)wan_dp;
+    /* Bridge: preserve end-host MAC/IP (transparent L2). Only patch wire core_id. */
+    dp_patch_l2_flow_core(pkt, len, src_ip, dst_ip, src_port, dst_port, proto);
 }
 
 static int send_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
@@ -232,10 +259,12 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
         dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         return -1;
-    dp_finish_wan_packet(fwd, pkt, l1, wan_dp, cp->action == POLICY_ACTION_ENCRYPT_L2,
-                         src_ip, dst_ip, src_port, dst_port, proto);
-    dp_finish_wan_packet(fwd, f2, l2, wan_dp, cp->action == POLICY_ACTION_ENCRYPT_L2,
-                         src_ip, dst_ip, src_port, dst_port, proto);
+    if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
+        dp_finish_wan_l2_packet(fwd, pkt, l1, wan_dp,
+                                src_ip, dst_ip, src_port, dst_port, proto);
+        dp_finish_wan_l2_packet(fwd, f2, l2, wan_dp,
+                                src_ip, dst_ip, src_port, dst_port, proto);
+    }
     if (send_split_to_wan(fwd, job, l1, f2, l2, wan_dp) != 0)
         return -1;
     return 1;
@@ -337,9 +366,9 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {
-        dp_finish_wan_packet(fwd, pkt, job.len, wan_dp, 0,
-                             src_ip, dst_ip, src_port, dst_port, proto);
-        (void)send_to_wan(fwd, &job, wan_dp);
+        if (proto == 6 || proto == 17)
+            dp_lan_tcp_log(fwd, proto, dst_port, src_port, cp, wan_dp, 0, flow_ok);
+        (void)send_to_wan(fwd, &job, wan_dp, 1);
         return;
     }
     if (!fwd->cfg->crypto_enabled)
@@ -372,10 +401,10 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (enc > 0)
         return;
     pkt = ne_packet_data(&fwd->pair, job.addr);
-    dp_finish_wan_packet(fwd, pkt, job.len, wan_dp,
-                          cp->action == POLICY_ACTION_ENCRYPT_L2,
-                          src_ip, dst_ip, src_port, dst_port, proto);
-    (void)send_to_wan(fwd, &job, wan_dp);
+    if (cp->action == POLICY_ACTION_ENCRYPT_L2)
+        dp_finish_wan_l2_packet(fwd, pkt, job.len, wan_dp,
+                                src_ip, dst_ip, src_port, dst_port, proto);
+    (void)send_to_wan(fwd, &job, wan_dp, 0);
     return;
 
 drop_policy:
