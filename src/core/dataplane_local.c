@@ -153,7 +153,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
+    if (wan_dp < 0)
         goto drop;
     if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         goto drop;

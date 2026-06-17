@@ -11,7 +11,9 @@
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
 
-#define NE_CPU_LOC        0u
+#define NE_CPU_LOC_RX0    0u
+#define NE_CPU_LOC_RX1    7u
+#define NE_CPU_LOC        NE_CPU_LOC_RX0
 #define NE_CPU_TX0        1u
 #define NE_CPU_TX1        2u
 #define NE_CPU_TX2        9u
@@ -21,12 +23,13 @@
 #define NE_CPU_MID2       4u
 #define NE_CPU_MID3       5u
 #define NE_CPU_MID4       6u
-#define NE_CPU_MID5       7u
-#define NE_CPU_MID6       8u
 
-#define NE_CPU_WAN        11u
+#define NE_CPU_WAN_RX0    11u
+#define NE_CPU_WAN_RX1    8u
+#define NE_CPU_WAN        NE_CPU_WAN_RX0
 
-#define NE_CRYPTO_WORKERS 6u
+#define NE_CRYPTO_WORKERS 4u
+#define NE_RX_SLOTS       2u
 #define NE_TX_SLOTS       4u
 
 struct bpf_object;
@@ -165,14 +168,20 @@ void ne_pair_close(struct ne_pair *p);
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
+int ne_recv_local_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int rx_slot);
+int ne_recv_wan_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int rx_slot);
 void ne_recv_release_local(struct ne_pair *p);
 void ne_recv_release_wan(struct ne_pair *p);
+void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot);
+void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_all(struct ne_pair *p, int tx_slot);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
+void ne_refill_fq_local_slot(struct ne_pair *p, int rx_slot);
+void ne_refill_fq_wan_slot(struct ne_pair *p, int rx_slot);
 int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
                           int local_idx, int tx_slot);
 int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
