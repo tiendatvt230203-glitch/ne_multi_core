@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "cpu_map.h"
 #include <pthread.h>
 #include <signal.h>
 
@@ -10,45 +11,6 @@
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
-
-/*
- * IO shard model (NE_IO_SLOTS = 4): queue q → shard q%4
- *   Mỗi shard: UMEM riêng + 1 io_shard thread (RX LAN/WAN + CQ drain + TX)
- *   local_to_mid[worker][shard]  — SPSC: RX shard → crypto worker
- *   wan_to_mid[worker][shard]    — SPSC
- *   mid_to_*[iface][shard][worker] — SPSC: crypto worker → io shard TX
- * Chỉnh CPU tại NE_CPU_IO* / NE_CPU_TX* / NE_CPU_MID* (không trùng core).
- */
-#define NE_IO_SLOTS       4u
-#define NE_RX_SLOTS       NE_IO_SLOTS
-#define NE_TX_SLOTS       NE_IO_SLOTS
-
-#define NE_CPU_IO0        0u   /* shard 0: RX+TX queues q%4==0 */
-#define NE_CPU_IO1        1u
-#define NE_CPU_IO2        2u
-#define NE_CPU_IO3        9u
-#define NE_CPU_LOC        NE_CPU_IO0
-#define NE_CPU_WAN        NE_CPU_IO3
-
-#define NE_CPU_TX0        NE_CPU_IO0
-#define NE_CPU_TX1        NE_CPU_IO1
-#define NE_CPU_TX2        NE_CPU_IO2
-#define NE_CPU_TX3        NE_CPU_IO3
-#define NE_CPU_LOC_TX     NE_CPU_TX0
-#define NE_CPU_LOC_TX1    NE_CPU_TX1
-#define NE_CPU_WAN_TX     NE_CPU_TX2
-#define NE_CPU_WAN_TX1    NE_CPU_TX3
-
-#define NE_CPU_MID1       3u
-#define NE_CPU_MID2       4u
-#define NE_CPU_MID3       5u
-#define NE_CPU_MID4       6u
-#define NE_CPU_MID5       7u
-#define NE_CPU_MID6       8u
-#define NE_CPU_LOC_RX1    NE_CPU_IO1
-#define NE_CPU_WAN_RX1    NE_CPU_IO2
-
-#define NE_CRYPTO_WORKERS 6u
 
 #define NE_XSK_BIND_FLAGS (XDP_COPY | XDP_USE_NEED_WAKEUP)
 
@@ -107,28 +69,6 @@ struct ne_packet {
     uint8_t dir;
     uint8_t wan_idx;
     uint8_t local_idx;
-    uint8_t umem_slot; /* 0..NE_TX_SLOTS-1: shard owning addr */
-};
-
-struct ne_pool {
-    uint64_t *buf;
-    uint32_t cap;
-    uint32_t mask;
-    uint32_t head;
-    uint32_t tail;
-    pthread_spinlock_t lock;
-};
-
-struct ne_umem_shard {
-    void *bufs;
-    size_t bufsize;
-    uint32_t n_frames;
-    uint32_t frame_size;
-    struct xsk_umem *umem;
-    struct xsk_ring_prod fq;
-    struct xsk_ring_cons cq;
-    struct ne_pool pool;
-    uint8_t live;
 };
 
 struct ne_ring {
@@ -142,6 +82,15 @@ struct ne_ring {
     uint8_t mpsc_pop;
 };
 
+struct ne_pool {
+    uint64_t *buf;
+    uint32_t cap;
+    uint32_t mask;
+    uint32_t head;
+    uint32_t tail;
+    pthread_spinlock_t lock;
+};
+
 struct ne_xsk_queue {
     struct xsk_socket *xsk;
     struct xsk_ring_cons rx;
@@ -149,7 +98,6 @@ struct ne_xsk_queue {
     struct xsk_ring_prod fq;
     struct xsk_ring_cons cq;
     uint32_t rx_pending;
-    uint8_t umem_slot;
 };
 
 struct ne_iface {
@@ -161,15 +109,18 @@ struct ne_iface {
 };
 
 struct ne_pair {
+    void *bufs;
+    size_t bufsize;
     uint32_t frame_size;
-    uint32_t n_frames_per_shard;
-    struct ne_umem_shard shards[NE_TX_SLOTS];
+    uint32_t n_frames;
+    struct xsk_umem *umem;
     struct ne_iface locals[MAX_INTERFACES];
     int local_count;
     struct ne_iface wans[MAX_INTERFACES];
     int wan_count;
     int local_queue_total;
     int wan_queue_total;
+    struct ne_pool pool;
     struct bpf_object *bpf_locals[MAX_INTERFACES];
     struct bpf_object *bpf_wans[MAX_INTERFACES];
     uint8_t xdp_local_on[MAX_INTERFACES];
@@ -199,8 +150,8 @@ void ne_pair_close(struct ne_pair *p);
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-int ne_recv_local_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int rx_slot);
-int ne_recv_wan_slot(struct ne_pair *p, struct ne_packet *out, uint32_t max, int rx_slot);
+int ne_recv_local_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
+int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
 void ne_recv_release_local(struct ne_pair *p);
 void ne_recv_release_wan(struct ne_pair *p);
 void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot);
@@ -208,7 +159,6 @@ void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
-void ne_drain_cq_all(struct ne_pair *p, int tx_slot);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
 void ne_refill_fq_local_slot(struct ne_pair *p, int rx_slot);
@@ -218,22 +168,9 @@ int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_cou
 int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
                         int wan_idx, int tx_slot);
 
-void *ne_packet_data(struct ne_pair *p, int umem_slot, uint64_t addr);
-int ne_frame_alloc(struct ne_pair *p, int umem_slot, uint64_t *addr_out);
-void ne_frame_free(struct ne_pair *p, int umem_slot, uint64_t addr);
-
-static inline void *ne_pkt_data(const struct ne_pair *p, const struct ne_packet *pkt)
-{
-    if (!p || !pkt || pkt->umem_slot >= NE_TX_SLOTS)
-        return NULL;
-    return ne_packet_data((struct ne_pair *)p, (int)pkt->umem_slot, pkt->addr);
-}
-
-static inline void ne_pkt_free(struct ne_pair *p, const struct ne_packet *pkt)
-{
-    if (p && pkt && pkt->umem_slot < NE_TX_SLOTS)
-        ne_frame_free(p, (int)pkt->umem_slot, pkt->addr);
-}
+void *ne_packet_data(struct ne_pair *p, uint64_t addr);
+int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
+void ne_frame_free(struct ne_pair *p, uint64_t addr);
 
 void interface_reset_redirect_maps(void);
 void interface_ip_xdp_off(const char *ifname);

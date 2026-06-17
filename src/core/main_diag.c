@@ -127,47 +127,31 @@ static void fmt_subnet(char *out, size_t outsz, const struct local_config *loc) 
     snprintf(out, outsz, "%s/%d", inet_ntoa(net), prefix);
 }
 
-static void print_profile_lan_wan(const struct app_config *cfg, const struct profile_config *p)
-{
-    int i;
+static void print_iface_table(const struct app_config *cfg) {
+    static const int w[DIAG_TBL_N] = { 14, 12, 20, 20, 0, 0, 0, 0 };
+    static const char *hdr[DIAG_TBL_N] = {
+        "role", "interface", "subnet", "note", "", "", "", ""
+    };
 
-    fprintf(stderr, "  LAN (%d):\n", p->local_count);
-    if (p->local_count == 0) {
-        fprintf(stderr, "    (none)\n");
-    }
-    for (i = 0; i < p->local_count; i++) {
-        int li = p->local_indices[i];
-        char subnet[32];
+    fprintf(stderr, "\n  [interfaces]\n");
+    tbl_hline(w, 4);
+    tbl_row(w, 4, hdr);
+    tbl_hline(w, 4);
 
-        if (li < 0 || li >= cfg->local_count)
-            continue;
-        fmt_subnet(subnet, sizeof(subnet), &cfg->locals[li]);
-        fprintf(stderr, "    %-12s  %s\n", cfg->locals[li].ifname, subnet);
+    for (int i = 0; i < cfg->local_count; i++) {
+        char subnet[32], c0[32], c1[32], c2[32], c3[32];
+        fmt_subnet(subnet, sizeof(subnet), &cfg->locals[i]);
+        snprintf(c0, sizeof(c0), "lan");
+        snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
+        snprintf(c2, sizeof(c2), "%s", subnet);
+        snprintf(c3, sizeof(c3), "remote subnet");
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
+        tbl_row(w, 4, row);
     }
-
-    fprintf(stderr, "  WAN (%d):\n", p->wan_count);
-    if (p->wan_count == 0) {
-        fprintf(stderr, "    (none)\n");
-        return;
-    }
-    for (i = 0; i < p->wan_count; i++) {
-        int wi = p->wan_indices[i];
-        const struct wan_config *wan;
-
-        if (wi < 0 || wi >= cfg->wan_count)
-            continue;
-        wan = &cfg->wans[wi];
-        if (wan->dataplane) {
-            fprintf(stderr, "    %-12s  dataplane\n", wan->ifname);
-        } else {
-            struct in_addr peer = { .s_addr = wan->dst_ip };
-            fprintf(stderr, "    %-12s  handshake peer %s\n", wan->ifname, inet_ntoa(peer));
-        }
-    }
+    tbl_hline(w, 4);
 }
 
-static void print_profile_policies(const struct app_config *cfg, const struct profile_config *p)
-{
+static void print_policy_table(const struct app_config *cfg) {
     static const int w[DIAG_TBL_N] = {
         6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 0, 0
     };
@@ -176,63 +160,44 @@ static void print_profile_policies(const struct app_config *cfg, const struct pr
         "src", "dst", "sport", "dport", "", ""
     };
 
-    fprintf(stderr, "  policies (%d):\n", p->policy_count);
-    if (p->policy_count == 0) {
-        fprintf(stderr, "    (none)\n");
-        return;
-    }
+    fprintf(stderr, "\n  [policies] count=%d\n", cfg->policy_count);
     fprintf(stderr,
-            "    priority = match order; pkt_tag = wire id (not db_id)\n");
+            "  priority = match order (lower first); pkt_tag = ID in encrypted packet (not DB id)\n");
     tbl_hline(w, 10);
     tbl_row(w, 10, hdr);
     tbl_hline(w, 10);
 
-    for (int j = 0; j < p->policy_count; j++) {
-        int pix = p->policy_indices[j];
-        if (pix < 0 || pix >= cfg->policy_count)
-            continue;
-        const struct crypto_policy *cp = &cfg->policies[pix];
-        char c0[8], c1[8], c2[8], c3[12], c4[8], c5[12];
-        char c8[12], c9[12];
-        char src_c[DIAG_CIDR_LEN], dst_c[DIAG_CIDR_LEN];
-
-        snprintf(c0, sizeof(c0), "%d", cp->db_id);
-        snprintf(c1, sizeof(c1), "%d", cp->priority);
-        snprintf(c2, sizeof(c2), "%d", cp->id);
-        snprintf(c3, sizeof(c3), "%s", policy_action_name(cp->action));
-        policy_crypto_label(cp, c4, sizeof(c4));
-        snprintf(c5, sizeof(c5), "%s", policy_proto_str(cp->protocol));
-        policy_cidr_field(src_c, sizeof(src_c), cp->src_any, cp->src_negate,
-                          cp->src_net, cp->src_mask);
-        policy_cidr_field(dst_c, sizeof(dst_c), cp->dst_any, cp->dst_negate,
-                          cp->dst_net, cp->dst_mask);
-        policy_port_str(c8, sizeof(c8), cp->src_port_from, cp->src_port_to);
-        policy_port_str(c9, sizeof(c9), cp->dst_port_from, cp->dst_port_to);
-
-        const char *row[DIAG_TBL_N] = {
-            c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, "", ""
-        };
-        tbl_row(w, 10, row);
-    }
-    tbl_hline(w, 10);
-}
-
-static void print_profiles_detail(const struct app_config *cfg)
-{
-    if (!cfg || cfg->profile_count <= 0)
-        return;
-
-    fprintf(stderr, "\n  [by profile]\n");
     for (int pr = 0; pr < cfg->profile_count; pr++) {
         const struct profile_config *p = &cfg->profiles[pr];
+        for (int j = 0; j < p->policy_count; j++) {
+            int pix = p->policy_indices[j];
+            if (pix < 0 || pix >= cfg->policy_count)
+                continue;
+            const struct crypto_policy *cp = &cfg->policies[pix];
+            char c0[8], c1[8], c2[8], c3[12], c4[8], c5[12];
+            char c8[12], c9[12];
+            char src_c[DIAG_CIDR_LEN], dst_c[DIAG_CIDR_LEN];
 
-        fprintf(stderr, "\n  --- profile %d", p->id);
-        if (p->name[0])
-            fprintf(stderr, " (%s)", p->name);
-        fprintf(stderr, " ---\n");
-        print_profile_lan_wan(cfg, p);
-        print_profile_policies(cfg, p);
+            snprintf(c0, sizeof(c0), "%d", cp->db_id);
+            snprintf(c1, sizeof(c1), "%d", cp->priority);
+            snprintf(c2, sizeof(c2), "%d", cp->id);
+            snprintf(c3, sizeof(c3), "%s", policy_action_name(cp->action));
+            policy_crypto_label(cp, c4, sizeof(c4));
+            snprintf(c5, sizeof(c5), "%s", policy_proto_str(cp->protocol));
+            policy_cidr_field(src_c, sizeof(src_c), cp->src_any, cp->src_negate,
+                              cp->src_net, cp->src_mask);
+            policy_cidr_field(dst_c, sizeof(dst_c), cp->dst_any, cp->dst_negate,
+                              cp->dst_net, cp->dst_mask);
+            policy_port_str(c8, sizeof(c8), cp->src_port_from, cp->src_port_to);
+            policy_port_str(c9, sizeof(c9), cp->dst_port_from, cp->dst_port_to);
+
+            const char *row[DIAG_TBL_N] = {
+                c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, "", ""
+            };
+            tbl_row(w, 10, row);
+        }
     }
+    tbl_hline(w, 10);
 }
 
 void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cfg) {
@@ -244,7 +209,8 @@ void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cf
             trigger_profile_id);
     fprintf(stderr, "  unchanged: LAN=%d WAN=%d policies=%d\n",
             cfg->local_count, cfg->wan_count, cfg->policy_count);
-    print_profiles_detail(cfg);
+    print_iface_table(cfg);
+    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
@@ -264,7 +230,8 @@ void main_diag_log_db_apply(const struct app_config *cfg, int trigger_profile_id
     fprintf(stderr, "\n");
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
-    print_profiles_detail(cfg);
+    print_iface_table(cfg);
+    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
@@ -283,7 +250,7 @@ void main_diag_log_db_policy_apply(const struct app_config *cfg, int trigger_pro
     }
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
-    print_profiles_detail(cfg);
+    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
@@ -302,20 +269,9 @@ void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id
     }
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
-    print_profiles_detail(cfg);
-    if (policy_only) {
-        const struct profile_config *p = NULL;
-        for (int i = 0; i < cfg->profile_count; i++) {
-            if (cfg->profiles[i].id == trigger_profile_id) {
-                p = &cfg->profiles[i];
-                break;
-            }
-        }
-        if (p) {
-            fprintf(stderr, "\n  (reload scope: profile %d policies only; LAN/WAN unchanged)\n",
-                    trigger_profile_id);
-        }
-    }
+    if (!policy_only)
+        print_iface_table(cfg);
+    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
@@ -325,7 +281,7 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
         return;
 
     fprintf(stderr, "+-- DATAPLANE ready --+\n");
-    print_profiles_detail(cfg);
+    print_iface_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }

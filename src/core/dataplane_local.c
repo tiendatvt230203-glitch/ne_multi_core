@@ -14,41 +14,35 @@
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
-    int ts = (int)job->umem_slot;
     int wi = dp_crypto_current_worker_idx();
 
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
-    return dp_ring_push(fwd, &fwd->mid_to_wan[wan_dp][ts][wi], job);
+    return dp_ring_push(fwd, &fwd->mid_to_wan[wan_dp][wi], job);
 }
 
 static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
                              uint32_t l1, const uint8_t *f2, uint32_t l2, int wan_dp)
 {
-    int ts = (int)job->umem_slot;
-    int wi = dp_crypto_current_worker_idx();
-    struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][ts][wi];
+    struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
     if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap)
         return -1;
     if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)
         return -1;
 
-    struct ne_packet tail = {
-        .len = l2, .dir = NE_DIR_WAN, .wan_idx = (uint8_t)wan_dp,
-        .umem_slot = job->umem_slot,
-    };
-    if (ne_frame_alloc(&fwd->pair, ts, &tail.addr) != 0)
+    struct ne_packet tail = { .len = l2, .dir = NE_DIR_WAN, .wan_idx = (uint8_t)wan_dp };
+    if (ne_frame_alloc(&fwd->pair, &tail.addr) != 0)
         return -1;
-    memcpy(ne_packet_data(&fwd->pair, ts, tail.addr), f2, l2);
+    memcpy(ne_packet_data(&fwd->pair, tail.addr), f2, l2);
     job->len = l1;
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
     if (ne_ring_try_push(tx, job) != 0) {
-        ne_frame_free(&fwd->pair, ts, tail.addr);
+        ne_frame_free(&fwd->pair, tail.addr);
         return -1;
     }
     if (ne_ring_try_push(tx, &tail) != 0)
-        ne_frame_free(&fwd->pair, ts, tail.addr);
+        ne_frame_free(&fwd->pair, tail.addr);
     return 0;
 }
 
@@ -59,7 +53,7 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
                           uint16_t src_port, uint16_t dst_port, uint8_t proto,
                           int flow_ok)
 {
-    uint8_t *pkt = ne_pkt_data(&fwd->pair, job);
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
     uint8_t f2[4096];
     uint32_t l1 = 0, l2 = 0;
@@ -140,7 +134,7 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
 
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 {
-    uint8_t *pkt = ne_pkt_data(&fwd->pair, &job);
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
     uint32_t src_ip = 0, dst_ip = 0;
     uint16_t src_port = 0, dst_port = 0;
     uint8_t proto = 0;
@@ -159,7 +153,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0)
+    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
         goto drop;
     if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
         goto drop;
@@ -190,5 +184,5 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     return;
 
 drop:
-    ne_pkt_free(&fwd->pair, &job);
+    ne_frame_free(&fwd->pair, job.addr);
 }

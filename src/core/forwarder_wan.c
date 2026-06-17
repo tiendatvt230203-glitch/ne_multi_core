@@ -116,12 +116,10 @@ uint32_t fwd_wan_flush_queue(struct forwarder *fwd, int wan_idx)
     uint32_t dropped = 0;
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return 0;
-    for (int s = 0; s < (int)NE_IO_SLOTS; s++) {
-        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            while (ne_ring_try_pop(&fwd->mid_to_wan[wan_idx][s][w], &pkt) == 0) {
-                ne_pkt_free(&fwd->pair, &pkt);
-                dropped++;
-            }
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        while (ne_ring_try_pop(&fwd->mid_to_wan[wan_idx][w], &pkt) == 0) {
+            ne_frame_free(&fwd->pair, pkt.addr);
+            dropped++;
         }
     }
     return dropped;
@@ -131,14 +129,9 @@ int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx)
 {
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return 0;
-    for (int s = 0; s < (int)NE_IO_SLOTS; s++) {
-        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-            struct ne_ring *r = &fwd->mid_to_wan[wan_idx][s][w];
-            if (ne_ring_count(r) < r->cap)
-                return 1;
-        }
-    }
-    return 0;
+    int wi = dp_crypto_current_worker_idx();
+    struct ne_ring *r = &fwd->mid_to_wan[wan_idx][wi];
+    return ne_ring_count(r) + NE_BATCH_SIZE < r->cap;
 }
 
 static void wan_drain_finish_slot(struct forwarder *fwd, int dp)
