@@ -6,7 +6,7 @@
 
 #define NE_CLUSTER_RX_LAN    1u
 #define NE_CLUSTER_RX_WAN    1u
-#define NE_CLUSTER_TX        2u
+#define NE_CLUSTER_TX        4u
 #define NE_CLUSTER_CRYPTO    6u
 
 #define NE_RX_LAN_SLOTS      NE_CLUSTER_RX_LAN
@@ -25,6 +25,8 @@
 #define NE_CPU_RX_WAN0       11u
 #define NE_CPU_TX0           1u
 #define NE_CPU_TX1           2u
+#define NE_CPU_TX2           9u
+#define NE_CPU_TX3           10u
 #define NE_CPU_CRYPTO0       3u
 #define NE_CPU_CRYPTO1       4u
 #define NE_CPU_CRYPTO2       5u
@@ -34,10 +36,6 @@
 
 #define NE_CPU_LOC           NE_CPU_RX_LAN0
 #define NE_CPU_WAN           NE_CPU_RX_WAN0
-#define NE_CPU_LOC_TX        NE_CPU_TX0
-#define NE_CPU_LOC_TX1       NE_CPU_TX1
-#define NE_CPU_WAN_TX        NE_CPU_TX0
-#define NE_CPU_WAN_TX1       NE_CPU_TX1
 #define NE_CPU_MID1          NE_CPU_CRYPTO0
 #define NE_CPU_MID2          NE_CPU_CRYPTO1
 #define NE_CPU_MID3          NE_CPU_CRYPTO2

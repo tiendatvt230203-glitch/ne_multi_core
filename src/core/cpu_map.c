@@ -5,7 +5,7 @@
 
 const uint8_t ne_cpu_rx_lan[NE_CLUSTER_RX_LAN] = { NE_CPU_RX_LAN0 };
 const uint8_t ne_cpu_rx_wan[NE_CLUSTER_RX_WAN] = { NE_CPU_RX_WAN0 };
-const uint8_t ne_cpu_tx[NE_CLUSTER_TX] = { NE_CPU_TX0, NE_CPU_TX1 };
+const uint8_t ne_cpu_tx[NE_CLUSTER_TX] = { NE_CPU_TX0, NE_CPU_TX1, NE_CPU_TX2, NE_CPU_TX3 };
 const uint8_t ne_cpu_crypto[NE_CLUSTER_CRYPTO] = {
     NE_CPU_CRYPTO0, NE_CPU_CRYPTO1, NE_CPU_CRYPTO2,
     NE_CPU_CRYPTO3, NE_CPU_CRYPTO4, NE_CPU_CRYPTO5,

@@ -39,6 +39,19 @@ void forwarder_pin_cpu(void)
 #define IO_CQ_BURST_ROUNDS  64
 #define IO_TX_BURST_MAX   64
 
+static void io_burst_refill_local(struct forwarder *fwd)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_refill_fq_local(&fwd->pair);
+}
+
+static void io_burst_refill_wan(struct forwarder *fwd)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_refill_fq_wan(&fwd->pair);
+}
+
+
 static void io_burst_drain_cq(struct forwarder *fwd, int tx_slot)
 {
     for (int i = 0; i < IO_CQ_BURST_ROUNDS; i++)
@@ -91,37 +104,17 @@ struct io_tx_slot_ctx {
     uint8_t cpu_id;
 };
 
-struct io_rx_slot_ctx {
-    struct forwarder *fwd;
-    int rx_slot;
-    uint8_t cpu_id;
-};
-
-static void io_burst_refill_local_slot(struct forwarder *fwd, int rx_slot)
-{
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_local_slot(&fwd->pair, rx_slot);
-}
-
-static void io_burst_refill_wan_slot(struct forwarder *fwd, int rx_slot)
-{
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_wan_slot(&fwd->pair, rx_slot);
-}
-
 static void *local_rx_thread(void *arg)
 {
-    struct io_rx_slot_ctx *ctx = arg;
-    struct forwarder *fwd = ctx->fwd;
-    int rx_slot = ctx->rx_slot;
+    struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
 
-    pin_cpu(ctx->cpu_id);
+    pin_cpu(NE_CPU_LOC);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        io_burst_refill_local_slot(fwd, rx_slot);
+        io_burst_refill_local(fwd);
 
-        int rcvd = ne_recv_local_slot(&fwd->pair, rx_slot, batch, NE_BATCH_SIZE);
+        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             sched_yield();
             continue;
@@ -133,7 +126,7 @@ static void *local_rx_thread(void *arg)
             if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
-        ne_recv_release_local_slot(&fwd->pair, rx_slot);
+        ne_recv_release_local(&fwd->pair);
     }
     return NULL;
 }
@@ -174,17 +167,15 @@ static void *tx_thread(void *arg)
 
 static void *wan_rx_thread(void *arg)
 {
-    struct io_rx_slot_ctx *ctx = arg;
-    struct forwarder *fwd = ctx->fwd;
-    int rx_slot = ctx->rx_slot;
+    struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
 
-    pin_cpu(ctx->cpu_id);
+    pin_cpu(NE_CPU_WAN);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        io_burst_refill_wan_slot(fwd, rx_slot);
+        io_burst_refill_wan(fwd);
 
-        int rcvd = ne_recv_wan_slot(&fwd->pair, rx_slot, batch, NE_BATCH_SIZE);
+        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             sched_yield();
             continue;
@@ -207,7 +198,7 @@ static void *wan_rx_thread(void *arg)
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
-        ne_recv_release_wan_slot(&fwd->pair, rx_slot);
+        ne_recv_release_wan(&fwd->pair);
     }
     return NULL;
 }
@@ -405,51 +396,42 @@ void forwarder_cleanup(struct forwarder *fwd)
     ne_pair_close(&fwd->pair);
 }
 
-static void forwarder_join_started(struct forwarder *fwd, int local_rx_started,
-                                   int tx_started, int crypto_started, int wan_rx_started)
+static void forwarder_join_started(struct forwarder *fwd, int local_rx, int tx_started,
+                                   int crypto_started, int wan_rx)
 {
     atomic_store_explicit(&running, 0, memory_order_release);
-    for (int w = 0; w < local_rx_started; w++)
-        pthread_join(fwd->local_rx_threads[w], NULL);
+    if (local_rx)
+        pthread_join(fwd->local_thread, NULL);
     for (int w = 0; w < tx_started; w++)
         pthread_join(fwd->tx_threads[w], NULL);
     for (int w = 0; w < crypto_started; w++)
         pthread_join(fwd->crypto_threads[w], NULL);
-    for (int w = 0; w < wan_rx_started; w++)
-        pthread_join(fwd->wan_rx_threads[w], NULL);
+    if (wan_rx)
+        pthread_join(fwd->wan_thread, NULL);
 }
 
 void forwarder_run(struct forwarder *fwd)
 {
     struct crypto_worker_ctx crypto_ctx[NE_CRYPTO_WORKERS];
-    struct io_rx_slot_ctx local_rx_ctx[NE_RX_LAN_SLOTS];
-    struct io_rx_slot_ctx wan_rx_ctx[NE_RX_WAN_SLOTS];
     struct io_tx_slot_ctx tx_ctx[NE_TX_SLOTS];
     int crypto_started = 0;
-    int local_rx_started = 0, tx_started = 0, wan_rx_started = 0;
+    int local_rx = 0, tx_started = 0, wan_rx = 0;
 
     if (!fwd || forwarder_should_stop())
         return;
 
     g_active_fwd = fwd;
 
-    for (int w = 0; w < (int)NE_RX_LAN_SLOTS; w++) {
-        local_rx_ctx[w].fwd = fwd;
-        local_rx_ctx[w].rx_slot = w;
-        local_rx_ctx[w].cpu_id = ne_cpu_rx_lan[w];
-        if (pthread_create(&fwd->local_rx_threads[w], NULL, local_rx_thread, &local_rx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, 0, 0);
-            return;
-        }
-        local_rx_started++;
-    }
+    if (pthread_create(&fwd->local_thread, NULL, local_rx_thread, fwd) != 0)
+        return;
+    local_rx = 1;
 
     for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
         tx_ctx[w].fwd = fwd;
         tx_ctx[w].tx_slot = w;
         tx_ctx[w].cpu_id = ne_cpu_tx[w];
         if (pthread_create(&fwd->tx_threads[w], NULL, tx_thread, &tx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, 0, 0);
+            forwarder_join_started(fwd, local_rx, tx_started, 0, 0);
             return;
         }
         tx_started++;
@@ -460,27 +442,27 @@ void forwarder_run(struct forwarder *fwd)
         crypto_ctx[w].worker_idx = w;
         crypto_ctx[w].cpu_id = dp_crypto_worker_cpu(w);
         if (pthread_create(&fwd->crypto_threads[w], NULL, crypto_worker_thread, &crypto_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, crypto_started, 0);
+            forwarder_join_started(fwd, local_rx, tx_started, crypto_started, 0);
             return;
         }
         crypto_started++;
     }
 
-    for (int w = 0; w < (int)NE_RX_WAN_SLOTS; w++) {
-        wan_rx_ctx[w].fwd = fwd;
-        wan_rx_ctx[w].rx_slot = w;
-        wan_rx_ctx[w].cpu_id = ne_cpu_rx_wan[w];
-        if (pthread_create(&fwd->wan_rx_threads[w], NULL, wan_rx_thread, &wan_rx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, crypto_started, 0);
-            return;
-        }
-        wan_rx_started++;
+    if (pthread_create(&fwd->wan_thread, NULL, wan_rx_thread, fwd) != 0) {
+        forwarder_join_started(fwd, local_rx, tx_started, crypto_started, 0);
+        return;
     }
+    wan_rx = 1;
 
     fwd->threads_started = 1;
     if (fwd->cfg)
         main_diag_log_dataplane_ready(fwd->cfg);
-    forwarder_join_started(fwd, local_rx_started, tx_started, crypto_started, wan_rx_started);
+    pthread_join(fwd->local_thread, NULL);
+    for (int w = 0; w < (int)NE_TX_SLOTS; w++)
+        pthread_join(fwd->tx_threads[w], NULL);
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+        pthread_join(fwd->crypto_threads[w], NULL);
+    pthread_join(fwd->wan_thread, NULL);
     fwd->threads_started = 0;
     if (g_active_fwd == fwd)
         g_active_fwd = NULL;
