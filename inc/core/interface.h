@@ -6,39 +6,28 @@
 #include <pthread.h>
 #include <signal.h>
 
-#define NE_RING        8192u
+#define NE_RING        16384u
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
-#define NE_BATCH_SIZE  64u
-
-/*
- * Dataplane CPU map — 9 pinned threads:
- *
- *   NE_CPU_LOC        (0)   local RX:  AF_XDP recv + FQ refill → local_to_mid
- *   NE_CPU_LOC_TX     (1)   local TX[0]: all mid_to_local[*][*] + XSK queue q%2==0
- *   NE_CPU_LOC_TX1    (2)   local TX[1]: all mid_to_local[*][*] + XSK queue q%2==1
- *   NE_CPU_MID1       (3)   crypto worker[0]
- *   NE_CPU_MID2       (4)   crypto worker[1]
- *   NE_CPU_MID3       (5)   crypto worker[2]
- *   NE_CPU_WAN_TX1    (9)   wan TX[1]:   all mid_to_wan[*][*]   + XSK queue q%2==1
- *   NE_CPU_WAN_TX     (10)  wan TX[0]:   all mid_to_wan[*][*]   + XSK queue q%2==0
- *   NE_CPU_WAN        (11)  wan RX:      AF_XDP recv + FQ refill → wan_to_mid
- *
- * TX slots (NE_TX_SLOTS) partition XSK hardware queues only (q % NE_TX_SLOTS).
- * Both TX threads per direction pop every crypto output ring (MPSC via pop_lock).
- */
+#define NE_BATCH_SIZE   64u
 
 #define NE_CPU_LOC        0u
-#define NE_CPU_LOC_TX     1u
-#define NE_CPU_LOC_TX1    2u
+#define NE_CPU_TX0        1u
+#define NE_CPU_TX1        2u
+#define NE_CPU_TX2        9u
+#define NE_CPU_TX3        10u
+
 #define NE_CPU_MID1       3u
 #define NE_CPU_MID2       4u
 #define NE_CPU_MID3       5u
-#define NE_CPU_WAN_TX1    9u
-#define NE_CPU_WAN_TX     10u
+#define NE_CPU_MID4       6u
+#define NE_CPU_MID5       7u
+#define NE_CPU_MID6       8u
+
 #define NE_CPU_WAN        11u
-#define NE_CRYPTO_WORKERS 3u
-#define NE_TX_SLOTS       2u
+
+#define NE_CRYPTO_WORKERS 6u
+#define NE_TX_SLOTS       4u
 
 struct bpf_object;
 
@@ -181,6 +170,7 @@ void ne_recv_release_wan(struct ne_pair *p);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
+void ne_drain_cq_all(struct ne_pair *p, int tx_slot);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
 int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
