@@ -59,12 +59,13 @@ static void io_burst_drain_cq(struct forwarder *fwd, int tx_slot)
         ne_drain_cq_all(&fwd->pair, tx_slot);
 }
 
-static void io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
+static int io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int total = 0;
 
     if (!ne_pair_local_live(&fwd->pair, local_idx))
-        return;
+        return 0;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         rings[w] = &fwd->mid_to_local[local_idx][w];
@@ -74,15 +75,18 @@ static void io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
                                          local_idx, tx_slot);
         if (sent <= 0)
             break;
+        total += sent;
     }
+    return total;
 }
 
-static void io_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
+static int io_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int total = 0;
 
     if (!ne_pair_wan_live(&fwd->pair, wan_idx))
-        return;
+        return 0;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         rings[w] = &fwd->mid_to_wan[wan_idx][w];
@@ -92,7 +96,9 @@ static void io_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
                                        wan_idx, tx_slot);
         if (sent <= 0)
             break;
+        total += sent;
     }
+    return total;
 }
 
 struct io_tx_slot_ctx {
@@ -127,17 +133,20 @@ static void *local_rx_thread(void *arg)
     return NULL;
 }
 
-static void io_burst_tx_slot(struct forwarder *fwd, int tx_slot)
+static int io_burst_tx_slot(struct forwarder *fwd, int tx_slot)
 {
-    for (int li = 0; li < fwd->local_count; li++)
-        io_burst_tx_local(fwd, li, tx_slot);
+    int sent = 0;
+
     for (int wi = 0; wi < fwd->wan_count; wi++) {
         if (fwd_wan_is_stopped(wi))
             continue;
-        io_burst_tx_wan(fwd, wi, tx_slot);
+        sent += io_burst_tx_wan(fwd, wi, tx_slot);
         if (tx_slot == 0 && fwd_mid_to_wan_depth(fwd, wi) == 0)
             fwd->wan_tx_stuck[wi] = 0;
     }
+    for (int li = 0; li < fwd->local_count; li++)
+        sent += io_burst_tx_local(fwd, li, tx_slot);
+    return sent;
 }
 
 static void *tx_thread(void *arg)
@@ -150,8 +159,8 @@ static void *tx_thread(void *arg)
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         io_burst_drain_cq(fwd, tx_slot);
-        io_burst_tx_slot(fwd, tx_slot);
-        sched_yield();
+        if (io_burst_tx_slot(fwd, tx_slot) <= 0)
+            sched_yield();
     }
     return NULL;
 }

@@ -754,16 +754,22 @@ void ne_recv_release_wan(struct ne_pair *p)
 static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool,
                            const char *ifname, int qid)
 {
-    uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
     uint32_t n;
 
     while ((n = xsk_ring_cons__peek(&slot->cq, NE_BATCH_SIZE, &idx)) > 0) {
-        for (uint32_t i = 0; i < n; i++)
-            addrs[i] = *xsk_ring_cons__comp_addr(&slot->cq, idx + i);
-        xsk_ring_cons__release(&slot->cq, n);
-        (void)pool_push(pool, addrs, n);
-        if (n < NE_BATCH_SIZE)
+        uint32_t released = 0;
+
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t addr = *xsk_ring_cons__comp_addr(&slot->cq, idx + i);
+            if (pool_push(pool, &addr, 1) != 1)
+                break;
+            released++;
+        }
+        if (!released)
+            break;
+        xsk_ring_cons__release(&slot->cq, released);
+        if (released < n)
             break;
     }
     if (xsk_ring_cons__peek(&slot->cq, 1, &idx) > 0)
@@ -829,13 +835,14 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool,
     uint32_t idx = 0;
     uint32_t free_slots = xsk_prod_nb_free(&slot->fq, NE_BATCH_SIZE);
 
-    if (free_slots < NE_BATCH_SIZE) {
+    if (!free_slots) {
         dp_warn_once(&warned_fq_ring_full,
                      "FQ ring full if=%s q=%d (fill queue has no space)",
                      ifname ? ifname : "?", qid);
         return;
     }
-    uint32_t got = pool_pop(pool, addrs, NE_BATCH_SIZE);
+    uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    uint32_t got = pool_pop(pool, addrs, want);
     if (!got) {
         dp_warn_once(&warned_fq_pool_empty,
                      "UMEM pool empty if=%s q=%d (FQ refill — need more CQ drain / TX)",
