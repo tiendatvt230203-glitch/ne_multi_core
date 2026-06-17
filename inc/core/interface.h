@@ -11,26 +11,42 @@
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
 
-#define NE_CPU_LOC_RX0    0u
+/*
+ * CPU map — chỉnh số core tại đây:
+ *   NE_RX_SLOTS=1     → 1 thread RX LAN (NE_CPU_LOC), 1 thread RX WAN (NE_CPU_WAN)
+ *   NE_TX_SLOTS=4     → 4 TX chung; mỗi slot s:
+ *                       - consumer duy nhất của mid_to_*[iface][s]
+ *                       - producer duy nhất của AF_XDP TX ring queue q (q % NE_TX_SLOTS == s)
+ *                       crypto push: dp_pick_tx_slot(pkt) → mid_to_*[iface][slot]
+ *   NE_CRYPTO_WORKERS → số core MID1.. phải đủ bằng workers
+ * AF_XDP: NE_XSK_BIND_FLAGS = XDP_COPY | XDP_USE_NEED_WAKEUP (không zerocopy)
+ */
+#define NE_CPU_LOC        0u
 #define NE_CPU_LOC_RX1    7u
-#define NE_CPU_LOC        NE_CPU_LOC_RX0
 #define NE_CPU_TX0        1u
 #define NE_CPU_TX1        2u
 #define NE_CPU_TX2        9u
 #define NE_CPU_TX3        10u
+#define NE_CPU_LOC_TX     NE_CPU_TX0
+#define NE_CPU_LOC_TX1    NE_CPU_TX1
+#define NE_CPU_WAN_TX     NE_CPU_TX2
+#define NE_CPU_WAN_TX1    NE_CPU_TX3
 
 #define NE_CPU_MID1       3u
 #define NE_CPU_MID2       4u
 #define NE_CPU_MID3       5u
 #define NE_CPU_MID4       6u
+#define NE_CPU_MID5       7u
+#define NE_CPU_MID6       8u
 
-#define NE_CPU_WAN_RX0    11u
 #define NE_CPU_WAN_RX1    8u
-#define NE_CPU_WAN        NE_CPU_WAN_RX0
+#define NE_CPU_WAN        11u
 
-#define NE_CRYPTO_WORKERS 4u
-#define NE_RX_SLOTS       2u
+#define NE_CRYPTO_WORKERS 6u
+#define NE_RX_SLOTS       1u
 #define NE_TX_SLOTS       4u
+
+#define NE_XSK_BIND_FLAGS (XDP_COPY | XDP_USE_NEED_WAKEUP)
 
 struct bpf_object;
 

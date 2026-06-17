@@ -13,6 +13,8 @@ static const uint8_t ne_crypto_cpus[NE_CRYPTO_WORKERS] = {
     NE_CPU_MID2,
     NE_CPU_MID3,
     NE_CPU_MID4,
+    NE_CPU_MID5,
+    NE_CPU_MID6,
 };
 
 static __thread int tls_crypto_worker_idx;
@@ -69,6 +71,32 @@ int dp_crypto_pick_local_worker(const uint8_t *pkt, uint32_t len)
     key ^= ntohl(src_ip) ^ ntohl(dst_ip) ^ (uint32_t)proto;
     key *= 0x9E3779B1u;
     return (int)((key >> 15) % NE_CRYPTO_WORKERS);
+}
+
+int dp_pick_tx_slot(const uint8_t *pkt, uint32_t len)
+{
+    uint32_t src_ip = 0, dst_ip = 0;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t proto = 0;
+    uint32_t key;
+
+    if (NE_TX_SLOTS <= 1)
+        return 0;
+    if (!pkt || len < 14)
+        return 0;
+
+    if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
+                      &src_port, &dst_port, &proto) != 0) {
+        key = len;
+        for (uint32_t i = 0; i < 14 && i < len; i++)
+            key = key * 31u + pkt[i];
+        return (int)((key >> 4) % NE_TX_SLOTS);
+    }
+
+    key = (uint32_t)(src_port ^ dst_port);
+    key ^= ntohl(src_ip) ^ ntohl(dst_ip) ^ (uint32_t)proto;
+    key *= 0x85EBCA6Bu;
+    return (int)((key >> 12) % NE_TX_SLOTS);
 }
 
 int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)

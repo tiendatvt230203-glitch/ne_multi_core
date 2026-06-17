@@ -337,7 +337,7 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
         .tx_size = NE_RING,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = p->xdp_flags,
-        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
+        .bind_flags = NE_XSK_BIND_FLAGS,
     };
 
     iface->ifindex = (int)if_nametoindex(ifname);
