@@ -182,7 +182,7 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
 static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 {
     uint8_t scratch[8192];
-    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
+    uint8_t *pkt = ne_pkt_data(&fwd->pair, job);
     uint32_t len = job->len;
     uint16_t pid = 0;
     uint8_t fidx = 0;
@@ -267,19 +267,19 @@ static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
 
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
-    uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
+    uint8_t *pkt = ne_pkt_data(&fwd->pair, &job);
     int li;
     int dec;
 
     if (wan_has_crypto(fwd, pkt, job.len)) {
         dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
-            ne_frame_free(&fwd->pair, job.addr);
+            ne_pkt_free(&fwd->pair, &job);
             return;
         }
         if (dec != 0)
             goto drop;
-        pkt = ne_packet_data(&fwd->pair, job.addr);
+        pkt = ne_pkt_data(&fwd->pair, &job);
     }
 
     li = pick_local(fwd, pkt, job.len);
@@ -291,11 +291,12 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     job.dir = NE_DIR_LOCAL;
     job.local_idx = (uint8_t)li;
     {
-        int ts = dp_pick_tx_slot(pkt, job.len);
-        (void)dp_ring_push(fwd, &fwd->mid_to_local[li][ts], &job);
+        int ts = (int)job.umem_slot;
+        int wi = dp_crypto_current_worker_idx();
+        (void)dp_ring_push(fwd, &fwd->mid_to_local[li][ts][wi], &job);
     }
     return;
 
 drop:
-    ne_frame_free(&fwd->pair, job.addr);
+    ne_pkt_free(&fwd->pair, &job);
 }

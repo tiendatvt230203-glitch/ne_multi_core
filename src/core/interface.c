@@ -313,20 +313,75 @@ static uint32_t pool_pop(struct ne_pool *p, uint64_t *addrs, uint32_t n)
     return got;
 }
 
-int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
+int ne_frame_alloc(struct ne_pair *p, int umem_slot, uint64_t *addr_out)
 {
-    return (p && addr_out && pool_pop(&p->pool, addr_out, 1) == 1) ? 0 : -1;
+    if (!p || umem_slot < 0 || umem_slot >= (int)NE_TX_SLOTS || !addr_out)
+        return -1;
+    return pool_pop(&p->shards[umem_slot].pool, addr_out, 1) == 1 ? 0 : -1;
 }
 
-void ne_frame_free(struct ne_pair *p, uint64_t addr)
+void ne_frame_free(struct ne_pair *p, int umem_slot, uint64_t addr)
 {
-    if (p)
-        (void)pool_push(&p->pool, &addr, 1);
+    if (!p || umem_slot < 0 || umem_slot >= (int)NE_TX_SLOTS)
+        return;
+    (void)pool_push(&p->shards[umem_slot].pool, &addr, 1);
 }
 
-void *ne_packet_data(struct ne_pair *p, uint64_t addr)
+void *ne_packet_data(struct ne_pair *p, int umem_slot, uint64_t addr)
 {
-    return xsk_umem__get_data(p->bufs, addr);
+    if (!p || umem_slot < 0 || umem_slot >= (int)NE_TX_SLOTS)
+        return NULL;
+    return xsk_umem__get_data(p->shards[umem_slot].bufs, addr);
+}
+
+static int umem_shard_open(struct ne_umem_shard *s, uint32_t n_frames, uint32_t frame_size)
+{
+    struct xsk_umem_config ucfg = {
+        .fill_size = NE_RING,
+        .comp_size = NE_RING,
+        .frame_size = frame_size,
+        .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+        .flags = 0,
+    };
+
+    memset(s, 0, sizeof(*s));
+    s->n_frames = n_frames;
+    s->frame_size = frame_size;
+    s->bufsize = (size_t)n_frames * (size_t)frame_size;
+    s->bufs = mmap(NULL, s->bufsize, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (s->bufs == MAP_FAILED)
+        return -1;
+    if (pool_init(&s->pool, n_frames) != 0)
+        goto fail_map;
+    for (uint32_t i = 0; i < n_frames; i++) {
+        uint64_t addr = (uint64_t)i * frame_size;
+        (void)pool_push(&s->pool, &addr, 1);
+    }
+    if (xsk_umem__create(&s->umem, s->bufs, s->bufsize, &s->fq, &s->cq, &ucfg) != 0)
+        goto fail_pool;
+    s->live = 1;
+    return 0;
+
+fail_pool:
+    pool_destroy(&s->pool);
+fail_map:
+    if (s->bufs && s->bufs != MAP_FAILED)
+        munmap(s->bufs, s->bufsize);
+    memset(s, 0, sizeof(*s));
+    return -1;
+}
+
+static void umem_shard_close(struct ne_umem_shard *s)
+{
+    if (!s || !s->live)
+        return;
+    if (s->umem)
+        xsk_umem__delete(s->umem);
+    pool_destroy(&s->pool);
+    if (s->bufs && s->bufs != MAP_FAILED)
+        munmap(s->bufs, s->bufsize);
+    memset(s, 0, sizeof(*s));
 }
 
 static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
@@ -348,8 +403,14 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
     iface->queue_count = queue_count;
 
     for (int q = 0; q < queue_count; q++) {
+        int us = q % (int)NE_TX_SLOTS;
+        struct ne_umem_shard *shard = &p->shards[us];
         struct ne_xsk_queue *slot = &iface->queues[q];
-        int ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
+
+        if (!shard->live || !shard->umem)
+            return -1;
+        slot->umem_slot = (uint8_t)us;
+        int ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, shard->umem,
                                             &slot->rx, &slot->tx,
                                             &slot->fq, &slot->cq, &cfg);
         if (ret)
@@ -358,20 +419,20 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
     return 0;
 }
 
-static void prefill_queue(struct ne_pair *p, struct ne_xsk_queue *slot, uint32_t want)
+static void prefill_queue(struct ne_umem_shard *shard, struct ne_xsk_queue *slot, uint32_t want)
 {
     uint64_t addrs[NE_BATCH_SIZE];
 
     while (want > 0) {
         uint32_t n = want > NE_BATCH_SIZE ? NE_BATCH_SIZE : want;
-        uint32_t got = pool_pop(&p->pool, addrs, n);
+        uint32_t got = pool_pop(&shard->pool, addrs, n);
         if (got == 0)
             return;
 
         uint32_t idx = 0;
         uint32_t reserved = xsk_ring_prod__reserve(&slot->fq, got, &idx);
         if (reserved != got) {
-            (void)pool_push(&p->pool, addrs, got);
+            (void)pool_push(&shard->pool, addrs, got);
             return;
         }
         for (uint32_t i = 0; i < got; i++)
@@ -383,8 +444,10 @@ static void prefill_queue(struct ne_pair *p, struct ne_xsk_queue *slot, uint32_t
 
 static void prefill_iface(struct ne_pair *p, struct ne_iface *iface, uint32_t want_per_queue)
 {
-    for (int q = 0; q < iface->queue_count; q++)
-        prefill_queue(p, &iface->queues[q], want_per_queue);
+    for (int q = 0; q < iface->queue_count; q++) {
+        int us = q % (int)NE_TX_SLOTS;
+        prefill_queue(&p->shards[us], &iface->queues[q], want_per_queue);
+    }
 }
 
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
@@ -404,20 +467,16 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
     p->frame_size = NE_FRAME;
-    p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
-    p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
+    {
+        uint32_t total = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
+        p->n_frames_per_shard = next_pow2_u32(total / NE_TX_SLOTS);
+        if (p->n_frames_per_shard < 8192u)
+            p->n_frames_per_shard = 8192u;
+    }
     p->xdp_flags = XDP_FLAGS_DRV_MODE;
 
-    p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p->bufs == MAP_FAILED)
-        return -1;
-
-    NE_TRY(pool_init(&p->pool, p->n_frames));
-    for (uint32_t i = 0; i < p->n_frames; i++) {
-        uint64_t addr = (uint64_t)i * p->frame_size;
-        (void)pool_push(&p->pool, &addr, 1);
-    }
+    for (int s = 0; s < (int)NE_TX_SLOTS; s++)
+        NE_TRY(umem_shard_open(&p->shards[s], p->n_frames_per_shard, p->frame_size));
 
     p->local_queue_total = 0;
     p->wan_queue_total = 0;
@@ -450,18 +509,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
             goto fail;
         NE_TRY(interface_set_promisc(cfg->wans[ci].ifname));
     }
-
-    struct xsk_umem_config ucfg = {
-        .fill_size = NE_RING,
-        .comp_size = NE_RING,
-        .frame_size = p->frame_size,
-        .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
-        .flags = 0,
-    };
-
-    NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize,
-                            &p->locals[0].queues[0].fq,
-                            &p->locals[0].queues[0].cq, &ucfg));
 
     for (int i = 0; i < p->local_count; i++)
         NE_TRY(open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
@@ -523,11 +570,8 @@ void ne_pair_close(struct ne_pair *p)
                 xsk_socket__delete(p->locals[i].queues[q].xsk);
         }
     }
-    if (p->umem)
-        xsk_umem__delete(p->umem);
-    pool_destroy(&p->pool);
-    if (p->bufs && p->bufs != MAP_FAILED)
-        munmap(p->bufs, p->bufsize);
+    for (int s = 0; s < (int)NE_TX_SLOTS; s++)
+        umem_shard_close(&p->shards[s]);
     memset(p, 0, sizeof(*p));
 }
 
@@ -548,7 +592,7 @@ int ne_pair_wan_live(const struct ne_pair *p, int dp_slot)
 int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg_local_idx,
                         int pair_li)
 {
-    if (!p || !cfg || !p->umem || cfg_local_idx < 0 || cfg_local_idx >= cfg->local_count)
+    if (!p || !cfg || !p->shards[0].live || cfg_local_idx < 0 || cfg_local_idx >= cfg->local_count)
         return -1;
     if (pair_li < 0 || pair_li >= MAX_INTERFACES)
         return -1;
@@ -578,7 +622,7 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
 int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cfg_wan_idx,
                          int dp_slot)
 {
-    if (!p || !cfg || !p->umem || cfg_wan_idx < 0 || cfg_wan_idx >= cfg->wan_count)
+    if (!p || !cfg || !p->shards[0].live || cfg_wan_idx < 0 || cfg_wan_idx >= cfg->wan_count)
         return -1;
     if (!cfg->wans[cfg_wan_idx].dataplane || dp_slot < 0 || dp_slot >= MAX_INTERFACES)
         return -1;
@@ -661,6 +705,7 @@ static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t
         out[i].dir = dir;
         out[i].wan_idx = wan_idx;
         out[i].local_idx = local_idx;
+        out[i].umem_slot = slot->umem_slot;
     }
     slot->rx_pending = n;
     if (n > 0 && n == max)
@@ -842,10 +887,11 @@ void ne_drain_cq_local(struct ne_pair *p, int tx_slot)
 {
     if (!p || tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return;
+    struct ne_pool *pool = &p->shards[tx_slot].pool;
     for (int i = 0; i < p->local_count; i++) {
         if (!p->local_live[i])
             continue;
-        drain_cq_iface_slot(&p->locals[i], &p->pool, tx_slot);
+        drain_cq_iface_slot(&p->locals[i], pool, tx_slot);
     }
 }
 
@@ -853,10 +899,11 @@ void ne_drain_cq_wan(struct ne_pair *p, int tx_slot)
 {
     if (!p || tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return;
+    struct ne_pool *pool = &p->shards[tx_slot].pool;
     for (int i = 0; i < p->wan_count; i++) {
         if (!p->wan_live[i])
             continue;
-        drain_cq_iface_slot(&p->wans[i], &p->pool, tx_slot);
+        drain_cq_iface_slot(&p->wans[i], pool, tx_slot);
     }
 }
 
@@ -894,12 +941,13 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool,
     xsk_ring_prod__submit(&slot->fq, got);
 }
 
-static void refill_fq_iface_slot(struct ne_iface *iface, struct ne_pool *pool, int rx_slot)
+static void refill_fq_iface_slot(struct ne_pair *p, struct ne_iface *iface, int rx_slot)
 {
     for (int q = 0; q < iface->queue_count; q++) {
         if (!xsk_queue_for_slot(q, rx_slot, iface->queue_count, (int)NE_RX_SLOTS))
             continue;
-        refill_fq_queue(&iface->queues[q], pool, iface->ifname, q);
+        int us = q % (int)NE_TX_SLOTS;
+        refill_fq_queue(&iface->queues[q], &p->shards[us].pool, iface->ifname, q);
     }
 }
 
@@ -910,7 +958,7 @@ void ne_refill_fq_local_slot(struct ne_pair *p, int rx_slot)
     for (int i = 0; i < p->local_count; i++) {
         if (!p->local_live[i])
             continue;
-        refill_fq_iface_slot(&p->locals[i], &p->pool, rx_slot);
+        refill_fq_iface_slot(p, &p->locals[i], rx_slot);
     }
 }
 
@@ -921,7 +969,7 @@ void ne_refill_fq_wan_slot(struct ne_pair *p, int rx_slot)
     for (int i = 0; i < p->wan_count; i++) {
         if (!p->wan_live[i])
             continue;
-        refill_fq_iface_slot(&p->wans[i], &p->pool, rx_slot);
+        refill_fq_iface_slot(p, &p->wans[i], rx_slot);
     }
 }
 
