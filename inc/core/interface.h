@@ -159,6 +159,7 @@ void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
+void ne_drain_cq_all(struct ne_pair *p, int tx_slot);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
 void ne_refill_fq_local_slot(struct ne_pair *p, int rx_slot);

@@ -6,8 +6,9 @@
 
 #define NE_CLUSTER_RX_LAN    1u
 #define NE_CLUSTER_RX_WAN    1u
-#define NE_CLUSTER_TX_LOCAL  2u
-#define NE_CLUSTER_TX_WAN    2u
+#define NE_CLUSTER_TX        2u
+#define NE_CLUSTER_TX_LOCAL  NE_CLUSTER_TX
+#define NE_CLUSTER_TX_WAN    NE_CLUSTER_TX
 #define NE_CLUSTER_CRYPTO    6u
 
 #define NE_RX_LAN_SLOTS      NE_CLUSTER_RX_LAN

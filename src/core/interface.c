@@ -838,6 +838,12 @@ void ne_drain_cq_wan(struct ne_pair *p, int tx_slot)
     }
 }
 
+void ne_drain_cq_all(struct ne_pair *p, int tx_slot)
+{
+    ne_drain_cq_local(p, tx_slot);
+    ne_drain_cq_wan(p, tx_slot);
+}
+
 
 static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
 {
