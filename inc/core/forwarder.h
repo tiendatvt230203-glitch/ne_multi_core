@@ -19,10 +19,10 @@ struct forwarder {
     struct ne_ring mid_to_wan[MAX_INTERFACES][NE_TX_SLOTS];
     struct ne_ring mid_to_local[MAX_INTERFACES][NE_TX_SLOTS];
 
-    pthread_t local_thread;
+    pthread_t local_rx_threads[NE_RX_LAN_SLOTS];
     pthread_t tx_threads[NE_TX_SLOTS];
     pthread_t crypto_threads[NE_CRYPTO_WORKERS];
-    pthread_t wan_thread;
+    pthread_t wan_rx_threads[NE_RX_WAN_SLOTS];
     int threads_started;
 
     uint64_t wan_tx_stuck[MAX_INTERFACES];

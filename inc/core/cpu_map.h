@@ -7,35 +7,24 @@
 #define NE_CLUSTER_RX_LAN    1u
 #define NE_CLUSTER_RX_WAN    1u
 #define NE_CLUSTER_TX        2u
-#define NE_CLUSTER_TX_LOCAL  NE_CLUSTER_TX
-#define NE_CLUSTER_TX_WAN    NE_CLUSTER_TX
 #define NE_CLUSTER_CRYPTO    6u
 
 #define NE_RX_LAN_SLOTS      NE_CLUSTER_RX_LAN
 #define NE_RX_WAN_SLOTS      NE_CLUSTER_RX_WAN
-#define NE_TX_SLOTS          NE_CLUSTER_TX_LOCAL
+#define NE_TX_SLOTS          NE_CLUSTER_TX
 #define NE_CRYPTO_WORKERS    NE_CLUSTER_CRYPTO
 
-#if NE_CLUSTER_TX_LOCAL != NE_CLUSTER_TX_WAN
-#error "NE_CLUSTER_TX_LOCAL must equal NE_CLUSTER_TX_WAN"
-#endif
-
 #if NE_CLUSTER_RX_LAN > 1 && NE_CLUSTER_RX_LAN > NE_LOCAL_QUEUE_TARGET
-#error "NE_CLUSTER_RX_LAN exceeds NE_LOCAL_QUEUE_TARGET"
+#error "NE_CLUSTER_RX_LAN > NE_LOCAL_QUEUE_TARGET"
 #endif
-
 #if NE_CLUSTER_RX_WAN > 1 && NE_CLUSTER_RX_WAN > NE_WAN_QUEUE_TARGET
-#error "NE_CLUSTER_RX_WAN exceeds NE_WAN_QUEUE_TARGET"
+#error "NE_CLUSTER_RX_WAN > NE_WAN_QUEUE_TARGET"
 #endif
 
 #define NE_CPU_RX_LAN0       0u
 #define NE_CPU_RX_WAN0       11u
-
-#define NE_CPU_TX_LOCAL0     1u
-#define NE_CPU_TX_LOCAL1     2u
-#define NE_CPU_TX_WAN0       9u
-#define NE_CPU_TX_WAN1       10u
-
+#define NE_CPU_TX0           1u
+#define NE_CPU_TX1           2u
 #define NE_CPU_CRYPTO0       3u
 #define NE_CPU_CRYPTO1       4u
 #define NE_CPU_CRYPTO2       5u
@@ -45,10 +34,10 @@
 
 #define NE_CPU_LOC           NE_CPU_RX_LAN0
 #define NE_CPU_WAN           NE_CPU_RX_WAN0
-#define NE_CPU_LOC_TX        NE_CPU_TX_LOCAL0
-#define NE_CPU_LOC_TX1       NE_CPU_TX_LOCAL1
-#define NE_CPU_WAN_TX        NE_CPU_TX_WAN0
-#define NE_CPU_WAN_TX1       NE_CPU_TX_WAN1
+#define NE_CPU_LOC_TX        NE_CPU_TX0
+#define NE_CPU_LOC_TX1       NE_CPU_TX1
+#define NE_CPU_WAN_TX        NE_CPU_TX0
+#define NE_CPU_WAN_TX1       NE_CPU_TX1
 #define NE_CPU_MID1          NE_CPU_CRYPTO0
 #define NE_CPU_MID2          NE_CPU_CRYPTO1
 #define NE_CPU_MID3          NE_CPU_CRYPTO2
@@ -58,8 +47,7 @@
 
 extern const uint8_t ne_cpu_rx_lan[NE_CLUSTER_RX_LAN];
 extern const uint8_t ne_cpu_rx_wan[NE_CLUSTER_RX_WAN];
-extern const uint8_t ne_cpu_tx_local[NE_CLUSTER_TX_LOCAL];
-extern const uint8_t ne_cpu_tx_wan[NE_CLUSTER_TX_WAN];
+extern const uint8_t ne_cpu_tx[NE_CLUSTER_TX];
 extern const uint8_t ne_cpu_crypto[NE_CLUSTER_CRYPTO];
 
 int ne_cpu_map_validate(void);
