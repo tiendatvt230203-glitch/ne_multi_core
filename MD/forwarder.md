@@ -1,194 +1,300 @@
-# forwarder.h — điều phối luồng & ring giữa các core
+# forwarder — kiến trúc dataplane
 
-Nguồn: [`inc/core/forwarder.h`](../inc/core/forwarder.h) · [`src/core/forwarder.c`](../src/core/forwarder.c)  
-Liên quan: [`interface.md`](interface.md)
+> **Mục đích:** file này **không** thay `forwarder.h`. Header liệt kê field; doc này trả lời **ai nối với ai**, **gói đi đường nào**, **index ring thế nào**.  
+> Chi tiết field: [`inc/core/forwarder.h`](../inc/core/forwarder.h) · AF_XDP: [`interface.md`](interface.md)
 
-## Chỉ số thường gặp
-
-| Ký hiệu | Nghĩa | Trong code |
-|---------|-------|------------|
-| `crypto_w` | Luồng crypto thứ mấy (0…5) | RX: biến `wi`; crypto thread: `worker_idx` |
-| `tx_slot` | Luồng TX thứ mấy (0…3) | `dp_pick_tx_slot()` trả `ts` |
-| `wan_dp` / `wan_idx` | Card WAN dataplane | `mid_to_wan[wan_dp][tx_slot]` |
-| `local_idx` | Card LAN dataplane | `mid_to_local[local_idx][tx_slot]` |
-| `rx_slot` | Luồng RX thứ mấy | `local_rx_threads[]`, `wan_rx_threads[]` |
+<style>
+.t{color:#4ec9b0}.p{color:#c586c0}.v{color:#e0e0e0}.m{color:#4fc1ff}.fn{color:#dcdcaa}
+</style>
 
 ---
 
-## 1. struct forwarder
+## 1. Sơ đồ quan hệ struct (toàn bộ)
 
-```c
-struct forwarder {
-    struct app_config *cfg;
+```mermaid
+classDiagram
+    direction TB
 
-    struct xsk_interface locals[MAX_INTERFACES];
-    int local_count;
-    struct xsk_interface wans[MAX_INTERFACES];
-    int wan_count;
-    int wan_cfg_idx[MAX_INTERFACES];
+    class forwarder {
+        app_config cfg
+        xsk_interface locals
+        xsk_interface wans
+        ne_pair pair
+        ne_ring local_to_mid
+        ne_ring wan_to_mid
+        ne_ring mid_to_wan
+        ne_ring mid_to_local
+        pthread_t local_rx_threads
+        pthread_t tx_threads
+        pthread_t crypto_threads
+        pthread_t wan_rx_threads
+    }
 
-    struct ne_pair pair;
-    struct ne_ring local_to_mid[NE_CRYPTO_WORKERS];
-    struct ne_ring wan_to_mid[NE_CRYPTO_WORKERS];
-    struct ne_ring mid_to_wan[MAX_INTERFACES][NE_TX_SLOTS];
-    struct ne_ring mid_to_local[MAX_INTERFACES][NE_TX_SLOTS];
+    class ne_pair {
+        void bufs
+        xsk_umem umem
+        ne_iface locals
+        ne_iface wans
+        ne_pool pool
+    }
 
-    pthread_t local_rx_threads[NE_RX_LAN_SLOTS];
-    pthread_t tx_threads[NE_TX_SLOTS];
-    pthread_t crypto_threads[NE_CRYPTO_WORKERS];
-    pthread_t wan_rx_threads[NE_RX_WAN_SLOTS];
-    int threads_started;
+    class ne_iface {
+        int ifindex
+        char ifname
+        ne_xsk_queue queues
+    }
 
-    uint64_t wan_tx_stuck[MAX_INTERFACES];
-    uint32_t wan_tx_cooldown[MAX_INTERFACES];
-};
+    class ne_xsk_queue {
+        xsk_socket xsk
+        rx tx fq cq
+    }
+
+    class ne_pool {
+        frame stack UMEM
+    }
+
+    class ne_ring {
+        ne_packet buf array
+        head tail
+    }
+
+    class ne_packet {
+        uint64_t addr
+        uint32_t len
+        uint8_t dir
+    }
+
+    class xsk_interface {
+        ifname MAC config
+    }
+
+    forwarder *-- ne_pair : pair
+    forwarder *-- ne_ring : 4 mang ring
+    forwarder o-- xsk_interface : metadata config
+    ne_pair *-- ne_iface : locals wans
+    ne_pair *-- ne_pool
+    ne_iface *-- ne_xsk_queue
+    ne_ring *-- ne_packet : cap phan tu
+    ne_packet ..> ne_pair : addr trỏ UMEM bufs
+    ne_pool ..> ne_pair : cung vung UMEM
+```
+
+**Đọc sơ đồ:**
+
+| Mũi tên | Nghĩa |
+|---------|--------|
+| `*--` | struct **chứa** struct/array bên trong (sở hữu) |
+| `o--` | tham chiếu metadata, **không** dùng I/O |
+| `..>` | con trỏ / offset trỏ sang vùng khác |
+
+- <span class="t">forwarder</span>.<span class="v">pair</span> → toàn bộ AF_XDP (UMEM, NIC)  
+- <span class="t">forwarder</span>.<span class="v">local_to_mid</span>… → ring mềm giữa thread (phần tử là <span class="t">ne_packet</span>)  
+- <span class="t">forwarder</span>.<span class="v">locals</span>/<span class="v">wans</span> (<span class="t">xsk_interface</span>) → tên/MAC config, I/O đi qua <span class="v">pair</span>
+
+Chi tiết <span class="t">ne_pair</span> → <span class="t">ne_iface</span> → <span class="t">ne_xsk_queue</span>: [`interface.md` §1](interface.md#1-phân-cấp-struct-interfaceh)
+
+---
+
+## 2. Bức tranh luồng thread (runtime)
+
+```mermaid
+flowchart TB
+    subgraph RX["Nhận gói"]
+        LRX["local_rx_threads"]
+        WRX["wan_rx_threads"]
+    end
+
+    subgraph R1["Ring RX → crypto"]
+        LTM["local_to_mid[crypto_w]"]
+        WTM["wan_to_mid[crypto_w]"]
+    end
+
+    subgraph CR["Mã hóa / routing"]
+        CW["crypto_threads[crypto_w]"]
+    end
+
+    subgraph R2["Ring crypto → TX"]
+        MTW["mid_to_wan[wan][tx_slot]"]
+        MTL["mid_to_local[local][tx_slot]"]
+    end
+
+    subgraph TX["Gửi gói"]
+        TTX["tx_threads[tx_slot]"]
+    end
+
+    PAIR["ne_pair — AF_XDP"] 
+
+    LRX --> LTM --> CW
+    WRX --> WTM --> CW
+    CW --> MTW --> TTX
+    CW --> MTL --> TTX
+    TTX --> PAIR
+    LRX --> PAIR
+    WRX --> PAIR
+```
+
+**12 thread baseline:** 1 RX LAN + 1 RX WAN + 4 TX + 6 crypto. CPU map: [`cpu_map.h`](../inc/core/cpu_map.h).
+
+---
+
+## 3. `struct forwarder` — field dataplane trong sơ đồ trên
+
+Không liệt kê lại header — xem [`forwarder.h`](../inc/core/forwarder.h).  
+Trong sơ đồ §1, các field ring/thread là **mảng** (kích thước `NE_CRYPTO_WORKERS`, `NE_TX_SLOTS`, …).
+
+Ví dụ tách <span class="t">kiểu</span> / <span class="v">tên</span>:
+
+<div style="font-family:monospace;font-size:0.95em;line-height:1.8">
+
+<span class="t">ne_ring</span> <span class="v">mid_to_wan</span><span style="color:#888">[MAX_INTERFACES][NE_TX_SLOTS]</span><br>
+<span class="t">ne_ring</span> <span class="v">local_to_mid</span><span style="color:#888">[NE_CRYPTO_WORKERS]</span><br>
+<span class="t">pthread_t</span> <span class="v">tx_threads</span><span style="color:#888">[NE_TX_SLOTS]</span>
+
+</div>
+
+---
+
+## 4. Ring — ai push, ai pop
+
+```mermaid
+flowchart LR
+    subgraph lan2wan["LAN → WAN"]
+        direction TB
+        A1["local_rx"] -->|push| B1["local_to_mid[w]"]
+        B1 -->|pop| C1["crypto[w]"]
+        C1 -->|push| D1["mid_to_wan[wan][t]"]
+        D1 -->|pop| E1["tx[t]"]
+    end
+
+    subgraph wan2lan["WAN → LAN"]
+        direction TB
+        A2["wan_rx"] -->|push| B2["wan_to_mid[w]"]
+        B2 -->|pop| C2["crypto[w]"]
+        C2 -->|push| D2["mid_to_local[loc][t]"]
+        D2 -->|pop| E2["tx[t]"]
+    end
+```
+
+| Ký hiệu | Nghĩa |
+|---------|--------|
+| `w` / `crypto_w` | crypto worker 0…5 (code RX: `wi`, crypto: `worker_idx`) |
+| `t` / `tx_slot` | TX thread 0…3 (`dp_pick_tx_slot`) |
+| `wan`, `loc` | chỉ số card dataplane |
+
+**Quan trọng:** `mid_to_wan` index theo **`tx_slot`**, không theo crypto worker.
+
+---
+
+## 5. LAN → WAN — 9 bước
+
+```mermaid
+flowchart TD
+    N1["① NIC LAN"] --> N2["② local_rx_thread"]
+    N2 --> N3["③ chọn crypto_w"]
+    N3 --> N4["④ push local_to_mid"]
+    N4 --> N5["⑤ crypto: dataplane_process_local"]
+    N5 --> N6["⑥ chọn tx_slot"]
+    N6 --> N7["⑦ push mid_to_wan"]
+    N7 --> N8["⑧ tx_thread drain"]
+    N8 --> N9["⑨ NIC WAN"]
+```
+
+| Bước | Hàm chính |
+|:--:|-----------|
+| ② | `ne_recv_local_slot` |
+| ③ | `dp_crypto_pick_local_worker` |
+| ⑤ | `dataplane_process_local` |
+| ⑥ | `dp_pick_tx_slot` |
+| ⑧ | `ne_tx_drain_wan_all` |
+
+---
+
+## 6. WAN → LAN — 9 bước
+
+```mermaid
+flowchart TD
+    N1["① NIC WAN"] --> N2["② wan_rx_thread"]
+    N2 --> N3["③ chọn crypto_w"]
+    N3 --> N4["④ push wan_to_mid"]
+    N4 --> N5["⑤ crypto: dataplane_process_wan"]
+    N5 --> N6["⑥ chọn tx_slot"]
+    N6 --> N7["⑦ push mid_to_local"]
+    N7 --> N8["⑧ tx_thread drain"]
+    N8 --> N9["⑨ NIC LAN"]
+```
+
+Khác LAN→WAN ở ring: `wan_to_mid` + `mid_to_local` + `ne_tx_drain_local_all`.
+
+---
+
+## 7. Vòng đời chương trình
+
+**Không** phải đường gói tin — là thứ tự khi chạy binary:
+
+```mermaid
+flowchart TD
+    M["main"] --> I["forwarder_init"]
+    I --> R["forwarder_run — block tại đây"]
+    R --> S["forwarder_stop — running=0"]
+    S --> J["pthread_join tất cả thread"]
+    J --> C["forwarder_cleanup"]
+```
+
+| Giai đoạn | Làm gì |
+|-----------|--------|
+| `init` | Mở `ne_pair`, `ne_ring_init`, **chưa** có thread RX/TX |
+| `run` | Tạo thread: RX LAN → TX×4 → crypto×6 → RX WAN |
+| `cleanup` | `ne_ring_destroy`, `ne_pair_close` |
+
+---
+
+## 8. tx_thread — mỗi vòng lặp
+
+```mermaid
+flowchart LR
+    CQ["ne_drain_cq_all"] --> WAN["drain mid_to_wan[*][tx_slot]"]
+    WAN --> LAN["drain mid_to_local[*][tx_slot]"]
+```
+
+Một `tx_threads[t]` lo **cả** WAN và LAN; chỉ drain ring có cùng `t`.
+
+---
+
+## 9. fwd_mid_to_wan_depth — đếm gói kẹt WAN
+
+```mermaid
+flowchart LR
+    R0["mid_to_wan[wan][0]"] --> SUM["d = tổng ne_ring_count"]
+    R1["mid_to_wan[wan][1]"] --> SUM
+    R2["mid_to_wan[wan][2]"] --> SUM
+    R3["mid_to_wan[wan][3]"] --> SUM
+    SUM --> USE["chọn WAN ít tắc / wan_tx_stuck"]
+```
+
+- <span class="fn">ne_ring_count</span>(ring) = số gói đang chờ trong **một** ring  
+- <span class="fn">fwd_mid_to_wan_depth</span> = cộng 4 ring `mid_to_wan[wan_dp][0..3]`
+
+---
+
+## 10. Ma trận ring (baseline)
+
+```
+              crypto_w:   0    1    2    3    4    5
+local_to_mid           [R]  [R]  [R]  [R]  [R]  [R]
+wan_to_mid             [R]  [R]  [R]  [R]  [R]  [R]
+
+mid_to_wan[wan0]  tx:  [0]  [1]  [2]  [3]
+mid_to_local[loc0] tx: [0]  [1]  [2]  [3]
 ```
 
 ---
 
-## 2. Tổng quan luồng gói tin
+## 11. Khi debug
 
-```
-RX → local_to_mid[crypto_w] / wan_to_mid[crypto_w]
-  → crypto_threads[crypto_w] → dataplane_process_*
-  → mid_to_wan[wan][tx_slot] / mid_to_local[local][tx_slot]
-  → tx_threads[tx_slot] → NIC
-```
+| Triệu chứng | Hỏi |
+|-------------|-----|
+| Không ra WAN | Crypto push `mid_to_wan[wan][t]` — TX drain cùng `t`? |
+| Scale TX hỏng | `tx_threads[i]` có drain `mid_to_wan[*][i]`? |
+| RX chết | Số RX slot > số hardware queue? |
 
----
-
-## 3. Bảng ring
-
-| Mảng | Index | Push | Pop |
-|------|-------|------|-----|
-| `local_to_mid` | `crypto_w` | `local_rx_thread` | `crypto_threads[crypto_w]` |
-| `wan_to_mid` | `crypto_w` | `wan_rx_thread` | `crypto_threads[crypto_w]` |
-| `mid_to_wan` | WAN + `tx_slot` | crypto (`dp_pick_tx_slot`) | `tx_threads[tx_slot]` |
-| `mid_to_local` | local + `tx_slot` | crypto | `tx_threads[tx_slot]` |
-
-`mid_to_wan` / `mid_to_local` index theo **tx_slot**, không theo crypto worker.
-
----
-
-## 4. Cụm CPU & thread (baseline)
-
-| Cụm | Macro | Hàm | CPU |
-|-----|-------|-----|-----|
-| RX LAN | `NE_CLUSTER_RX_LAN` | `local_rx_thread` | `ne_cpu_rx_lan` |
-| RX WAN | `NE_CLUSTER_RX_WAN` | `wan_rx_thread` | `ne_cpu_rx_wan` |
-| TX | `NE_CLUSTER_TX` | `tx_thread` | `ne_cpu_tx` |
-| Crypto | `NE_CLUSTER_CRYPTO` | `crypto_worker_thread` | `ne_cpu_crypto` |
-
----
-
-## 5. Gói tin đi thế nào
-
-### LAN → WAN
-
-| Bước | Ai | Việc |
-|:--:|-----|------|
-| 1 | NIC LAN | Gói vào card |
-| 2 | `local_rx_thread` | `ne_recv_local_slot` |
-| 3 | `local_rx_thread` | `crypto_w = dp_crypto_pick_local_worker` |
-| 4 | `local_rx_thread` | push `local_to_mid[crypto_w]` |
-| 5 | `crypto_threads[crypto_w]` | `dataplane_process_local` |
-| 6 | crypto | `tx_slot = dp_pick_tx_slot` |
-| 7 | crypto | push `mid_to_wan[wan_idx][tx_slot]` |
-| 8 | `tx_threads[tx_slot]` | `ne_tx_drain_wan_all` |
-| 9 | NIC WAN | Gói ra mạng |
-
-### WAN → LAN
-
-| Bước | Ai | Việc |
-|:--:|-----|------|
-| 1 | NIC WAN | Gói vào card |
-| 2 | `wan_rx_thread` | `ne_recv_wan_slot` |
-| 3 | `wan_rx_thread` | `crypto_w = dp_crypto_pick_wan_worker` |
-| 4 | `wan_rx_thread` | push `wan_to_mid[crypto_w]` |
-| 5 | `crypto_threads[crypto_w]` | `dataplane_process_wan` |
-| 6 | crypto | `tx_slot = dp_pick_tx_slot` |
-| 7 | crypto | push `mid_to_local[local_idx][tx_slot]` |
-| 8 | `tx_threads[tx_slot]` | `ne_tx_drain_local_all` |
-| 9 | NIC LAN | Gói ra LAN |
-
-### So sánh nhanh
-
-| | LAN → WAN | WAN → LAN |
-|--|-----------|-----------|
-| RX thread | `local_rx_thread` | `wan_rx_thread` |
-| Ring → crypto | `local_to_mid` | `wan_to_mid` |
-| Hàm crypto | `dataplane_process_local` | `dataplane_process_wan` |
-| Ring → TX | `mid_to_wan` | `mid_to_local` |
-| TX thread | `tx_threads[tx_slot]` (chung) | `tx_threads[tx_slot]` (chung) |
-
----
-
-## 6. Vòng đời chương trình
-
-```
-main()
-  → forwarder_init()      // chuẩn bị, chưa có thread
-  → forwarder_run()       // tạo thread, block đến khi stop
-  → forwarder_cleanup()   // hủy ring, đóng AF_XDP
-```
-
-**forwarder_init:** CPU map → config → crypto → `ne_pair_open` → `ne_ring_init`
-
-**forwarder_run:** tạo thread theo thứ tự RX LAN → TX (4) → crypto (6) → RX WAN → `pthread_join` khi `forwarder_stop()`
-
-**forwarder_cleanup:** `ne_ring_destroy` → `ne_pair_close`
-
----
-
-## 7. tx_thread
-
-Mỗi `tx_slot` mỗi vòng lặp:
-
-1. `ne_drain_cq_all(pair, tx_slot)`
-2. `ne_tx_drain_wan_all` — drain `mid_to_wan[wan][tx_slot]` mọi WAN
-3. `ne_tx_drain_local_all` — drain `mid_to_local[local][tx_slot]` mọi LAN
-
-Một TX thread lo cả WAN lẫn LAN.
-
----
-
-## 8. ne_ring_count và fwd_mid_to_wan_depth
-
-`ne_ring_count(ring)` = số gói đang chờ trong ring (`head - tail`).
-
-`fwd_mid_to_wan_depth(fwd, wan_dp)` = tổng gói chờ gửi WAN trên cả 4 TX slot:
-
-```c
-uint32_t d = 0;
-for (int w = 0; w < NE_TX_SLOTS; w++)
-    d += ne_ring_count(&fwd->mid_to_wan[wan_dp][w]);
-```
-
-- `d` lớn → WAN egress chậm
-- `d == 0` → hết gói kẹt; TX slot 0 reset `wan_tx_stuck`
-- `fwd_wan_pick_for_local` chọn WAN có `d` nhỏ nhất
-
----
-
-## 9. Ma trận ring (baseline)
-
-```
-                 crypto_w:  0   1   2   3   4   5
-local_to_mid        [R] [R] [R] [R] [R] [R]
-wan_to_mid          [R] [R] [R] [R] [R] [R]
-
-mid_to_wan[wan0]  tx_slot: [0] [1] [2] [3]
-mid_to_local[loc0] tx_slot: [0] [1] [2] [3]
-```
-
-[R] = một `ne_ring`, dung lượng `NE_RING` (16384).
-
----
-
-## 10. Debug nhanh
-
-| Triệu chứng | Kiểm tra |
-|-------------|----------|
-| Không ra WAN | crypto push `mid_to_wan[wan][tx_slot]` — TX drain cùng `tx_slot`? |
-| Scale TX lỗi | `NE_CLUSTER_TX` tăng, `tx_threads[t]` drain đúng `t`? |
-| RX không nhận | `NE_CLUSTER_RX_*` > số hardware queue? |
+Màu trong doc: <span class="t">kiểu</span> · <span class="v">biến/field</span> · <span class="fn">hàm</span>
