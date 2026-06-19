@@ -10,7 +10,7 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-static __thread uint8_t tls_l2_worker_core_id = NE_CPU_MID1;
+static __thread uint8_t tls_l2_worker_core_id;
 
 static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();

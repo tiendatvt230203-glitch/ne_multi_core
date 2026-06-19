@@ -14,6 +14,7 @@ TARGET  = $(BIN_DIR)/network-encryptor
 
 APP_SRC = main.c \
           src/core/main_diag.c \
+          src/core/cpu_map.c \
           src/core/interface.c \
           src/core/forwarder.c \
           src/core/crypto_route.c \

@@ -15,48 +15,6 @@
 
 struct bpf_object;
 
-struct xsk_queue {
-    struct xsk_socket *xsk;
-    struct xsk_umem *umem;
-    void *bufs;
-    struct xsk_ring_prod fill;
-    struct xsk_ring_cons comp;
-    struct xsk_ring_prod tx;
-    struct xsk_ring_cons rx;
-    uint64_t tx_slot;
-    int pending_tx_count;
-    pthread_mutex_t tx_lock;
-    uint64_t tx_wait_loops;
-};
-
-struct xsk_interface {
-    struct xsk_umem *umem;
-    void *bufs;
-    size_t umem_size;
-    uint32_t ring_size;
-    uint32_t frame_size;
-    uint32_t batch_size;
-    struct xsk_queue queues[MAX_QUEUES];
-    int queue_count;
-    int current_queue;
-    struct xsk_socket *xsk;
-    struct xsk_ring_prod fill;
-    struct xsk_ring_cons comp;
-    struct xsk_ring_prod tx;
-    struct xsk_ring_cons rx;
-    int ifindex;
-    char ifname[IF_NAMESIZE];
-    uint8_t src_mac[MAC_LEN];
-    uint8_t dst_mac[MAC_LEN];
-    uint64_t tx_slot;
-    pthread_mutex_t tx_lock;
-    int pending_tx_count;
-    uint64_t rx_packets;
-    uint64_t tx_packets;
-    uint64_t rx_bytes;
-    uint64_t tx_bytes;
-};
-
 enum ne_packet_dir {
     NE_DIR_LOCAL = 0,
     NE_DIR_WAN = 1,
@@ -149,16 +107,19 @@ void ne_pair_close(struct ne_pair *p);
 
 int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
 int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
+int ne_recv_local_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
+int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
 void ne_recv_release_local(struct ne_pair *p);
 void ne_recv_release_wan(struct ne_pair *p);
+void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot);
+void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
-void ne_drain_cq_all(struct ne_pair *p);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
-void ne_refill_fq_all(struct ne_pair *p);
-void ne_io_log_pressure(const struct ne_pair *p);
+void ne_refill_fq_local_slot(struct ne_pair *p, int rx_slot);
+void ne_refill_fq_wan_slot(struct ne_pair *p, int rx_slot);
 void ne_dp_tx_ctx(const char *dir, int tx_slot);
 void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd);
 void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth);

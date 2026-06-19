@@ -22,17 +22,10 @@ int dp_crypto_current_worker_idx(void)
     return tls_crypto_worker_idx;
 }
 
-uint8_t dp_crypto_worker_cpu(int worker_idx)
-{
-    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
-        return ne_crypto_cpus[0];
-    return ne_crypto_cpus[worker_idx];
-}
-
 int dp_crypto_worker_idx_for_cpu(uint8_t cpu_id)
 {
     for (int i = 0; i < (int)NE_CRYPTO_WORKERS; i++) {
-        if (ne_crypto_cpus[i] == cpu_id)
+        if (NE_CPU_CRYPTO[i] == cpu_id)
             return i;
     }
     return -1;
