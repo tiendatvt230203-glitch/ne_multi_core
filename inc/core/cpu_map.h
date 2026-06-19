@@ -7,7 +7,7 @@
  * ┌─────────┬──────────────────────────────────────────────────────────┐
  * │ Core    │ Vai trò (mặc định)                                       │
  * ├─────────┼──────────────────────────────────────────────────────────┤
- * │ 0       │ IO — FQ + CQ (cố định, không scale thêm thread)          │
+ * │ 0       │ IO — FQ refill only (CQ drain on TX threads per slot)    │
  * │ ne_rx_* │ RX LAN / RX WAN                                          │
  * │ ne_tx_* │ TX LAN / TX WAN (queue q → slot q % NE_TX_SLOTS)         │
  * │ ne_crypto_* │ Mã hóa / giải mã / rã ráp                          │

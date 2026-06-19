@@ -161,6 +161,7 @@ void ne_refill_fq_all(struct ne_pair *p);
 void ne_io_log_pressure(const struct ne_pair *p);
 void ne_dp_tx_ctx(const char *dir, int tx_slot);
 void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd);
+void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth);
 void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending);
 void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q);
 int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,

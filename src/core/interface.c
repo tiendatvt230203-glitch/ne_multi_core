@@ -75,9 +75,17 @@ void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
 {
     int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
 
-    dp_warn_once(id, batch_rcvd >= (int)NE_BATCH_SIZE,
-                 "core=%d RX %s saturated batch=%d (RX ring backlog)",
-                 cpu, dir ? dir : "?", batch_rcvd);
+    if (batch_rcvd <= 0)
+        dp_warn_once(id, 0, "");
+}
+
+void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth)
+{
+    int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
+
+    dp_warn_once(id, 1,
+                 "core=%d RX %s saturated worker=%d q_depth=%u (crypto queue full)",
+                 cpu, dir ? dir : "?", worker, q_depth);
 }
 
 void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
@@ -898,10 +906,13 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
     uint32_t free_slots = xsk_prod_nb_free(&slot->fq, NE_BATCH_SIZE);
-    if (free_slots < NE_BATCH_SIZE) {
+    uint32_t want;
+    uint32_t got;
+
+    if (!free_slots)
         return;
-    }
-    uint32_t got = pool_pop(pool, addrs, NE_BATCH_SIZE);
+    want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    got = pool_pop(pool, addrs, want);
     if (!got)
         return;
     if (xsk_ring_prod__reserve(&slot->fq, got, &idx) != got) {
@@ -961,14 +972,14 @@ static int cq_iface_pending(const struct ne_iface *iface)
 
 void ne_io_log_pressure(const struct ne_pair *p)
 {
-    uint32_t pool_free;
+    uint32_t pool_avail;
     int cq_backlog = 0;
 
     if (!p)
         return;
 
     pthread_spin_lock(&p->pool.lock);
-    pool_free = p->pool.cap - (p->pool.head - p->pool.tail);
+    pool_avail = p->pool.head - p->pool.tail;
     pthread_spin_unlock(&p->pool.lock);
 
     for (int i = 0; i < p->local_count; i++) {
@@ -982,10 +993,10 @@ void ne_io_log_pressure(const struct ne_pair *p)
         cq_backlog += cq_iface_pending(&p->wans[i]);
     }
 
-    if (pool_free < NE_BATCH_SIZE || cq_backlog >= (int)NE_DP_IO_CQ_MIN) {
+    if (pool_avail < NE_BATCH_SIZE || cq_backlog >= (int)NE_DP_IO_CQ_MIN) {
         dp_warn_once(NE_DP_WARN_IO, 1,
-                     "core=%d IO saturated pool_free=%u/%u cq_backlog=%d",
-                     (int)NE_CPU_IO, pool_free, p->pool.cap, cq_backlog);
+                     "core=%d IO saturated pool_avail=%u/%u cq_backlog=%d",
+                     (int)NE_CPU_IO, pool_avail, p->pool.cap, cq_backlog);
     } else {
         dp_warn_once(NE_DP_WARN_IO, 0, "");
     }

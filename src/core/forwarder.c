@@ -40,9 +40,19 @@ static void io_burst_service(struct forwarder *fwd)
 {
     for (int i = 0; i < IO_BURST_ROUNDS; i++)
         ne_refill_fq_all(&fwd->pair);
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_drain_cq_all(&fwd->pair);
     ne_io_log_pressure(&fwd->pair);
+}
+
+static void io_burst_drain_cq_local(struct forwarder *fwd, int tx_slot)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_drain_cq_local(&fwd->pair, tx_slot);
+}
+
+static void io_burst_drain_cq_wan(struct forwarder *fwd, int tx_slot)
+{
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_drain_cq_wan(&fwd->pair, tx_slot);
 }
 
 static void io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
@@ -107,7 +117,8 @@ static void log_cpu_map_conf(void)
 {
     int i;
 
-    fprintf(stderr, "[DP-CONF] arch=io-central io_core=%u\n", (unsigned)NE_CPU_IO);
+    fprintf(stderr, "[DP-CONF] arch=io-central io_core=%u (FQ only; CQ on TX threads)\n",
+            (unsigned)NE_CPU_IO);
     fprintf(stderr, "[DP-CONF] rx_lan_slots=%u cores:", (unsigned)NE_RX_LAN_SLOTS);
     for (i = 0; i < (int)NE_RX_LAN_SLOTS; i++)
         fprintf(stderr, " %u", (unsigned)ne_rx_lan_cpus[i]);
@@ -154,15 +165,12 @@ static void *local_rx_thread(void *arg)
             continue;
         }
 
-        ne_dp_warn_rx("LAN", (int)ne_rx_lan_cpus[0], rcvd);
-
         for (int i = 0; i < rcvd; i++) {
             int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
                                                  batch[i].len);
             if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_crypto((int)dp_crypto_worker_cpu(wi), wi,
-                                  ne_ring_count(&fwd->local_to_mid[wi]),
-                                  ne_ring_count(&fwd->wan_to_mid[wi]));
+                ne_dp_warn_rx_drop("LAN", (int)ne_rx_lan_cpus[0], wi,
+                                   ne_ring_count(&fwd->local_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
             }
         }
@@ -181,6 +189,7 @@ static void *local_tx_thread(void *arg)
     ne_dp_tx_ctx("LAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        io_burst_drain_cq_local(fwd, tx_slot);
         for (int li = 0; li < fwd->local_count; li++)
             io_burst_tx_local(fwd, li, tx_slot);
         sched_yield();
@@ -202,8 +211,6 @@ static void *wan_rx_thread(void *arg)
             continue;
         }
 
-        ne_dp_warn_rx("WAN", (int)ne_rx_wan_cpus[0], rcvd);
-
         for (int i = 0; i < rcvd; i++) {
             int wi;
             const uint8_t *pkt;
@@ -219,9 +226,8 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_crypto((int)dp_crypto_worker_cpu(wi), wi,
-                                  ne_ring_count(&fwd->local_to_mid[wi]),
-                                  ne_ring_count(&fwd->wan_to_mid[wi]));
+                ne_dp_warn_rx_drop("WAN", (int)ne_rx_wan_cpus[0], wi,
+                                   ne_ring_count(&fwd->wan_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
             }
         }
@@ -240,6 +246,7 @@ static void *wan_tx_thread(void *arg)
     ne_dp_tx_ctx("WAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        io_burst_drain_cq_wan(fwd, tx_slot);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
             if (fwd_wan_is_stopped(wi))
                 continue;
