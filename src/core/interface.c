@@ -851,6 +851,58 @@ void ne_refill_fq_all(struct ne_pair *p)
     ne_refill_fq_wan(p);
 }
 
+static int cq_queue_pending(const struct ne_xsk_queue *slot)
+{
+    uint32_t idx = 0;
+
+    return (int)xsk_ring_cons__peek(&slot->cq, 1, &idx);
+}
+
+static int cq_iface_pending(const struct ne_iface *iface)
+{
+    int pending = 0;
+
+    for (int q = 0; q < iface->queue_count; q++)
+        pending += cq_queue_pending(&iface->queues[q]);
+    return pending;
+}
+
+void ne_io_log_pressure(const struct ne_pair *p)
+{
+    static int warned;
+    uint32_t pool_free;
+    int cq_backlog = 0;
+
+    if (!p)
+        return;
+
+    pthread_spin_lock(&p->pool.lock);
+    pool_free = p->pool.cap - (p->pool.head - p->pool.tail);
+    pthread_spin_unlock(&p->pool.lock);
+
+    for (int i = 0; i < p->local_count; i++) {
+        if (!p->local_live[i])
+            continue;
+        cq_backlog += cq_iface_pending(&p->locals[i]);
+    }
+    for (int i = 0; i < p->wan_count; i++) {
+        if (!p->wan_live[i])
+            continue;
+        cq_backlog += cq_iface_pending(&p->wans[i]);
+    }
+
+    if (pool_free < NE_BATCH_SIZE || cq_backlog > 0) {
+        if (!warned) {
+            fprintf(stderr, "[DP-WARN] core=0 IO saturated pool_free=%u cq_backlog=%d\n",
+                    pool_free, cq_backlog);
+            fflush(stderr);
+            warned = 1;
+        }
+    } else {
+        warned = 0;
+    }
+}
+
 // TX
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,
                           uint64_t *tx_no_free)

@@ -45,6 +45,7 @@ static void io_burst_service(struct forwarder *fwd)
         ne_refill_fq_all(&fwd->pair);
     for (int i = 0; i < IO_BURST_ROUNDS; i++)
         ne_drain_cq_all(&fwd->pair);
+    ne_io_log_pressure(&fwd->pair);
 }
 
 static void io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)

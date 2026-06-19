@@ -185,6 +185,7 @@ void ne_drain_cq_all(struct ne_pair *p);
 void ne_refill_fq_local(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
 void ne_refill_fq_all(struct ne_pair *p);
+void ne_io_log_pressure(const struct ne_pair *p);
 int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
                           int local_idx, int tx_slot);
 int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
