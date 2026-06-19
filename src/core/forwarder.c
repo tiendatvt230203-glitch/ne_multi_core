@@ -8,7 +8,6 @@
 #include "../../inc/core/local_hwaddr.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
-#include "../../inc/core/cpu_map.h"
 #include "../../inc/core/profile_iface_xdp.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
 
@@ -17,8 +16,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
-#include <stdio.h>
-
+#include <stdatomic.h>
 static atomic_int running = 1;
 struct forwarder *g_active_fwd;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -31,58 +29,58 @@ static void pin_cpu(unsigned int cpu)
 }
 
 void forwarder_pin_cpu(void)
-{   
-    pin_cpu(NE_CPU_LOC);
+{
+    pin_cpu(NE_CPU_IO);
 }
 
 #define IO_BURST_ROUNDS   8
-#define IO_CQ_BURST_ROUNDS  64
 #define IO_TX_BURST_MAX   64
 
-static void io_burst_drain_cq(struct forwarder *fwd, int tx_slot)
+static const uint8_t local_tx_cpus[NE_TX_SLOTS] = { NE_CPU_LOC_TX0, NE_CPU_LOC_TX1 };
+static const uint8_t wan_tx_cpus[NE_TX_SLOTS] = { NE_CPU_WAN_TX0, NE_CPU_WAN_TX1 };
+
+static void io_burst_service(struct forwarder *fwd)
 {
-    for (int i = 0; i < IO_CQ_BURST_ROUNDS; i++)
-        ne_drain_cq_all(&fwd->pair, tx_slot);
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_refill_fq_all(&fwd->pair);
+    for (int i = 0; i < IO_BURST_ROUNDS; i++)
+        ne_drain_cq_all(&fwd->pair);
 }
 
-static int io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
+static void io_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 {
-    struct ne_ring *rings[1] = { &fwd->mid_to_local[local_idx][tx_slot] };
-    int total = 0;
+    struct ne_ring *rings[NE_CRYPTO_WORKERS];
 
     if (!ne_pair_local_live(&fwd->pair, local_idx))
-        return 0;
-    if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
-        return 0;
+        return;
+
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+        rings[w] = &fwd->mid_to_local[local_idx][w];
 
     for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_local_all(&fwd->pair, rings, 1,
+        int sent = ne_tx_drain_local_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
                                          local_idx, tx_slot);
         if (sent <= 0)
             break;
-        total += sent;
     }
-    return total;
 }
 
-static int io_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
+static void io_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
 {
-    struct ne_ring *rings[1] = { &fwd->mid_to_wan[wan_idx][tx_slot] };
-    int total = 0;
+    struct ne_ring *rings[NE_CRYPTO_WORKERS];
 
     if (!ne_pair_wan_live(&fwd->pair, wan_idx))
-        return 0;
-    if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
-        return 0;
+        return;
+
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+        rings[w] = &fwd->mid_to_wan[wan_idx][w];
 
     for (int burst = 0; burst < IO_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, 1,
+        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
                                        wan_idx, tx_slot);
         if (sent <= 0)
             break;
-        total += sent;
     }
-    return total;
 }
 
 struct io_tx_slot_ctx {
@@ -91,37 +89,43 @@ struct io_tx_slot_ctx {
     uint8_t cpu_id;
 };
 
-struct io_rx_slot_ctx {
-    struct forwarder *fwd;
-    int rx_slot;
-    uint8_t cpu_id;
-};
-
-static void io_burst_refill_local_slot(struct forwarder *fwd, int rx_slot)
+static void init_iface_meta(struct xsk_interface *iface, const char *ifname,
+                            const uint8_t src_mac[MAC_LEN],
+                            const uint8_t dst_mac[MAC_LEN])
 {
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_local_slot(&fwd->pair, rx_slot);
+    memset(iface, 0, sizeof(*iface));
+    iface->ifindex = if_nametoindex(ifname);
+    strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
+    iface->ifname[sizeof(iface->ifname) - 1] = '\0';
+    iface->queue_count = 0;
+    iface->ring_size = NE_RING;
+    iface->batch_size = NE_BATCH_SIZE;
+    iface->frame_size = NE_FRAME;
+    memcpy(iface->src_mac, src_mac, MAC_LEN);
+    memcpy(iface->dst_mac, dst_mac, MAC_LEN);
 }
 
-static void io_burst_refill_wan_slot(struct forwarder *fwd, int rx_slot)
+static void *io_thread(void *arg)
 {
-    for (int i = 0; i < IO_BURST_ROUNDS; i++)
-        ne_refill_fq_wan_slot(&fwd->pair, rx_slot);
+    struct forwarder *fwd = arg;
+
+    pin_cpu(NE_CPU_IO);
+
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        io_burst_service(fwd);
+        sched_yield();
+    }
+    return NULL;
 }
 
 static void *local_rx_thread(void *arg)
 {
-    struct io_rx_slot_ctx *ctx = arg;
-    struct forwarder *fwd = ctx->fwd;
-    int rx_slot = ctx->rx_slot;
+    struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
-
-    pin_cpu(ctx->cpu_id);
+    pin_cpu(NE_CPU_LOC_RX);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        io_burst_refill_local_slot(fwd, rx_slot);
-
-        int rcvd = ne_recv_local_slot(&fwd->pair, rx_slot, batch, NE_BATCH_SIZE);
+        int rcvd = ne_recv_local(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             sched_yield();
             continue;
@@ -133,28 +137,12 @@ static void *local_rx_thread(void *arg)
             if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
-        ne_recv_release_local_slot(&fwd->pair, rx_slot);
+        ne_recv_release_local(&fwd->pair);
     }
     return NULL;
 }
 
-static int io_burst_tx_slot(struct forwarder *fwd, int tx_slot)
-{
-    int sent = 0;
-
-    for (int wi = 0; wi < fwd->wan_count; wi++) {
-        if (fwd_wan_is_stopped(wi))
-            continue;
-        sent += io_burst_tx_wan(fwd, wi, tx_slot);
-        if (tx_slot == 0 && fwd_mid_to_wan_depth(fwd, wi) == 0)
-            fwd->wan_tx_stuck[wi] = 0;
-    }
-    for (int li = 0; li < fwd->local_count; li++)
-        sent += io_burst_tx_local(fwd, li, tx_slot);
-    return sent;
-}
-
-static void *tx_thread(void *arg)
+static void *local_tx_thread(void *arg)
 {
     struct io_tx_slot_ctx *ctx = arg;
     struct forwarder *fwd = ctx->fwd;
@@ -163,28 +151,21 @@ static void *tx_thread(void *arg)
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        io_burst_drain_cq(fwd, tx_slot);
-        if (io_burst_tx_slot(fwd, tx_slot) <= 0)
-            sched_yield();
-        else
-            io_burst_drain_cq(fwd, tx_slot);
+        for (int li = 0; li < fwd->local_count; li++)
+            io_burst_tx_local(fwd, li, tx_slot);
+        sched_yield();
     }
     return NULL;
 }
-
 static void *wan_rx_thread(void *arg)
 {
-    struct io_rx_slot_ctx *ctx = arg;
-    struct forwarder *fwd = ctx->fwd;
-    int rx_slot = ctx->rx_slot;
+    struct forwarder *fwd = arg;
     struct ne_packet batch[NE_BATCH_SIZE];
 
-    pin_cpu(ctx->cpu_id);
+    pin_cpu(NE_CPU_WAN_RX);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        io_burst_refill_wan_slot(fwd, rx_slot);
-
-        int rcvd = ne_recv_wan_slot(&fwd->pair, rx_slot, batch, NE_BATCH_SIZE);
+        int rcvd = ne_recv_wan(&fwd->pair, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             sched_yield();
             continue;
@@ -207,7 +188,28 @@ static void *wan_rx_thread(void *arg)
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0)
                 ne_frame_free(&fwd->pair, batch[i].addr);
         }
-        ne_recv_release_wan_slot(&fwd->pair, rx_slot);
+        ne_recv_release_wan(&fwd->pair);
+    }
+    return NULL;
+}
+
+static void *wan_tx_thread(void *arg)
+{
+    struct io_tx_slot_ctx *ctx = arg;
+    struct forwarder *fwd = ctx->fwd;
+    int tx_slot = ctx->tx_slot;
+
+    pin_cpu(ctx->cpu_id);
+
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        for (int wi = 0; wi < fwd->wan_count; wi++) {
+            if (fwd_wan_is_stopped(wi))
+                continue;
+            io_burst_tx_wan(fwd, wi, tx_slot);
+            if (tx_slot == 0 && fwd_mid_to_wan_depth(fwd, wi) == 0)
+                fwd->wan_tx_stuck[wi] = 0;
+        }
+        sched_yield();
     }
     return NULL;
 }
@@ -295,10 +297,6 @@ static void *crypto_worker_thread(void *arg)
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
-    if (ne_cpu_map_validate() != 0)
-        return -1;
-    ne_cpu_map_log();
-
     if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
         return -1;
     if (forwarder_should_stop())
@@ -313,16 +311,17 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
 
+    static const uint8_t zero_mac[MAC_LEN];
+    for (int i = 0; i < fwd->local_count; i++)
+        init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname,
+                        cfg->locals[i].src_mac, zero_mac);
     for (int di = 0; di < fwd->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
         if (ci < 0)
             return -1;
         fwd->wan_cfg_idx[di] = ci;
-        strncpy(fwd->wans[di].ifname, cfg->wans[ci].ifname, sizeof(fwd->wans[di].ifname) - 1);
-        fwd->wans[di].ifname[sizeof(fwd->wans[di].ifname) - 1] = '\0';
-        fwd->wans[di].ifindex = (int)if_nametoindex(cfg->wans[ci].ifname);
-        memcpy(fwd->wans[di].src_mac, cfg->wans[ci].src_mac, MAC_LEN);
-        memcpy(fwd->wans[di].dst_mac, cfg->wans[ci].dst_mac, MAC_LEN);
+        init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
+                        cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
     }
 
     profile_iface_xdp_prepare_init(cfg);
@@ -362,16 +361,16 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         }
     }
     for (int i = 0; i < fwd->local_count; i++) {
-        for (int t = 0; t < (int)NE_TX_SLOTS; t++) {
-            if (ne_ring_init(&fwd->mid_to_local[i][t], NE_RING, 0) != 0) {
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+            if (ne_ring_init(&fwd->mid_to_local[i][w], NE_RING, 1) != 0) {
                 forwarder_cleanup(fwd);
                 return -1;
             }
         }
     }
     for (int i = 0; i < fwd->wan_count; i++) {
-        for (int t = 0; t < (int)NE_TX_SLOTS; t++) {
-            if (ne_ring_init(&fwd->mid_to_wan[i][t], NE_RING, 0) != 0) {
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+            if (ne_ring_init(&fwd->mid_to_wan[i][w], NE_RING, 1) != 0) {
                 forwarder_cleanup(fwd);
                 return -1;
             }
@@ -394,65 +393,67 @@ void forwarder_cleanup(struct forwarder *fwd)
         ne_ring_destroy(&fwd->wan_to_mid[w]);
     }
     for (int i = 0; i < MAX_INTERFACES; i++) {
-        for (int t = 0; t < (int)NE_TX_SLOTS; t++)
-            ne_ring_destroy(&fwd->mid_to_wan[i][t]);
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+            ne_ring_destroy(&fwd->mid_to_wan[i][w]);
     }
     for (int i = 0; i < MAX_INTERFACES; i++) {
-        for (int t = 0; t < (int)NE_TX_SLOTS; t++)
-            ne_ring_destroy(&fwd->mid_to_local[i][t]);
+        for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+            ne_ring_destroy(&fwd->mid_to_local[i][w]);
     }
     fwd_crypto_cleanup_all_profile_slots();
     ne_pair_close(&fwd->pair);
 }
 
-static void forwarder_join_started(struct forwarder *fwd, int local_rx_started,
-                                   int tx_started, int crypto_started, int wan_rx_started)
+static void forwarder_join_started(struct forwarder *fwd, int io, int local_rx, int local_tx_started,
+                                   int crypto_started, int wan_tx_started, int wan_rx)
 {
     atomic_store_explicit(&running, 0, memory_order_release);
-    for (int w = 0; w < local_rx_started; w++)
-        pthread_join(fwd->local_rx_threads[w], NULL);
-    for (int w = 0; w < tx_started; w++)
-        pthread_join(fwd->tx_threads[w], NULL);
+    if (io)
+        pthread_join(fwd->io_thread, NULL);
+    if (local_rx)
+        pthread_join(fwd->local_thread, NULL);
+    for (int w = 0; w < local_tx_started; w++)
+        pthread_join(fwd->local_tx_threads[w], NULL);
     for (int w = 0; w < crypto_started; w++)
         pthread_join(fwd->crypto_threads[w], NULL);
-    for (int w = 0; w < wan_rx_started; w++)
-        pthread_join(fwd->wan_rx_threads[w], NULL);
+    for (int w = 0; w < wan_tx_started; w++)
+        pthread_join(fwd->wan_tx_threads[w], NULL);
+    if (wan_rx)
+        pthread_join(fwd->wan_thread, NULL);
 }
 
 void forwarder_run(struct forwarder *fwd)
 {
     struct crypto_worker_ctx crypto_ctx[NE_CRYPTO_WORKERS];
-    struct io_rx_slot_ctx local_rx_ctx[NE_RX_LAN_SLOTS];
-    struct io_rx_slot_ctx wan_rx_ctx[NE_RX_WAN_SLOTS];
-    struct io_tx_slot_ctx tx_ctx[NE_TX_SLOTS];
+    struct io_tx_slot_ctx local_tx_ctx[NE_TX_SLOTS];
+    struct io_tx_slot_ctx wan_tx_ctx[NE_TX_SLOTS];
     int crypto_started = 0;
-    int local_rx_started = 0, tx_started = 0, wan_rx_started = 0;
+    int io = 0, local_rx = 0, local_tx_started = 0, wan_tx_started = 0;
 
     if (!fwd || forwarder_should_stop())
         return;
 
     g_active_fwd = fwd;
 
-    for (int w = 0; w < (int)NE_RX_LAN_SLOTS; w++) {
-        local_rx_ctx[w].fwd = fwd;
-        local_rx_ctx[w].rx_slot = w;
-        local_rx_ctx[w].cpu_id = ne_cpu_rx_lan[w];
-        if (pthread_create(&fwd->local_rx_threads[w], NULL, local_rx_thread, &local_rx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, 0, 0);
-            return;
-        }
-        local_rx_started++;
+    if (pthread_create(&fwd->io_thread, NULL, io_thread, fwd) != 0)
+        return;
+    io = 1;
+
+    if (pthread_create(&fwd->local_thread, NULL, local_rx_thread, fwd) != 0) {
+        forwarder_join_started(fwd, io, 0, 0, 0, 0, 0);
+        return;
     }
+    local_rx = 1;
 
     for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
-        tx_ctx[w].fwd = fwd;
-        tx_ctx[w].tx_slot = w;
-        tx_ctx[w].cpu_id = ne_cpu_tx[w];
-        if (pthread_create(&fwd->tx_threads[w], NULL, tx_thread, &tx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, 0, 0);
+        local_tx_ctx[w].fwd = fwd;
+        local_tx_ctx[w].tx_slot = w;
+        local_tx_ctx[w].cpu_id = local_tx_cpus[w];
+        if (pthread_create(&fwd->local_tx_threads[w], NULL, local_tx_thread, &local_tx_ctx[w]) != 0) {
+            forwarder_join_started(fwd, io, local_rx, local_tx_started, 0, 0, 0);
             return;
         }
-        tx_started++;
+        local_tx_started++;
     }
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
@@ -460,27 +461,49 @@ void forwarder_run(struct forwarder *fwd)
         crypto_ctx[w].worker_idx = w;
         crypto_ctx[w].cpu_id = dp_crypto_worker_cpu(w);
         if (pthread_create(&fwd->crypto_threads[w], NULL, crypto_worker_thread, &crypto_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, crypto_started, 0);
+            forwarder_join_started(fwd, io, local_rx, local_tx_started, crypto_started, 0, 0);
             return;
         }
         crypto_started++;
     }
 
-    for (int w = 0; w < (int)NE_RX_WAN_SLOTS; w++) {
-        wan_rx_ctx[w].fwd = fwd;
-        wan_rx_ctx[w].rx_slot = w;
-        wan_rx_ctx[w].cpu_id = ne_cpu_rx_wan[w];
-        if (pthread_create(&fwd->wan_rx_threads[w], NULL, wan_rx_thread, &wan_rx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, tx_started, crypto_started, 0);
+    for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
+        wan_tx_ctx[w].fwd = fwd;
+        wan_tx_ctx[w].tx_slot = w;
+        wan_tx_ctx[w].cpu_id = wan_tx_cpus[w];
+        if (pthread_create(&fwd->wan_tx_threads[w], NULL, wan_tx_thread, &wan_tx_ctx[w]) != 0) {
+            forwarder_join_started(fwd, io, local_rx, local_tx_started, crypto_started, wan_tx_started, 0);
             return;
         }
-        wan_rx_started++;
+        wan_tx_started++;
     }
 
+    if (pthread_create(&fwd->wan_thread, NULL, wan_rx_thread, fwd) != 0) {
+        forwarder_join_started(fwd, io, local_rx, local_tx_started, crypto_started, wan_tx_started, 0);
+        return;
+    }
+    int wan_rx = 1;
     fwd->threads_started = 1;
-    if (fwd->cfg)
+    if (fwd->cfg) {
+        fprintf(stderr,
+                "[DP-CONF] arch=io-central umem=shared io_core=%u "
+                "(FQ+CQ) crypto=%u tx_slots=%u rx(lan=%u wan=%u)\n",
+                (unsigned)NE_CPU_IO, (unsigned)NE_CRYPTO_WORKERS,
+                (unsigned)NE_TX_SLOTS, (unsigned)NE_CPU_LOC_RX,
+                (unsigned)NE_CPU_WAN_RX);
+        fflush(stderr);
         main_diag_log_dataplane_ready(fwd->cfg);
-    forwarder_join_started(fwd, local_rx_started, tx_started, crypto_started, wan_rx_started);
+    }
+    pthread_join(fwd->io_thread, NULL);
+    pthread_join(fwd->local_thread, NULL);
+    for (int w = 0; w < (int)NE_TX_SLOTS; w++)
+        pthread_join(fwd->local_tx_threads[w], NULL);
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+        pthread_join(fwd->crypto_threads[w], NULL);
+    for (int w = 0; w < (int)NE_TX_SLOTS; w++)
+        pthread_join(fwd->wan_tx_threads[w], NULL);
+    if (wan_rx)
+        pthread_join(fwd->wan_thread, NULL);
     fwd->threads_started = 0;
     if (g_active_fwd == fwd)
         g_active_fwd = NULL;

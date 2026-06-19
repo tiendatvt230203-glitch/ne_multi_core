@@ -16,13 +16,15 @@ struct forwarder {
     struct ne_pair pair;
     struct ne_ring local_to_mid[NE_CRYPTO_WORKERS];
     struct ne_ring wan_to_mid[NE_CRYPTO_WORKERS];
-    struct ne_ring mid_to_wan[MAX_INTERFACES][NE_TX_SLOTS];
-    struct ne_ring mid_to_local[MAX_INTERFACES][NE_TX_SLOTS];
+    struct ne_ring mid_to_wan[MAX_INTERFACES][NE_CRYPTO_WORKERS];
+    struct ne_ring mid_to_local[MAX_INTERFACES][NE_CRYPTO_WORKERS];
 
-    pthread_t local_rx_threads[NE_RX_LAN_SLOTS];
-    pthread_t tx_threads[NE_TX_SLOTS];
+    pthread_t io_thread;
+    pthread_t local_thread;
+    pthread_t local_tx_threads[NE_TX_SLOTS];
     pthread_t crypto_threads[NE_CRYPTO_WORKERS];
-    pthread_t wan_rx_threads[NE_RX_WAN_SLOTS];
+    pthread_t wan_tx_threads[NE_TX_SLOTS];
+    pthread_t wan_thread;
     int threads_started;
 
     uint64_t wan_tx_stuck[MAX_INTERFACES];
@@ -34,7 +36,7 @@ static inline uint32_t fwd_mid_to_wan_depth(const struct forwarder *fwd, int wan
     uint32_t d = 0;
     if (!fwd || wan_dp < 0)
         return 0;
-    for (int w = 0; w < (int)NE_TX_SLOTS; w++)
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         d += ne_ring_count(&fwd->mid_to_wan[wan_dp][w]);
     return d;
 }
