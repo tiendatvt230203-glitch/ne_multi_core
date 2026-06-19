@@ -8,15 +8,6 @@
 #include <arpa/inet.h>
 #include <stddef.h>
 
-static const uint8_t ne_crypto_cpus[NE_CRYPTO_WORKERS] = {
-    NE_CPU_MID1,
-    NE_CPU_MID2,
-    NE_CPU_MID3,
-    NE_CPU_MID4,
-    NE_CPU_MID5,
-    NE_CPU_MID6,
-};
-
 static __thread int tls_crypto_worker_idx;
 
 void dp_crypto_worker_bind(int worker_idx)
@@ -34,7 +25,7 @@ int dp_crypto_current_worker_idx(void)
 uint8_t dp_crypto_worker_cpu(int worker_idx)
 {
     if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
-        return NE_CPU_MID1;
+        return ne_crypto_cpus[0];
     return ne_crypto_cpus[worker_idx];
 }
 

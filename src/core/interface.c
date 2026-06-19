@@ -5,7 +5,9 @@
 #include <net/if.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -16,6 +18,85 @@ int lock_tx = 0;
 int lock_rx = 0;
 int lock_fill = 0;
 int lock_cq = 0;
+
+#define NE_DP_WARN_IO       0
+#define NE_DP_WARN_RX_LAN   1
+#define NE_DP_WARN_RX_WAN   2
+#define NE_DP_WARN_TX_LAN0  3
+#define NE_DP_WARN_TX_LAN1  4
+#define NE_DP_WARN_TX_WAN0  5
+#define NE_DP_WARN_TX_WAN1  6
+#define NE_DP_WARN_CRYPTO0  7
+#define NE_DP_WARN_SLOTS    (NE_DP_WARN_CRYPTO0 + NE_CRYPTO_WORKERS)
+
+static int dp_warn_on[NE_DP_WARN_SLOTS];
+static __thread const char *tls_dp_tx_dir;
+static __thread int tls_dp_tx_slot = -1;
+
+static void dp_warn_once(int id, int active, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (id < 0 || id >= NE_DP_WARN_SLOTS)
+        return;
+    if (active) {
+        if (!dp_warn_on[id]) {
+            fprintf(stderr, "[DP-WARN] ");
+            va_start(ap, fmt);
+            vfprintf(stderr, fmt, ap);
+            va_end(ap);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+            dp_warn_on[id] = 1;
+        }
+    } else {
+        dp_warn_on[id] = 0;
+    }
+}
+
+void ne_dp_tx_ctx(const char *dir, int tx_slot)
+{
+    tls_dp_tx_dir = dir;
+    tls_dp_tx_slot = tx_slot;
+}
+
+void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
+{
+    int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
+
+    dp_warn_once(id, batch_rcvd >= (int)NE_BATCH_SIZE,
+                 "core=%d RX %s saturated batch=%d (RX ring backlog)",
+                 cpu, dir ? dir : "?", batch_rcvd);
+}
+
+void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
+{
+    int id;
+    int active;
+
+    if (!tls_dp_tx_dir || tls_dp_tx_slot < 0 || tls_dp_tx_slot >= (int)NE_TX_SLOTS)
+        return;
+    if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
+        id = NE_DP_WARN_TX_LAN0 + tls_dp_tx_slot;
+    else
+        id = NE_DP_WARN_TX_WAN0 + tls_dp_tx_slot;
+    active = tx_full && pending > 0;
+    dp_warn_once(id, active,
+                 "core=%d TX %s slot=%d saturated pending=%u (TX ring full)",
+                 cpu, tls_dp_tx_dir, tls_dp_tx_slot, pending);
+}
+
+void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)
+{
+    uint32_t hi = (NE_RING * 7u) / 8u;
+
+    if (worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
+        return;
+    dp_warn_once(NE_DP_WARN_CRYPTO0 + worker, lan_q >= hi || wan_q >= hi,
+                 "core=%d crypto saturated worker=%d lan_q=%u wan_q=%u",
+                 cpu, worker, lan_q, wan_q);
+}
+
 static uint32_t next_pow2_u32(uint32_t v)
 {
     if (v <= 1)
@@ -869,7 +950,6 @@ static int cq_iface_pending(const struct ne_iface *iface)
 
 void ne_io_log_pressure(const struct ne_pair *p)
 {
-    static int warned;
     uint32_t pool_free;
     int cq_backlog = 0;
 
@@ -892,14 +972,11 @@ void ne_io_log_pressure(const struct ne_pair *p)
     }
 
     if (pool_free < NE_BATCH_SIZE || cq_backlog > 0) {
-        if (!warned) {
-            fprintf(stderr, "[DP-WARN] core=0 IO saturated pool_free=%u cq_backlog=%d\n",
-                    pool_free, cq_backlog);
-            fflush(stderr);
-            warned = 1;
-        }
+        dp_warn_once(NE_DP_WARN_IO, 1,
+                     "core=%d IO saturated pool_free=%u cq_backlog=%d",
+                     (int)NE_CPU_IO, pool_free, cq_backlog);
     } else {
-        warned = 0;
+        dp_warn_once(NE_DP_WARN_IO, 0, "core=%d IO ok", (int)NE_CPU_IO);
     }
 }
 
@@ -909,20 +986,19 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 {   
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
+    uint32_t pending = ne_ring_count(src);
+    int cpu = sched_getcpu();
+
     if (!free_slots) {
         if (tx_no_free)
             (*tx_no_free)++;
-
-        if (!lock_tx) {
-            int cpu = sched_getcpu();
-            lock_tx++;
-            printf("[%d]Tx_ring full at core %d\n",lock_tx,cpu);
-        }
+        ne_dp_warn_tx(cpu, 1, pending);
         if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
         }
         return 0;
     }
+    ne_dp_warn_tx(cpu, 0, pending);
 
     uint32_t popped = 0;
     uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
