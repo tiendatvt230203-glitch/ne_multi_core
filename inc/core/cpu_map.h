@@ -4,41 +4,34 @@
 /*
  * Bản đồ CPU dataplane (12 core 0–11). CHỈ SỬA FILE NÀY khi đổi core.
  *
+ * Kiến trúc ổn định (~3G GCM): FQ refill trên RX, CQ drain trên TX.
+ *
  * ┌─────────┬──────────────────────────────────────────────────────────┐
- * │ Core    │ Vai trò (mặc định)                                       │
+ * │ Core    │ Vai trò                                                  │
  * ├─────────┼──────────────────────────────────────────────────────────┤
- * │ 0       │ IO — FQ refill only (CQ drain on TX threads per slot)    │
- * │ ne_rx_* │ RX LAN / RX WAN                                          │
- * │ ne_tx_* │ TX LAN / TX WAN (queue q → slot q % NE_TX_SLOTS)         │
- * │ ne_crypto_* │ Mã hóa / giải mã / rã ráp                          │
+ * │ ne_rx_lan │ RX LAN + FQ refill LAN                                 │
+ * │ ne_rx_wan │ RX WAN + FQ refill WAN                                 │
+ * │ ne_tx_lan │ TX LAN + CQ drain (slot q % NE_TX_SLOTS)               │
+ * │ ne_tx_wan │ TX WAN + CQ drain                                      │
+ * │ ne_crypto │ Mã hóa / giải mã / rã ráp                              │
  * └─────────┴──────────────────────────────────────────────────────────┘
  *
- * Cách scale:
- *   Crypto — đổi NE_CRYPTO_WORKERS, thêm/bớt phần tử ne_crypto_cpus[].
- *   TX     — đổi NE_TX_SLOTS, sửa ne_tx_lan_cpus[] và ne_tx_wan_cpus[] (cùng số slot).
- *   RX     — đổi NE_RX_LAN_SLOTS / NE_RX_WAN_SLOTS, sửa ne_rx_*_cpus[].
- *            (NE_RX_* > 1 cần thêm rx thread theo slot trong forwarder.c)
- *
- * Lưu ý: mỗi core 1–11 chỉ nên gán một vai trò nặng; tránh trùng core trừ khi cố ý.
+ * Scale: sửa NE_*_SLOTS / NE_CRYPTO_WORKERS và mảng cpu tương ứng (cùng độ dài).
  */
-
-#define NE_CPU_IO           0u
 
 #define NE_RX_LAN_SLOTS     1u
 #define NE_RX_WAN_SLOTS     1u
-
 #define NE_TX_SLOTS         2u
-
 #define NE_CRYPTO_WORKERS   6u
 
-static const uint8_t ne_rx_lan_cpus[NE_RX_LAN_SLOTS] = { 1u };
+static const uint8_t ne_rx_lan_cpus[NE_RX_LAN_SLOTS] = { 0u };
 static const uint8_t ne_rx_wan_cpus[NE_RX_WAN_SLOTS] = { 11u };
 
-static const uint8_t ne_tx_lan_cpus[NE_TX_SLOTS] = { 2u, 5u };
-static const uint8_t ne_tx_wan_cpus[NE_TX_SLOTS] = { 8u, 11u };
+static const uint8_t ne_tx_lan_cpus[NE_TX_SLOTS] = { 1u, 2u };
+static const uint8_t ne_tx_wan_cpus[NE_TX_SLOTS] = { 9u, 10u };
 
 static const uint8_t ne_crypto_cpus[NE_CRYPTO_WORKERS] = {
-    3u, 4u, 6u, 7u, 9u, 10u,
+    3u, 4u, 5u, 6u, 7u, 8u,
 };
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -54,7 +47,7 @@ _Static_assert(sizeof(ne_crypto_cpus) / sizeof(ne_crypto_cpus[0]) == NE_CRYPTO_W
                "ne_crypto_cpus[] length must match NE_CRYPTO_WORKERS");
 #endif
 
-/* Alias tương thích code cũ */
+#define NE_CPU_IO           ne_rx_lan_cpus[0]
 #define NE_CPU_LOC_RX       ne_rx_lan_cpus[0]
 #define NE_CPU_WAN_RX       ne_rx_wan_cpus[0]
 #define NE_CPU_LOC_TX0      ne_tx_lan_cpus[0]

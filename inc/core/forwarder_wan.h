@@ -20,7 +20,6 @@ int fwd_wan_ifname_dataplane_in_cfg(const struct app_config *cfg, const char *if
 
 int fwd_wan_dp_ok_for_new_traffic(int dp);
 int fwd_wan_is_stopped(int dp);
-void fwd_wan_mark_stopped(int dp);
 
 uint32_t fwd_wan_flush_queue(struct forwarder *fwd, int wan_idx);
 int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx);
