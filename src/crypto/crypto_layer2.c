@@ -10,7 +10,7 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-static __thread uint8_t tls_l2_worker_core_id;
+static __thread uint8_t tls_l2_worker_idx;
 
 static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
@@ -20,14 +20,14 @@ static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
     return et == fake;
 }
 
-void crypto_layer2_bind_worker_core(uint8_t cpu_core_id)
+void crypto_layer2_bind_worker_idx(uint8_t worker_idx)
 {
-    tls_l2_worker_core_id = cpu_core_id;
+    tls_l2_worker_idx = worker_idx;
 }
 
-uint8_t crypto_layer2_worker_core_id(void)
+uint8_t crypto_layer2_worker_idx(void)
 {
-    return tls_l2_worker_core_id;
+    return tls_l2_worker_idx;
 }
 
 static inline int l2_enc_start_offset(int nonce_size) {
@@ -49,17 +49,17 @@ static void l2_write_wire_header(uint8_t *packet, uint8_t policy_id,
     packet[12] = (uint8_t)(fake >> 8);
     packet[13] = (uint8_t)(fake & 0xFF);
     packet[CRYPTO_L2_POLICY_OFF] = policy_id;
-    packet[CRYPTO_L2_CORE_ID_OFF] = crypto_layer2_worker_core_id();
+    packet[CRYPTO_L2_CORE_ID_OFF] = crypto_layer2_worker_idx();
     memcpy(packet + CRYPTO_L2_NONCE_OFF, nonce, (size_t)nonce_size);
 }
 
-int crypto_layer2_read_core_id(const uint8_t *packet, uint32_t pkt_len, uint8_t *core_id_out)
+int crypto_layer2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8_t *worker_idx_out)
 {
-    if (!packet || !core_id_out || pkt_len < CRYPTO_L2_NONCE_OFF)
+    if (!packet || !worker_idx_out || pkt_len < CRYPTO_L2_NONCE_OFF)
         return -1;
     if (!l2_pkt_fake_ethertype(packet))
         return -1;
-    *core_id_out = packet[CRYPTO_L2_CORE_ID_OFF];
+    *worker_idx_out = packet[CRYPTO_L2_CORE_ID_OFF];
     return 0;
 }
 

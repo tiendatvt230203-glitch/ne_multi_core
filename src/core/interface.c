@@ -1054,15 +1054,27 @@ static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint
     return 0;
 }
 
+static __thread uint32_t tls_tx_drain_rr;
+
 static int tx_drain_iface_all_rings(struct ne_iface *iface, struct ne_ring *srcs[],
                                     int src_count, uint32_t max_frame, int tx_slot)
 {
     int sent = 0;
-    for (int s = 0; s < src_count; s++) {
+    int start;
+
+    if (!srcs || src_count <= 0)
+        return 0;
+
+    start = (int)(tls_tx_drain_rr % (uint32_t)src_count);
+    for (int i = 0; i < src_count; i++) {
+        int s = (start + i) % src_count;
+
         if (!srcs[s])
             continue;
         sent += tx_drain_iface_ring(iface, srcs[s], max_frame, tx_slot);
     }
+    if (sent > 0)
+        tls_tx_drain_rr++;
     return sent;
 }
 
