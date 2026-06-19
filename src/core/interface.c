@@ -28,8 +28,12 @@ int lock_cq = 0;
 #define NE_DP_WARN_TX_WAN1  6
 #define NE_DP_WARN_CRYPTO0  7
 #define NE_DP_WARN_SLOTS    (NE_DP_WARN_CRYPTO0 + NE_CRYPTO_WORKERS)
+#define NE_DP_WARN_CLEAR    8192u
+#define NE_DP_IO_CQ_MIN     NE_BATCH_SIZE
 
 static int dp_warn_on[NE_DP_WARN_SLOTS];
+static uint32_t dp_warn_clear_streak[NE_DP_WARN_SLOTS];
+static pthread_mutex_t dp_warn_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread const char *tls_dp_tx_dir;
 static __thread int tls_dp_tx_slot = -1;
 
@@ -39,7 +43,9 @@ static void dp_warn_once(int id, int active, const char *fmt, ...)
 
     if (id < 0 || id >= NE_DP_WARN_SLOTS)
         return;
+    pthread_mutex_lock(&dp_warn_lock);
     if (active) {
+        dp_warn_clear_streak[id] = 0;
         if (!dp_warn_on[id]) {
             fprintf(stderr, "[DP-WARN] ");
             va_start(ap, fmt);
@@ -49,9 +55,14 @@ static void dp_warn_once(int id, int active, const char *fmt, ...)
             fflush(stderr);
             dp_warn_on[id] = 1;
         }
-    } else {
-        dp_warn_on[id] = 0;
+    } else if (dp_warn_on[id]) {
+        dp_warn_clear_streak[id]++;
+        if (dp_warn_clear_streak[id] >= NE_DP_WARN_CLEAR) {
+            dp_warn_on[id] = 0;
+            dp_warn_clear_streak[id] = 0;
+        }
     }
+    pthread_mutex_unlock(&dp_warn_lock);
 }
 
 void ne_dp_tx_ctx(const char *dir, int tx_slot)
@@ -971,12 +982,12 @@ void ne_io_log_pressure(const struct ne_pair *p)
         cq_backlog += cq_iface_pending(&p->wans[i]);
     }
 
-    if (pool_free < NE_BATCH_SIZE || cq_backlog > 0) {
+    if (pool_free < NE_BATCH_SIZE || cq_backlog >= (int)NE_DP_IO_CQ_MIN) {
         dp_warn_once(NE_DP_WARN_IO, 1,
-                     "core=%d IO saturated pool_free=%u cq_backlog=%d",
-                     (int)NE_CPU_IO, pool_free, cq_backlog);
+                     "core=%d IO saturated pool_free=%u/%u cq_backlog=%d",
+                     (int)NE_CPU_IO, pool_free, p->pool.cap, cq_backlog);
     } else {
-        dp_warn_once(NE_DP_WARN_IO, 0, "core=%d IO ok", (int)NE_CPU_IO);
+        dp_warn_once(NE_DP_WARN_IO, 0, "");
     }
 }
 
