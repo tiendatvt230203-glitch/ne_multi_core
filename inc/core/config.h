@@ -14,16 +14,9 @@
 #define CRYPTO_MODE_PQC_GCM 2
 /* PQC GCM wire nonce is always 12 bytes (see CRYPTO_PQC_NONCE_BYTES). */
 
-#define DEFAULT_FRAME_SIZE      4096
-#define DEFAULT_BATCH_SIZE      64
-#define DEFAULT_UMEM_MB_LOCAL   2048
-#define DEFAULT_UMEM_MB_WAN     256
-#define DEFAULT_RING_SIZE       262144
-#define DEFAULT_RING_SIZE_WAN   32768
+/* XSK buffer/ring sizing: NE_FRAME, NE_RING, NE_N_FRAMES, NE_BATCH_SIZE in interface.h */
+/* NIC queue count: NE_QUEUE_OVERRIDE in interface.h (0 = auto from hardware) */
 #define WAN_REORDER_WINDOW_KB   10240
-#define DEFAULT_QUEUE_COUNT         4
-#define NE_LOCAL_QUEUE_TARGET       4
-#define NE_WAN_QUEUE_TARGET         4
 #define MAX_PROFILES 32
 #define MAX_PROFILE_INTERFACES 16
 #define MAX_CRYPTO_POLICIES 128
@@ -89,11 +82,6 @@ struct local_config {
     uint32_t netmask;
     uint32_t network;
     uint8_t src_mac[MAC_LEN];
-    uint32_t umem_mb;
-    uint32_t ring_size;
-    uint32_t batch_size;
-    uint32_t frame_size;
-    int queue_count;
 };
 
 struct wan_config {
@@ -102,18 +90,10 @@ struct wan_config {
     uint8_t src_mac[MAC_LEN];
     uint8_t dst_mac[MAC_LEN];
     uint32_t window_size;
-    uint32_t umem_mb;
-    uint32_t ring_size;
-    uint32_t batch_size;
-    uint32_t frame_size;
-    int queue_count;
     int dataplane; /* 0 = có dst_ip (peer IP), chỉ PQC handshake; 1 = L2 traffic (enp7/enp8) */
 };
 
 struct app_config {
-    uint32_t global_frame_size;
-    uint32_t global_batch_size;
-
     struct local_config locals[MAX_INTERFACES];
     int local_count;
 
@@ -180,6 +160,10 @@ int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
 int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip);
 int config_validate(struct app_config *cfg);
+int config_local_ifname_in_cfg(const struct app_config *cfg, const char *ifname);
+int config_local_owner_profile(const struct app_config *cfg, int local_idx, int skip_profile_id);
+int config_wan_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id);
+int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id);
 int config_policy_db_id_taken(const struct app_config *cfg, int db_id);
 int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);

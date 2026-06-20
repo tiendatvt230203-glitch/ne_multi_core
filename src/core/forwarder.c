@@ -31,8 +31,8 @@ void forwarder_pin_cpu(void)
     pin_cpu(ne_cpu_rx_lan(0));
 }
 
-#define DP_BURST_ROUNDS   8
-#define DP_TX_BURST_MAX   64
+#define DP_BURST_ROUNDS   1
+#define DP_TX_BURST_MAX   1
 
 static void dp_burst_refill_local(struct forwarder *fwd, int rx_slot)
 {

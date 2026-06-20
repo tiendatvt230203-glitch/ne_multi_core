@@ -137,37 +137,166 @@ int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag)
     return 0;
 }
 
+int config_local_ifname_in_cfg(const struct app_config *cfg, const char *ifname)
+{
+    if (!cfg || !ifname)
+        return 0;
+    for (int i = 0; i < cfg->local_count; i++) {
+        if (strcmp(cfg->locals[i].ifname, ifname) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+int config_local_owner_profile(const struct app_config *cfg, int local_idx, int skip_profile_id)
+{
+    if (!cfg || local_idx < 0 || local_idx >= cfg->local_count)
+        return 0;
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        if (p->id == skip_profile_id)
+            continue;
+        for (int li = 0; li < p->local_count; li++) {
+            if (p->local_indices[li] == local_idx)
+                return p->id;
+        }
+    }
+    return 0;
+}
+
+int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
+{
+    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
+        return 0;
+    if (!cfg->wans[wan_idx].dataplane)
+        return 0;
+    return config_wan_owner_profile(cfg, wan_idx, skip_profile_id);
+}
+
+int config_wan_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
+{
+    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
+        return 0;
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        if (p->id == skip_profile_id)
+            continue;
+        for (int wi = 0; wi < p->wan_count; wi++) {
+            if (p->wan_indices[wi] == wan_idx)
+                return p->id;
+        }
+    }
+    return 0;
+}
+
+static int profile_has_dup_index(const int *indices, int count)
+{
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (indices[i] == indices[j])
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int config_validate_policy_db_ids_across_profiles(const struct app_config *cfg)
+{
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *a = &cfg->profiles[pi];
+
+        for (int pj = pi + 1; pj < cfg->profile_count; pj++) {
+            const struct profile_config *b = &cfg->profiles[pj];
+
+            for (int ai = 0; ai < a->policy_count; ai++) {
+                int a_idx = a->policy_indices[ai];
+
+                if (a_idx < 0 || a_idx >= cfg->policy_count)
+                    continue;
+                for (int bi = 0; bi < b->policy_count; bi++) {
+                    int b_idx = b->policy_indices[bi];
+
+                    if (b_idx < 0 || b_idx >= cfg->policy_count)
+                        continue;
+                    if (cfg->policies[a_idx].db_id <= 0)
+                        continue;
+                    if (cfg->policies[a_idx].db_id == cfg->policies[b_idx].db_id) {
+                        fprintf(stderr,
+                                "[VALIDATE] duplicate policy db_id=%d (profile %d and %d)\n",
+                                cfg->policies[a_idx].db_id, a->id, b->id);
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int config_validate_profiles(const struct app_config *cfg)
+{
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        if (profile_has_dup_index(p->local_indices, p->local_count)) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: duplicate LAN binding in profile config\n",
+                    p->id);
+            return -1;
+        }
+        if (profile_has_dup_index(p->wan_indices, p->wan_count)) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: duplicate WAN binding in profile config\n",
+                    p->id);
+            return -1;
+        }
+        if (profile_has_dup_index(p->policy_indices, p->policy_count)) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: duplicate policy binding in profile config\n",
+                    p->id);
+            return -1;
+        }
+
+        for (int li = 0; li < p->local_count; li++) {
+            int idx = p->local_indices[li];
+            int owner;
+
+            if (idx < 0 || idx >= cfg->local_count)
+                continue;
+            owner = config_local_owner_profile(cfg, idx, p->id);
+            if (owner > 0) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: LAN %s already used by profile %d\n",
+                        p->id, cfg->locals[idx].ifname, owner);
+                return -1;
+            }
+        }
+        for (int wi = 0; wi < p->wan_count; wi++) {
+            int idx = p->wan_indices[wi];
+            int owner;
+
+            if (idx < 0 || idx >= cfg->wan_count)
+                continue;
+            owner = config_wan_owner_profile(cfg, idx, p->id);
+            if (owner > 0) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: WAN %s already used by profile %d\n",
+                        p->id, cfg->wans[idx].ifname, owner);
+                return -1;
+            }
+        }
+    }
+    return config_validate_policy_db_ids_across_profiles(cfg);
+}
+
 int config_validate(struct app_config *cfg) {
-    if (cfg->global_frame_size == 0) {
-        fprintf(stderr, "[GLOBAL] frame_size not specified\n");
-        return -1;
-    }
-
-    if (cfg->global_batch_size == 0) {
-        fprintf(stderr, "[GLOBAL] batch_size not specified\n");
-        return -1;
-    }
-
     for (int i = 0; i < cfg->local_count; i++) {
         struct local_config *local = &cfg->locals[i];
 
         if (local->ifname[0] == '\0') {
             fprintf(stderr, "LOCAL[%d]: interface not specified\n", i);
-            return -1;
-        }
-        if (local->umem_mb == 0) {
-            fprintf(stderr, "LOCAL %s: umem_mb not specified\n", local->ifname);
-            return -1;
-        }
-        if (local->ring_size == 0) {
-            fprintf(stderr, "LOCAL %s: ring_size not specified\n", local->ifname);
-            return -1;
-        }
-
-        uint32_t min_umem_mb = (local->ring_size * 2 * local->frame_size) / (1024 * 1024);
-        if (local->umem_mb < min_umem_mb) {
-            fprintf(stderr, "LOCAL %s: umem_mb=%d too small for ring_size=%d (min: %d)\n",
-                    local->ifname, local->umem_mb, local->ring_size, min_umem_mb);
             return -1;
         }
         if (local->netmask == 0) {
@@ -197,29 +326,14 @@ int config_validate(struct app_config *cfg) {
             return -1;
         }
 
-        if (wan->umem_mb == 0) {
-            fprintf(stderr, "WAN %s: umem_mb not specified\n", wan->ifname);
-            return -1;
-        }
-
-        if (wan->ring_size == 0) {
-            fprintf(stderr, "WAN %s: ring_size not specified\n", wan->ifname);
-            return -1;
-        }
-
         if (wan->window_size == 0) {
             fprintf(stderr, "WAN %s: window_kb not specified\n", wan->ifname);
             return -1;
         }
-
-        uint32_t min_umem_mb = (wan->ring_size * 2 * wan->frame_size) / (1024 * 1024);
-        if (wan->umem_mb < min_umem_mb) {
-            fprintf(stderr, "WAN %s: umem_mb=%d too small for ring_size=%d (min: %d)\n",
-                    wan->ifname, wan->umem_mb, wan->ring_size, min_umem_mb);
-            return -1;
-        }
     }
 
+    if (config_validate_profiles(cfg) != 0)
+        return -1;
     return 0;
 }
 

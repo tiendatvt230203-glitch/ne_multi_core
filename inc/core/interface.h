@@ -10,6 +10,8 @@
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
+/* NIC combined queues: 0 = keep current ethtool count; >0 = reshape via ethtool -L */
+#define NE_QUEUE_OVERRIDE 0
 
 #include "cpu_map.h"
 

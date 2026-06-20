@@ -574,15 +574,17 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
         if (config_policy_db_id_taken(cfg, cp_base.db_id)) {
             fprintf(stderr,
-                    "[VALIDATE] profile %d: skip policy db_id=%d (duplicate db_id)\n",
+                    "[VALIDATE] profile %d: duplicate policy db_id=%d\n",
                     p->id, cp_base.db_id);
-            continue;
+            PQclear(res);
+            return -1;
         }
-        if (config_policy_pkt_tag_taken(cfg, cp_base.id)) {
+        if (cp_base.id > 0 && config_policy_pkt_tag_taken(cfg, cp_base.id)) {
             fprintf(stderr,
-                    "[VALIDATE] profile %d: skip policy pkt_tag=%d db_id=%d (duplicate pkt_tag)\n",
+                    "[VALIDATE] profile %d: duplicate policy wire id=%d (db_id=%d)\n",
                     p->id, cp_base.id, cp_base.db_id);
-            continue;
+            PQclear(res);
+            return -1;
         }
 
         char src_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
@@ -669,12 +671,6 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
         struct local_config *loc = &cfg->locals[cfg->local_count];
         memset(loc, 0, sizeof(*loc));
 
-        loc->frame_size  = cfg->global_frame_size;
-        loc->batch_size  = cfg->global_batch_size;
-        loc->umem_mb     = DEFAULT_UMEM_MB_LOCAL;
-        loc->ring_size   = DEFAULT_RING_SIZE;
-        loc->queue_count = NE_LOCAL_QUEUE_TARGET;
-
         const char *v = PQgetvalue(res, row, PQfnumber(res, "ifname"));
         if (!v || v[0] == '\0') {
             fprintf(stderr, "[DB LOCAL][%d] ifname not specified\n", row);
@@ -709,12 +705,7 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
         struct wan_config *wan = &cfg->wans[cfg->wan_count];
         memset(wan, 0, sizeof(*wan));
 
-        wan->frame_size   = cfg->global_frame_size;
-        wan->batch_size   = cfg->global_batch_size;
         wan->window_size  = (uint32_t)(WAN_REORDER_WINDOW_KB * 1024U);
-        wan->umem_mb      = DEFAULT_UMEM_MB_WAN;
-        wan->ring_size    = DEFAULT_RING_SIZE_WAN;
-        wan->queue_count  = NE_WAN_QUEUE_TARGET;
 
         const char *v = PQgetvalue(res, row, PQfnumber(res, "ifname"));
         if (!v || v[0] == '\0') {
@@ -903,8 +894,6 @@ int config_load_from_db(struct app_config *cfg, int profile_id, const char *conn
     memset(cfg, 0, sizeof(*cfg));
     strncpy(cfg->bpf_file, "bpf/xdp_redirect.o", sizeof(cfg->bpf_file) - 1);
     strncpy(cfg->bpf_wan_file, "bpf/xdp_wan_redirect.o", sizeof(cfg->bpf_wan_file) - 1);
-    cfg->global_frame_size = DEFAULT_FRAME_SIZE;
-    cfg->global_batch_size = DEFAULT_BATCH_SIZE;
 
     PGconn *conn = PQconnectdbParams(pg.keywords, pg.values, 0);
     if (PQstatus(conn) != CONNECTION_OK) {

@@ -128,24 +128,10 @@ static int find_wan_by_ifname(const struct app_config *cfg, const char *ifname) 
     return -1;
 }
 
-/* Return owning profile id if dataplane WAN index already bound to another profile. */
-static int wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
+/* Return owning profile id if LAN index already bound to another profile. */
+static int lan_owner_profile(const struct app_config *cfg, int local_idx, int skip_profile_id)
 {
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return 0;
-    if (!cfg->wans[wan_idx].dataplane)
-        return 0;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-
-        if (p->id == skip_profile_id)
-            continue;
-        for (int wi = 0; wi < p->wan_count; wi++) {
-            if (p->wan_indices[wi] == wan_idx)
-                return p->id;
-        }
-    }
-    return 0;
+    return config_local_owner_profile(cfg, local_idx, skip_profile_id);
 }
 
 static int append_local_unique(struct app_config *dst, const struct local_config *src_loc) {
@@ -168,39 +154,45 @@ static int append_wan_unique(struct app_config *dst, const struct wan_config *sr
     return dst->wan_count++;
 }
 
-static int append_policy_skip_dup(struct app_config *dst, const struct crypto_policy *src_cp,
-                                  int src_profile_id)
+static int policy_db_id_in_cfg(const struct app_config *cfg, int db_id, int before_count)
 {
-    if (!dst || !src_cp)
-        return -1;
+    if (!cfg || db_id <= 0)
+        return 0;
+    for (int i = 0; i < before_count && i < cfg->policy_count; i++) {
+        if (cfg->policies[i].db_id == db_id)
+            return 1;
+    }
+    return 0;
+}
 
-    if (dst->policy_count >= MAX_CRYPTO_POLICIES) {
+static int merge_append_policies(struct app_config *dst, const struct app_config *src,
+                                 int src_profile_id, int *policy_map)
+{
+    int base = dst->policy_count;
+
+    for (int i = 0; i < src->policy_count; i++) {
+        const struct crypto_policy *cp = &src->policies[i];
+
+        if (policy_db_id_in_cfg(dst, cp->db_id, base)) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: duplicate policy db_id=%d (already in merged config)\n",
+                    src_profile_id, cp->db_id);
+            return -1;
+        }
+    }
+
+    if (dst->policy_count + src->policy_count > MAX_CRYPTO_POLICIES) {
         fprintf(stderr,
-                "[VALIDATE] profile %d: skip policy db_id=%d pkt_tag=%d (policy table full)\n",
-                src_profile_id, src_cp->db_id, src_cp->id);
+                "[VALIDATE] profile %d: policy table full (need %d slots)\n",
+                src_profile_id, src->policy_count);
         return -1;
     }
 
-    for (int i = 0; i < dst->policy_count; i++) {
-        const struct crypto_policy *existing = &dst->policies[i];
-        if (src_cp->db_id > 0 && existing->db_id == src_cp->db_id) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip policy db_id=%d pkt_tag=%d "
-                    "(db_id already used, existing pkt_tag=%d)\n",
-                    src_profile_id, src_cp->db_id, src_cp->id, existing->id);
-            return -1;
-        }
-        if (existing->id == src_cp->id) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip policy pkt_tag=%d db_id=%d "
-                    "(pkt_tag already used, existing db_id=%d)\n",
-                    src_profile_id, src_cp->id, src_cp->db_id, existing->db_id);
-            return -1;
-        }
+    for (int i = 0; i < src->policy_count; i++) {
+        policy_map[i] = dst->policy_count;
+        dst->policies[dst->policy_count++] = src->policies[i];
     }
-
-    dst->policies[dst->policy_count] = *src_cp;
-    return dst->policy_count++;
+    return 0;
 }
 
 static int merge_one_config(struct app_config *dst, const struct app_config *src) {
@@ -258,6 +250,13 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
                 iface_validate_failed = 1;
                 continue;
             }
+            if (lan_owner_profile(dst, merged_li, src_profile_id) > 0) {
+                fprintf(stderr,
+                        "[VALIDATE] profile %d: skip LAN %s (already used by another profile)\n",
+                        src_profile_id, ifname);
+                iface_validate_failed = 1;
+                continue;
+            }
             if (dp->local_count >= MAX_PROFILE_INTERFACES) {
                 fprintf(stderr,
                         "[VALIDATE] profile %d: skip LAN %s (MAX_PROFILE_INTERFACES)\n",
@@ -290,10 +289,10 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
                 iface_validate_failed = 1;
                 continue;
             }
-            owner = wan_dataplane_owner_profile(dst, merged_wi, src_profile_id);
+            owner = config_wan_owner_profile(dst, merged_wi, src_profile_id);
             if (owner > 0) {
                 fprintf(stderr,
-                        "[VALIDATE] profile %d: skip WAN %s (dataplane already used by profile %d)\n",
+                        "[VALIDATE] profile %d: WAN %s already used by profile %d\n",
                         src_profile_id, ifname, owner);
                 iface_validate_failed = 1;
                 continue;
@@ -311,16 +310,14 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
         }
 
         if (iface_validate_failed) {
-            dp->local_count = 0;
-            dp->wan_count = 0;
             fprintf(stderr,
-                    "[VALIDATE] profile %d: skip all policies (LAN/WAN validation failed)\n",
+                    "[VALIDATE] profile %d: merge failed (duplicate or invalid LAN/WAN)\n",
                     src_profile_id);
-            continue;
+            return -1;
         }
 
-        for (int i = 0; i < src->policy_count; i++)
-            policy_map[i] = append_policy_skip_dup(dst, &src->policies[i], src_profile_id);
+        if (merge_append_policies(dst, src, src_profile_id, policy_map) != 0)
+            return -1;
 
         for (int i = 0; i < sp->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
             int spi = sp->policy_indices[i];
@@ -343,8 +340,6 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
     memset(&merged, 0, sizeof(merged));
     strncpy(merged.bpf_file, "bpf/xdp_redirect.o", sizeof(merged.bpf_file) - 1);
     strncpy(merged.bpf_wan_file, "bpf/xdp_wan_redirect.o", sizeof(merged.bpf_wan_file) - 1);
-    merged.global_frame_size = DEFAULT_FRAME_SIZE;
-    merged.global_batch_size = DEFAULT_BATCH_SIZE;
 
     for (int i = 0; i < id_count; i++) {
         struct app_config tmp;

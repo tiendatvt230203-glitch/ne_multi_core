@@ -25,16 +25,7 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
     interface_reset_redirect_maps();
 }
 
-static int cfg_has_local_ifname(const struct app_config *cfg, const char *ifname)
-{
-    if (!cfg || !ifname)
-        return 0;
-    for (int i = 0; i < cfg->local_count; i++) {
-        if (strcmp(cfg->locals[i].ifname, ifname) == 0)
-            return 1;
-    }
-    return 0;
-}
+/* --- ifname / profile helpers --- */
 
 static int cfg_has_wan_ifname(const struct app_config *cfg, const char *ifname)
 {
@@ -47,17 +38,10 @@ static int cfg_has_wan_ifname(const struct app_config *cfg, const char *ifname)
     return 0;
 }
 
-/* --- LAN share vs WAN exclusive policy --- */
-
-static int lan_still_in_merged_cfg(const struct app_config *cfg, const char *ifname)
-{
-    return cfg_has_local_ifname(cfg, ifname);
-}
-
 static int cfg_locals_subset(const struct app_config *sub, const struct app_config *sup)
 {
     for (int i = 0; i < sub->local_count; i++) {
-        if (!cfg_has_local_ifname(sup, sub->locals[i].ifname))
+        if (!config_local_ifname_in_cfg(sup, sub->locals[i].ifname))
             return 0;
     }
     return 1;
@@ -75,7 +59,7 @@ static int cfg_wans_subset(const struct app_config *sub, const struct app_config
 static int cfg_has_lan_row_addition(const struct app_config *old, const struct app_config *new)
 {
     for (int i = 0; i < new->local_count; i++) {
-        if (!cfg_has_local_ifname(old, new->locals[i].ifname))
+        if (!config_local_ifname_in_cfg(old, new->locals[i].ifname))
             return 1;
     }
     return 0;
@@ -93,7 +77,7 @@ static int cfg_has_wan_row_addition(const struct app_config *old, const struct a
 static int cfg_has_lan_row_removal(const struct app_config *old, const struct app_config *new)
 {
     for (int i = 0; i < old->local_count; i++) {
-        if (!cfg_has_local_ifname(new, old->locals[i].ifname))
+        if (!config_local_ifname_in_cfg(new, old->locals[i].ifname))
             return 1;
     }
     return 0;
@@ -196,37 +180,12 @@ static int profile_config_has_wan_ci(const struct profile_config *prof, int ci)
     return 0;
 }
 
-static int wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx,
-                                       int skip_profile_id)
-{
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return 0;
-    if (!cfg->wans[wan_idx].dataplane)
-        return 0;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-
-        if (p->id == skip_profile_id)
-            continue;
-        for (int wi = 0; wi < p->wan_count; wi++) {
-            if (p->wan_indices[wi] == wan_idx)
-                return p->id;
-        }
-    }
-    return 0;
-}
-
 static int local_db_equal(const struct local_config *a, const struct local_config *b)
 {
     return strcmp(a->ifname, b->ifname) == 0 &&
            a->ip == b->ip &&
            a->netmask == b->netmask &&
-           a->network == b->network &&
-           a->umem_mb == b->umem_mb &&
-           a->ring_size == b->ring_size &&
-           a->batch_size == b->batch_size &&
-           a->frame_size == b->frame_size &&
-           a->queue_count == b->queue_count;
+           a->network == b->network;
 }
 
 static int wan_db_equal(const struct wan_config *a, const struct wan_config *b)
@@ -234,11 +193,6 @@ static int wan_db_equal(const struct wan_config *a, const struct wan_config *b)
     return strcmp(a->ifname, b->ifname) == 0 &&
            a->dst_ip == b->dst_ip &&
            a->window_size == b->window_size &&
-           a->umem_mb == b->umem_mb &&
-           a->ring_size == b->ring_size &&
-           a->batch_size == b->batch_size &&
-           a->frame_size == b->frame_size &&
-           a->queue_count == b->queue_count &&
            a->dataplane == b->dataplane;
 }
 
@@ -402,14 +356,10 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     if (profile_iface_ifindex(ifname, "LAN") < 0)
         return -1;
 
-    if (p->bpf_locals[pair_li] && p->xdp_local_on[pair_li]) {
-        map = bpf_object__find_map_by_name(p->bpf_locals[pair_li], "xsks_map");
-        if (!map)
-            return -1;
-        fprintf(stderr,
-                "[PROFILE-XDP] LAN %s — refresh xsks_map (shared, no re-attach)\n",
-                ifname);
-        return update_xsk_map_iface(&p->locals[pair_li], bpf_map__fd(map));
+    if (p->bpf_locals[pair_li]) {
+        bpf_object__close(p->bpf_locals[pair_li]);
+        p->bpf_locals[pair_li] = NULL;
+        p->xdp_local_on[pair_li] = 0;
     }
 
     if (open_bpf_object(cfg->bpf_file, &p->bpf_locals[pair_li],
@@ -534,12 +484,8 @@ static int detach_profile_lan_rows(struct forwarder *fwd, const struct app_confi
         ifname = old_cfg->locals[oci].ifname;
         if (new_prof && profile_config_has_local_ci(new_prof, oci))
             continue;
-        if (lan_still_in_merged_cfg(new_cfg, ifname)) {
-            fprintf(stderr,
-                    "[PROFILE-XDP] profile %d LAN %s still in merged config — keep xdp/id\n",
-                    trigger_profile_id, ifname);
+        if (config_local_ifname_in_cfg(new_cfg, ifname))
             continue;
-        }
         li = pair_local_slot_live(fwd, ifname);
         if (li < 0)
             continue;
@@ -551,7 +497,7 @@ static int detach_profile_lan_rows(struct forwarder *fwd, const struct app_confi
     return 0;
 }
 
-/* WAN REMOVE: exclusive — detach when trigger profile drops dataplane WAN from merged config. */
+/* Detach WAN rows owned by trigger profile when they leave merged config. */
 static int detach_profile_wan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
                                    const struct app_config *old_cfg, int trigger_profile_id)
 {
@@ -605,7 +551,7 @@ static void profile_attach_sess_rollback(struct forwarder *fwd, struct profile_a
     fwd_reconcile_iface_counts(fwd);
 }
 
-/* ADD: only LAN rows listed in trigger profile's DB config. */
+/* ADD: LAN rows from trigger profile only (one profile per interface). */
 static void attach_profile_lan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
                                     int trigger_profile_id, struct profile_attach_sess *sess)
 {
@@ -618,6 +564,7 @@ static void attach_profile_lan_rows(struct forwarder *fwd, const struct app_conf
         int ci = prof->local_indices[pi];
         const char *ifname;
         int li;
+        int owner;
 
         if (sess->validate_failed)
             break;
@@ -631,12 +578,16 @@ static void attach_profile_lan_rows(struct forwarder *fwd, const struct app_conf
             sess->validate_failed = 1;
             continue;
         }
-        if (pair_local_slot_live(fwd, ifname) >= 0) {
+        owner = config_local_owner_profile(new_cfg, ci, trigger_profile_id);
+        if (owner > 0) {
             fprintf(stderr,
-                    "[PROFILE-XDP] profile %d LAN %s shared — skip attach\n",
-                    trigger_profile_id, ifname);
+                    "[VALIDATE] profile %d: skip LAN %s (already used by profile %d)\n",
+                    trigger_profile_id, ifname, owner);
+            sess->validate_failed = 1;
             continue;
         }
+        if (pair_local_slot_live(fwd, ifname) >= 0)
+            continue;
 
         li = fwd->local_count;
         if (li >= MAX_INTERFACES) {
@@ -699,10 +650,10 @@ static void attach_profile_wan_rows(struct forwarder *fwd, const struct app_conf
             sess->validate_failed = 1;
             continue;
         }
-        owner = wan_dataplane_owner_profile(new_cfg, ci, trigger_profile_id);
+        owner = config_wan_owner_profile(new_cfg, ci, trigger_profile_id);
         if (owner > 0) {
             fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (dataplane already used by profile %d)\n",
+                    "[VALIDATE] profile %d: skip WAN %s (already used by profile %d)\n",
                     trigger_profile_id, ifname, owner);
             sess->validate_failed = 1;
             continue;

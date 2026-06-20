@@ -308,12 +308,7 @@ static int local_db_equal(const struct local_config *a, const struct local_confi
     return strcmp(a->ifname, b->ifname) == 0 &&
            a->ip == b->ip &&
            a->netmask == b->netmask &&
-           a->network == b->network &&
-           a->umem_mb == b->umem_mb &&
-           a->ring_size == b->ring_size &&
-           a->batch_size == b->batch_size &&
-           a->frame_size == b->frame_size &&
-           a->queue_count == b->queue_count;
+           a->network == b->network;
 }
 
 static const struct wan_config *wan_by_ifname(const struct app_config *cfg,
@@ -331,11 +326,6 @@ static int wan_db_equal(const struct wan_config *a, const struct wan_config *b)
     return strcmp(a->ifname, b->ifname) == 0 &&
            a->dst_ip == b->dst_ip &&
            a->window_size == b->window_size &&
-           a->umem_mb == b->umem_mb &&
-           a->ring_size == b->ring_size &&
-           a->batch_size == b->batch_size &&
-           a->frame_size == b->frame_size &&
-           a->queue_count == b->queue_count &&
            a->dataplane == b->dataplane;
 }
 
@@ -384,8 +374,10 @@ static int profile_db_unchanged(const struct profile_config *old,
             return 0;
     }
 
-    if (old->wan_count != new->wan_count)
-        return 0;
+    for (int i = 0; i < old->local_count; i++) {
+        if (old->local_indices[i] != new->local_indices[i])
+            return 0;
+    }
     for (int i = 0; i < old->wan_count; i++) {
         if (old->wan_indices[i] != new->wan_indices[i] ||
             old->wan_bandwidth_weight[i] != new->wan_bandwidth_weight[i])
@@ -491,7 +483,7 @@ static int lan_wan_db_unchanged(const struct app_config *old,
     return 1;
 }
 
-/* Same ifnames; only LAN/WAN tuning (ring/window/umem) changed — no policy/profile traffic change. */
+/* Same ifnames; only WAN window tuning changed — no policy/profile traffic change. */
 static int runtime_tuning_only_change(const struct app_config *old,
                                       const struct app_config *new)
 {

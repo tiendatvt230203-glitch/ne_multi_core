@@ -229,18 +229,36 @@ int interface_get_queue_count(const char *ifname)
     return count > 0 ? count : 1;
 }
 
-static int resolve_iface_queue_count(const char *ifname, int cfg_count, int target_default)
+static int resolve_iface_queue_count(const char *ifname)
 {
-    int want = cfg_count > 0 ? cfg_count : target_default;
     int hw = interface_get_queue_count(ifname);
+    if (hw < 1)
+        hw = 1;
 
-    if (hw > 0 && want > hw)
-        want = hw;
+#if NE_QUEUE_OVERRIDE > 0
+    int want = NE_QUEUE_OVERRIDE;
+#else
+    int want = hw;
+#endif
+
     if (want > MAX_QUEUES)
         want = MAX_QUEUES;
     if (want < 1)
         want = 1;
     return want;
+}
+
+static int apply_iface_queue_count(const char *ifname, int want)
+{
+#if NE_QUEUE_OVERRIDE > 0
+    int hw = interface_get_queue_count(ifname);
+
+    if (hw != want)
+        return interface_set_queue_count(ifname, want);
+#endif
+    (void)ifname;
+    (void)want;
+    return 0;
 }
 
 int ne_ring_init(struct ne_ring *r, uint32_t cap, int mpsc_pop)
@@ -494,23 +512,23 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->wan_queue_total = 0;
 
     for (int i = 0; i < p->local_count; i++) {
-        int nq = resolve_iface_queue_count(cfg->locals[i].ifname,
-                                           cfg->locals[i].queue_count,
-                                           NE_LOCAL_QUEUE_TARGET);
-        NE_TRY(interface_set_queue_count(cfg->locals[i].ifname, nq));
+        int nq = resolve_iface_queue_count(cfg->locals[i].ifname);
+        NE_TRY(apply_iface_queue_count(cfg->locals[i].ifname, nq));
         p->locals[i].queue_count = nq;
         p->local_queue_total += nq;
+        fprintf(stderr, "[DP-CONF] %s LAN queues=%d%s\n", cfg->locals[i].ifname, nq,
+                NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
     }
     for (int di = 0; di < p->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
         if (ci < 0)
             goto fail;
-        int nq = resolve_iface_queue_count(cfg->wans[ci].ifname,
-                                           cfg->wans[ci].queue_count,
-                                           NE_WAN_QUEUE_TARGET);
-        NE_TRY(interface_set_queue_count(cfg->wans[ci].ifname, nq));
+        int nq = resolve_iface_queue_count(cfg->wans[ci].ifname);
+        NE_TRY(apply_iface_queue_count(cfg->wans[ci].ifname, nq));
         p->wans[di].queue_count = nq;
         p->wan_queue_total += nq;
+        fprintf(stderr, "[DP-CONF] %s WAN queues=%d%s\n", cfg->wans[ci].ifname, nq,
+                NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
     }
 
     for (int i = 0; i < p->local_count; i++)
@@ -625,9 +643,8 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
         return -1;
 
     const char *ifname = cfg->locals[cfg_local_idx].ifname;
-    int nq = resolve_iface_queue_count(ifname, cfg->locals[cfg_local_idx].queue_count,
-                                       NE_LOCAL_QUEUE_TARGET);
-    if (interface_set_queue_count(ifname, nq) != 0)
+    int nq = resolve_iface_queue_count(ifname);
+    if (apply_iface_queue_count(ifname, nq) != 0)
         return -1;
     p->locals[pair_li].queue_count = nq;
     if (interface_set_promisc(ifname) != 0)
@@ -655,9 +672,8 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
         return -1;
 
     const char *ifname = cfg->wans[cfg_wan_idx].ifname;
-    int nq = resolve_iface_queue_count(ifname, cfg->wans[cfg_wan_idx].queue_count,
-                                       NE_WAN_QUEUE_TARGET);
-    if (interface_set_queue_count(ifname, nq) != 0)
+    int nq = resolve_iface_queue_count(ifname);
+    if (apply_iface_queue_count(ifname, nq) != 0)
         return -1;
     p->wans[dp_slot].queue_count = nq;
     if (interface_set_promisc(ifname) != 0)
@@ -684,12 +700,13 @@ void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
     interface_ip_xdp_off(p->locals[pair_li].ifname);
     p->xdp_local_on[pair_li] = 0;
     p->local_live[pair_li] = 0;
+    int nq = p->locals[pair_li].queue_count;
     p->locals[pair_li].queue_count = 0;
     if (p->bpf_locals[pair_li]) {
         bpf_object__close(p->bpf_locals[pair_li]);
         p->bpf_locals[pair_li] = NULL;
     }
-    for (int q = 0; q < p->locals[pair_li].queue_count; q++) {
+    for (int q = 0; q < nq; q++) {
         if (p->locals[pair_li].queues[q].xsk) {
             xsk_socket__delete(p->locals[pair_li].queues[q].xsk);
             p->locals[pair_li].queues[q].xsk = NULL;
@@ -705,12 +722,13 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
     interface_ip_xdp_off(p->wans[dp_slot].ifname);
     p->xdp_wan_on[dp_slot] = 0;
     p->wan_live[dp_slot] = 0;
+    int nq = p->wans[dp_slot].queue_count;
     p->wans[dp_slot].queue_count = 0;
     if (p->bpf_wans[dp_slot]) {
         bpf_object__close(p->bpf_wans[dp_slot]);
         p->bpf_wans[dp_slot] = NULL;
     }
-    for (int q = 0; q < p->wans[dp_slot].queue_count; q++) {
+    for (int q = 0; q < nq; q++) {
         if (p->wans[dp_slot].queues[q].xsk) {
             xsk_socket__delete(p->wans[dp_slot].queues[q].xsk);
             p->wans[dp_slot].queues[q].xsk = NULL;
