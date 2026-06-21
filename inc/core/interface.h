@@ -4,14 +4,11 @@
 #include "common.h"
 #include "config.h"
 #include <pthread.h>
-#include <signal.h>
 
 #define NE_RING        16384u
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
-/* NIC combined queues: 0 = keep current ethtool count; >0 = reshape via ethtool -L */
-#define NE_QUEUE_OVERRIDE 0
 
 #include "cpu_map.h"
 
@@ -64,7 +61,6 @@ struct ne_iface {
     char ifname[IF_NAMESIZE];
     int queue_count;
     struct ne_xsk_queue queues[MAX_QUEUES];
-    uint64_t tx_no_free;
 };
 
 struct ne_pair {
@@ -107,19 +103,13 @@ uint32_t ne_ring_count(const struct ne_ring *r);
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg);
 void ne_pair_close(struct ne_pair *p);
 
-int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
 int ne_recv_local_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
 int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
-void ne_recv_release_local(struct ne_pair *p);
-void ne_recv_release_wan(struct ne_pair *p);
 void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot);
 void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
-void ne_refill_fq_local(struct ne_pair *p);
-void ne_refill_fq_wan(struct ne_pair *p);
 void ne_refill_fq_local_slot(struct ne_pair *p, int rx_slot);
 void ne_refill_fq_wan_slot(struct ne_pair *p, int rx_slot);
 void ne_dp_tx_ctx(const char *dir, int tx_slot);
@@ -136,11 +126,8 @@ void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 
-void interface_reset_redirect_maps(void);
 void interface_ip_xdp_off(const char *ifname);
 void interface_ip_xdp_off_config(const struct app_config *cfg);
 void interface_promisc_off_config(const struct app_config *cfg);
-int interface_set_queue_count(const char *ifname, int desired_count);
-int interface_get_queue_count(const char *ifname);
 
 #endif

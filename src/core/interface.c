@@ -11,7 +11,6 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
 
@@ -172,28 +171,6 @@ void interface_promisc_off_config(const struct app_config *cfg)
         interface_set_promisc_off(cfg->wans[i].ifname);
 }
 
-void interface_reset_redirect_maps(void) {}
-
-int interface_set_queue_count(const char *ifname, int desired_count)
-{
-    if (!ifname_is_safe(ifname) || desired_count <= 0)
-        return -1;
-
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ethtool -L %s combined %d >/dev/null 2>&1",
-             ifname, desired_count);
-    if (system(cmd) == 0) {
-        return 0;
-    }
-
-    snprintf(cmd, sizeof(cmd), "ethtool -L %s rx %d tx %d >/dev/null 2>&1",
-             ifname, desired_count, desired_count);
-    if (system(cmd) == 0)
-        return 0;
-
-    return -1;
-}
-
 static int interface_set_promisc(const char *ifname)
 {
     if (!ifname_is_safe(ifname))
@@ -207,7 +184,7 @@ static int interface_set_promisc(const char *ifname)
     return -1;
 }
 
-int interface_get_queue_count(const char *ifname)
+static int interface_get_queue_count(const char *ifname)
 {
     char path[256];
     int count = 0;
@@ -229,36 +206,15 @@ int interface_get_queue_count(const char *ifname)
     return count > 0 ? count : 1;
 }
 
-static int resolve_iface_queue_count(const char *ifname)
+static int iface_queue_count(const char *ifname)
 {
-    int hw = interface_get_queue_count(ifname);
-    if (hw < 1)
-        hw = 1;
+    int nq = interface_get_queue_count(ifname);
 
-#if NE_QUEUE_OVERRIDE > 0
-    int want = NE_QUEUE_OVERRIDE;
-#else
-    int want = hw;
-#endif
-
-    if (want > MAX_QUEUES)
-        want = MAX_QUEUES;
-    if (want < 1)
-        want = 1;
-    return want;
-}
-
-static int apply_iface_queue_count(const char *ifname, int want)
-{
-#if NE_QUEUE_OVERRIDE > 0
-    int hw = interface_get_queue_count(ifname);
-
-    if (hw != want)
-        return interface_set_queue_count(ifname, want);
-#endif
-    (void)ifname;
-    (void)want;
-    return 0;
+    if (nq < 1)
+        nq = 1;
+    if (nq > MAX_QUEUES)
+        nq = MAX_QUEUES;
+    return nq;
 }
 
 int ne_ring_init(struct ne_ring *r, uint32_t cap, int mpsc_pop)
@@ -297,7 +253,6 @@ void ne_ring_destroy(struct ne_ring *r)
     memset(r, 0, sizeof(*r));
 }
 
-// Push gói tin đi vào ring (muilti core push)
 int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt)
 {
     uint32_t head, tail;
@@ -318,7 +273,6 @@ int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt)
     return 0;
 }
 
-// Pop gói tin đi ra khỏi ring
 int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt)
 {
     uint32_t tail, head;
@@ -330,7 +284,7 @@ int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt)
         pthread_spin_lock(&r->pop_lock);
     tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
     head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
-    if (tail == head) { // ring trống
+    if (tail == head) {
         if (r->mpsc_pop)
             pthread_spin_unlock(&r->pop_lock);
         return -1;
@@ -512,23 +466,19 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->wan_queue_total = 0;
 
     for (int i = 0; i < p->local_count; i++) {
-        int nq = resolve_iface_queue_count(cfg->locals[i].ifname);
-        NE_TRY(apply_iface_queue_count(cfg->locals[i].ifname, nq));
+        int nq = iface_queue_count(cfg->locals[i].ifname);
         p->locals[i].queue_count = nq;
         p->local_queue_total += nq;
-        fprintf(stderr, "[DP-CONF] %s LAN queues=%d%s\n", cfg->locals[i].ifname, nq,
-                NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
+        fprintf(stderr, "[DP-CONF] %s LAN queues=%d\n", cfg->locals[i].ifname, nq);
     }
     for (int di = 0; di < p->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
         if (ci < 0)
             goto fail;
-        int nq = resolve_iface_queue_count(cfg->wans[ci].ifname);
-        NE_TRY(apply_iface_queue_count(cfg->wans[ci].ifname, nq));
+        int nq = iface_queue_count(cfg->wans[ci].ifname);
         p->wans[di].queue_count = nq;
         p->wan_queue_total += nq;
-        fprintf(stderr, "[DP-CONF] %s WAN queues=%d%s\n", cfg->wans[ci].ifname, nq,
-                NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
+        fprintf(stderr, "[DP-CONF] %s WAN queues=%d\n", cfg->wans[ci].ifname, nq);
     }
 
     for (int i = 0; i < p->local_count; i++)
@@ -643,9 +593,7 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
         return -1;
 
     const char *ifname = cfg->locals[cfg_local_idx].ifname;
-    int nq = resolve_iface_queue_count(ifname);
-    if (apply_iface_queue_count(ifname, nq) != 0)
-        return -1;
+    int nq = iface_queue_count(ifname);
     p->locals[pair_li].queue_count = nq;
     if (interface_set_promisc(ifname) != 0)
         return -1;
@@ -672,9 +620,7 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
         return -1;
 
     const char *ifname = cfg->wans[cfg_wan_idx].ifname;
-    int nq = resolve_iface_queue_count(ifname);
-    if (apply_iface_queue_count(ifname, nq) != 0)
-        return -1;
+    int nq = iface_queue_count(ifname);
     p->wans[dp_slot].queue_count = nq;
     if (interface_set_promisc(ifname) != 0)
         return -1;
@@ -735,7 +681,6 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
         }
     }
 }
-// RX
 static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t max,
                       uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
@@ -791,11 +736,6 @@ int ne_recv_local_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, ui
     return (int)total;
 }
 
-int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
-{
-    return ne_recv_local_slot(p, 0, out, max);
-}
-
 int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max)
 {
     uint32_t total = 0;
@@ -825,12 +765,6 @@ int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint
     return (int)total;
 }
 
-int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
-{
-    return ne_recv_wan_slot(p, 0, out, max);
-}
-
-
 void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot)
 {
     if (!p || rx_slot < 0 || rx_slot >= (int)NE_RX_LAN_SLOTS)
@@ -847,12 +781,6 @@ void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot)
             }
         }
     }
-}
-
-void ne_recv_release_local(struct ne_pair *p)
-{
-    for (int s = 0; s < (int)NE_RX_LAN_SLOTS; s++)
-        ne_recv_release_local_slot(p, s);
 }
 
 void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot)
@@ -873,14 +801,6 @@ void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot)
     }
 }
 
-void ne_recv_release_wan(struct ne_pair *p)
-{
-    for (int s = 0; s < (int)NE_RX_WAN_SLOTS; s++)
-        ne_recv_release_wan_slot(p, s);
-}
-
-
-// CQ
 static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
 {
     uint64_t addrs[NE_BATCH_SIZE];
@@ -997,30 +917,14 @@ void ne_refill_fq_wan_slot(struct ne_pair *p, int rx_slot)
     }
 }
 
-void ne_refill_fq_local(struct ne_pair *p)
+static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame)
 {
-    for (int s = 0; s < (int)NE_RX_LAN_SLOTS; s++)
-        ne_refill_fq_local_slot(p, s);
-}
-
-void ne_refill_fq_wan(struct ne_pair *p)
-{
-    for (int s = 0; s < (int)NE_RX_WAN_SLOTS; s++)
-        ne_refill_fq_wan_slot(p, s);
-}
-
-// TX
-static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,
-                          uint64_t *tx_no_free)
-{   
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
     uint32_t pending = ne_ring_count(src);
     int cpu = sched_getcpu();
 
     if (!free_slots) {
-        if (tx_no_free)
-            (*tx_no_free)++;
         ne_dp_warn_tx(cpu, 1, pending);
         if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
@@ -1065,7 +969,7 @@ static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint
     for (int q = 0; q < nq; q++) {
         if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
             continue;
-        int sent = tx_drain_queue(&iface->queues[q], src, max_frame, &iface->tx_no_free);
+        int sent = tx_drain_queue(&iface->queues[q], src, max_frame);
         if (sent > 0)
             return sent;
     }

@@ -22,7 +22,6 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
     fprintf(stderr, "[PROFILE-XDP] prepare: detach xdp on configured LAN/WAN\n");
     fflush(stderr);
     interface_ip_xdp_off_config(cfg);
-    interface_reset_redirect_maps();
 }
 
 /* --- ifname / profile helpers --- */

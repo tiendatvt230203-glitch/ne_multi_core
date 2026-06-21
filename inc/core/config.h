@@ -15,7 +15,6 @@
 /* PQC GCM wire nonce is always 12 bytes (see CRYPTO_PQC_NONCE_BYTES). */
 
 /* XSK buffer/ring sizing: NE_FRAME, NE_RING, NE_N_FRAMES, NE_BATCH_SIZE in interface.h */
-/* NIC queue count: NE_QUEUE_OVERRIDE in interface.h (0 = auto from hardware) */
 #define WAN_REORDER_WINDOW_KB   10240
 #define MAX_PROFILES 32
 #define MAX_PROFILE_INTERFACES 16
