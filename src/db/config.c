@@ -126,17 +126,6 @@ int config_policy_db_id_taken(const struct app_config *cfg, int db_id)
     return 0;
 }
 
-int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag)
-{
-    if (!cfg)
-        return 0;
-    for (int i = 0; i < cfg->policy_count; i++) {
-        if (cfg->policies[i].id == pkt_tag)
-            return 1;
-    }
-    return 0;
-}
-
 int config_local_ifname_in_cfg(const struct app_config *cfg, const char *ifname)
 {
     if (!cfg || !ifname)
