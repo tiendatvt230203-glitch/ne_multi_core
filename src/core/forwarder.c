@@ -6,7 +6,6 @@
 #include "../../inc/core/crypto_route.h"
 
 #include "../../inc/core/local_hwaddr.h"
-#include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/core/profile_iface_xdp.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
@@ -68,7 +67,6 @@ static void *local_rx_thread(void *arg)
 
         int rcvd = ne_recv_local_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
-            ne_dp_warn_rx("LAN", (int)ctx->cpu_id, 0);
             sched_yield();
             continue;
         }
@@ -77,8 +75,6 @@ static void *local_rx_thread(void *arg)
             int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
                                                  batch[i].len);
             if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
-                                   ne_ring_count(&fwd->local_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
             }
         }
@@ -94,7 +90,6 @@ static void *local_tx_thread(void *arg)
     int tx_slot = ctx->tx_slot;
 
     pin_cpu(ctx->cpu_id);
-    ne_dp_tx_ctx("LAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         struct ne_ring *rings[NE_CRYPTO_WORKERS];
@@ -125,7 +120,6 @@ static void *wan_rx_thread(void *arg)
 
         int rcvd = ne_recv_wan_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
-            ne_dp_warn_rx("WAN", (int)ctx->cpu_id, 0);
             sched_yield();
             continue;
         }
@@ -145,8 +139,6 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
-                                   ne_ring_count(&fwd->wan_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
             }
         }
@@ -162,7 +154,6 @@ static void *wan_tx_thread(void *arg)
     int tx_slot = ctx->tx_slot;
 
     pin_cpu(ctx->cpu_id);
-    ne_dp_tx_ctx("WAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         struct ne_ring *rings[NE_CRYPTO_WORKERS];
@@ -251,11 +242,6 @@ static void *crypto_worker_thread(void *arg)
         if (++gc_tick >= 2048) {
             fwd_crypto_frag_gc_worker_tick(ctx->worker_idx);
             gc_tick = 0;
-        }
-        if ((gc_tick & 511u) == 0) {
-            ne_dp_warn_crypto((int)ctx->cpu_id, ctx->worker_idx,
-                              ne_ring_count(&fwd->local_to_mid[ctx->worker_idx]),
-                              ne_ring_count(&fwd->wan_to_mid[ctx->worker_idx]));
         }
         if (is_primary)
             pthread_mutex_unlock(&runtime_lock);
@@ -465,10 +451,6 @@ void forwarder_run(struct forwarder *fwd)
     }
 
     fwd->threads_started = 1;
-    if (fwd->cfg) {
-        ne_cpu_map_log();
-        main_diag_log_dataplane_ready(fwd->cfg);
-    }
     for (int w = 0; w < local_rx_started; w++)
         pthread_join(fwd->local_rx_threads[w], NULL);
     for (int w = 0; w < (int)NE_TX_SLOTS; w++)

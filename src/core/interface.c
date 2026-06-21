@@ -5,109 +5,12 @@
 #include <net/if.h>
 #include <errno.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <ctype.h>
 #include <dirent.h>
-
-#define NE_DP_WARN_RX_LAN   0
-#define NE_DP_WARN_RX_WAN   1
-#define NE_DP_WARN_TX_LAN0  2
-#define NE_DP_WARN_TX_LAN1  3
-#define NE_DP_WARN_TX_WAN0  4
-#define NE_DP_WARN_TX_WAN1  5
-#define NE_DP_WARN_CRYPTO0  6
-#define NE_DP_WARN_SLOTS    (NE_DP_WARN_CRYPTO0 + NE_CRYPTO_WORKERS)
-#define NE_DP_WARN_CLEAR    8192u
-
-static int dp_warn_on[NE_DP_WARN_SLOTS];
-static uint32_t dp_warn_clear_streak[NE_DP_WARN_SLOTS];
-static pthread_mutex_t dp_warn_lock = PTHREAD_MUTEX_INITIALIZER;
-static __thread const char *tls_dp_tx_dir;
-static __thread int tls_dp_tx_slot = -1;
-
-static void dp_warn_once(int id, int active, const char *fmt, ...)
-{
-    va_list ap;
-
-    if (id < 0 || id >= NE_DP_WARN_SLOTS)
-        return;
-    pthread_mutex_lock(&dp_warn_lock);
-    if (active) {
-        dp_warn_clear_streak[id] = 0;
-        if (!dp_warn_on[id]) {
-            fprintf(stderr, "[DP-WARN] ");
-            va_start(ap, fmt);
-            vfprintf(stderr, fmt, ap);
-            va_end(ap);
-            fprintf(stderr, "\n");
-            fflush(stderr);
-            dp_warn_on[id] = 1;
-        }
-    } else if (dp_warn_on[id]) {
-        dp_warn_clear_streak[id]++;
-        if (dp_warn_clear_streak[id] >= NE_DP_WARN_CLEAR) {
-            dp_warn_on[id] = 0;
-            dp_warn_clear_streak[id] = 0;
-        }
-    }
-    pthread_mutex_unlock(&dp_warn_lock);
-}
-
-void ne_dp_tx_ctx(const char *dir, int tx_slot)
-{
-    tls_dp_tx_dir = dir;
-    tls_dp_tx_slot = tx_slot;
-}
-
-void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
-{
-    int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
-
-    if (batch_rcvd <= 0)
-        dp_warn_once(id, 0, "");
-}
-
-void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth)
-{
-    int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
-
-    dp_warn_once(id, 1,
-                 "core=%d RX %s saturated worker=%d q_depth=%u (crypto queue full)",
-                 cpu, dir ? dir : "?", worker, q_depth);
-}
-
-void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
-{
-    int id;
-    int active;
-
-    if (!tls_dp_tx_dir || tls_dp_tx_slot < 0 || tls_dp_tx_slot >= (int)NE_TX_SLOTS)
-        return;
-    if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
-        id = NE_DP_WARN_TX_LAN0 + tls_dp_tx_slot;
-    else
-        id = NE_DP_WARN_TX_WAN0 + tls_dp_tx_slot;
-    active = tx_full && pending > 0;
-    dp_warn_once(id, active,
-                 "core=%d TX %s slot=%d saturated pending=%u (TX ring full)",
-                 cpu, tls_dp_tx_dir, tls_dp_tx_slot, pending);
-}
-
-void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)
-{
-    uint32_t hi = (NE_RING * 7u) / 8u;
-
-    if (worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
-        return;
-    dp_warn_once(NE_DP_WARN_CRYPTO0 + worker, lan_q >= hi || wan_q >= hi,
-                 "core=%d crypto saturated worker=%d lan_q=%u wan_q=%u",
-                 cpu, worker, lan_q, wan_q);
-}
 
 static uint32_t next_pow2_u32(uint32_t v)
 {
@@ -469,7 +372,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         int nq = iface_queue_count(cfg->locals[i].ifname);
         p->locals[i].queue_count = nq;
         p->local_queue_total += nq;
-        fprintf(stderr, "[DP-CONF] %s LAN queues=%d\n", cfg->locals[i].ifname, nq);
     }
     for (int di = 0; di < p->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
@@ -478,7 +380,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         int nq = iface_queue_count(cfg->wans[ci].ifname);
         p->wans[di].queue_count = nq;
         p->wan_queue_total += nq;
-        fprintf(stderr, "[DP-CONF] %s WAN queues=%d\n", cfg->wans[ci].ifname, nq);
     }
 
     for (int i = 0; i < p->local_count; i++)
@@ -921,17 +822,13 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 {
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
-    uint32_t pending = ne_ring_count(src);
-    int cpu = sched_getcpu();
 
     if (!free_slots) {
-        ne_dp_warn_tx(cpu, 1, pending);
         if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
         }
         return 0;
     }
-    ne_dp_warn_tx(cpu, 0, pending);
 
     uint32_t popped = 0;
     uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;

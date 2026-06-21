@@ -179,9 +179,7 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         int tunnel_off = plain_off;
         int enc_off = tunnel_off + tunnel_hdr_size;
 
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
-            return -1;
-        if (crypto_pqc_generate_nonce(nonce) != 0)
+        if (crypto_pqc_prep_encrypt(ctx, &pqc, nonce) != 0)
             return -1;
 
         memmove(packet + enc_off, packet + plain_off, plain_len);
@@ -269,7 +267,7 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         int enc_off = tunnel_off + tunnel_hdr_size;
 
         memcpy(nonce, packet + tunnel_off, pqc_nonce_size);
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+        if (crypto_pqc_prep_decrypt(ctx, &pqc) != 0)
             return -1;
         if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
                                        (int)(pkt_len - (size_t)enc_off), &dec_len) != 0)
@@ -383,9 +381,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         memcpy(out_buf + offset, wire_ports, L4_WIRE_PORT_LEN);
         offset += L4_WIRE_PORT_LEN;
 
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
-            return -1;
-        if (crypto_pqc_generate_nonce(nonce) != 0)
+        if (crypto_pqc_prep_encrypt(ctx, &pqc, nonce) != 0)
             return -1;
 
         int tunnel_off = offset;
@@ -498,7 +494,7 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
         int dec_len = 0;
 
         memcpy(nonce, packet + tunnel_off, pqc_nonce_size);
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+        if (crypto_pqc_prep_decrypt(ctx, &pqc) != 0)
             return -1;
         if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
                                        (int)(pkt_len - (size_t)enc_off), &dec_len) != 0)

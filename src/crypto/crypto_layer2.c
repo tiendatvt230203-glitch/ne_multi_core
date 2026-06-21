@@ -123,9 +123,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         size_t payload_len = pkt_len - ETH_HEADER_SIZE;
         memmove(packet + l2_enc_start, packet + ETH_HEADER_SIZE, payload_len);
 
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
-            return -1;
-        if (crypto_pqc_generate_nonce(nonce) != 0)
+        if (crypto_pqc_prep_encrypt(ctx, &pqc, nonce) != 0)
             return -1;
 
         l2_write_wire_header(packet, packet_crypto_get_policy_id(), nonce, nonce_size);
@@ -195,7 +193,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int dec_len = 0;
 
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+        if (crypto_pqc_prep_decrypt(ctx, &pqc) != 0)
             return -1;
         memcpy(nonce, packet + CRYPTO_L2_NONCE_OFF, (size_t)pqc_nonce_size);
 
@@ -295,9 +293,7 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
         memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
 
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
-            return -1;
-        if (crypto_pqc_generate_nonce(nonce) != 0)
+        if (crypto_pqc_prep_encrypt(ctx, &pqc, nonce) != 0)
             return -1;
 
         memmove(out_buf + enc_off, enc_plain, enc_plain_len);
@@ -376,7 +372,7 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
         l2_read_frag_tag(packet + l2_frag_magic_offset(nonce_size) + 1,
                          out_pkt_id, out_frag_index);
 
-        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+        if (crypto_pqc_prep_decrypt(ctx, &pqc) != 0)
             return -1;
         memcpy(nonce, packet + CRYPTO_L2_NONCE_OFF, (size_t)nonce_size);
 
