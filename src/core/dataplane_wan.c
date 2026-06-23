@@ -1,7 +1,6 @@
 #include "../../inc/core/dataplane.h"
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
-#include "../../inc/core/config.h"
 
 #include "../../inc/crypto/crypto_dispatch.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -259,10 +258,10 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 
 static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
 {
-    uint32_t dest_ip = dp_dest_ipv4(pkt, len);
-    if (dest_ip == 0)
-        return -1;
-    return config_find_local_for_ip(fwd->cfg, dest_ip);
+    (void)fwd;
+    (void)pkt;
+    (void)len;
+    return -1;
 }
 
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
@@ -284,8 +283,6 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     li = pick_local(fwd, pkt, job.len);
     if (li < 0 || li >= fwd->local_count)
-        goto drop;
-    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
         goto drop;
 
     job.dir = NE_DIR_LOCAL;

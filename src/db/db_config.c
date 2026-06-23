@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <strings.h>
+#include <openssl/sha.h>
 #include "../inc/crypto/pqc_handshake.h"
 
 static int str_is_any(const char *v) {
@@ -62,6 +63,47 @@ static uint8_t parse_protocol_name(const char *v) {
     if (strcasecmp(v, "icmp") == 0) return 1;
     if (strcasecmp(v, "ospf") == 0) return 89;
     return (uint8_t)atoi(v);
+}
+
+#define NE_KEY_WIRE_MAP_MAX 64
+
+struct ne_key_wire_entry {
+    uint8_t key[AES_KEY_LEN];
+    int key_len;
+    int wire_id;
+    int valid;
+};
+
+static int alloc_wire_policy_id(int db_row_id, uint8_t *used);
+
+static int ne_wire_id_for_encrypt_key(struct ne_key_wire_entry *map, int map_sz,
+                                      uint8_t *wire_used,
+                                      const uint8_t *key, int key_len,
+                                      int db_policy_id) {
+    if (!key || key_len <= 0)
+        return alloc_wire_policy_id(db_policy_id, wire_used);
+
+    for (int i = 0; i < map_sz; i++) {
+        if (!map[i].valid)
+            continue;
+        if (map[i].key_len == key_len && memcmp(map[i].key, key, (size_t)key_len) == 0)
+            return map[i].wire_id;
+    }
+
+    int wire_id = alloc_wire_policy_id(db_policy_id, wire_used);
+    if (wire_id < 0)
+        return -1;
+
+    for (int i = 0; i < map_sz; i++) {
+        if (!map[i].valid) {
+            map[i].valid = 1;
+            map[i].wire_id = wire_id;
+            map[i].key_len = key_len;
+            memcpy(map[i].key, key, (size_t)key_len);
+            return wire_id;
+        }
+    }
+    return wire_id;
 }
 
 static int alloc_wire_policy_id(int db_row_id, uint8_t *used) {
@@ -233,24 +275,15 @@ static int ne_parse_method(const char *v, int pq_null, int *crypto_mode_out, int
 }
 
 static void ne_fill_policy_key(const char *enc_key, int enc_null, int key_len_bytes, uint8_t *out) {
+    
     memset(out, 0, AES_KEY_LEN);
     if (enc_null || !enc_key || !enc_key[0])
         return;
     if (parse_hex_bytes_pub(enc_key, out, key_len_bytes) == 0)
         return;
-
-    int hex_len = (int)strlen(enc_key);
-    int avail = hex_len / 2;
-    if (avail <= 0)
-        return;
-    if (avail > key_len_bytes)
-        avail = key_len_bytes;
-    for (int i = 0; i < avail; i++) {
-        unsigned int val;
-        if (sscanf(enc_key + i * 2, "%2x", &val) != 1)
-            break;
-        out[i] = (uint8_t)val;
-    }
+    unsigned char md[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)enc_key, strlen(enc_key), md);
+    memcpy(out, md, (size_t)key_len_bytes);
 }
 
 static void ne_cidr_buf_with_invert(char *buf, size_t bufsz, const char *tok, int invert_db) {
@@ -275,7 +308,7 @@ static int find_wan_index_by_ifname(const struct app_config *cfg, const char *if
     return -1;
 }
 
-/* ne_wan row có dst_ip = WAN dùng PQC handshake. */
+
 static int db_pick_handshake_wan(const struct app_config *cfg,
                                  char peer_ip[64], char *wan_ifname, size_t wan_sz)
 {
@@ -368,21 +401,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     PQclear(res);
 
     res = PQexecParams(conn,
-        "SELECT interface AS ifname, subnet::text AS subnet "
-        "FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
-        1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
-        int rows = PQntuples(res);
-        for (int r = 0; r < rows && p->local_count < MAX_PROFILE_INTERFACES; r++) {
-            const char *ifname = PQgetvalue(res, r, 0);
-            int li = find_local_index_by_ifname(cfg, ifname);
-            if (li >= 0)
-                p->local_indices[p->local_count++] = li;
-        }
-    }
-    PQclear(res);
-
-    res = PQexecParams(conn,
         "SELECT interface AS ifname, weight AS bandwidth_weight_percent "
         "FROM ne_wan WHERE profile_id = $1 ORDER BY created_at",
         1, NULL, params, NULL, NULL, 0);
@@ -406,7 +424,9 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     }
 
     uint8_t wire_id_used[256];
+    struct ne_key_wire_entry key_wire_map[NE_KEY_WIRE_MAP_MAX];
     memset(wire_id_used, 0, sizeof(wire_id_used));
+    memset(key_wire_map, 0, sizeof(key_wire_map));
     wire_id_used[0] = 1;
 
     int rows = PQntuples(res);
@@ -522,11 +542,11 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                     cp_base.aes_bits = 128;
                 int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
                 ne_fill_policy_key(enc_key, enc_null, key_len, cp_base.key);
-                if (db_policy_id >= 1 && db_policy_id <= 255) {
-                    cp_base.id = db_policy_id;
-                    wire_id_used[(size_t)db_policy_id] = 1;
-                } else {
-                    int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
+                {
+                    int wire_id = ne_wire_id_for_encrypt_key(key_wire_map, NE_KEY_WIRE_MAP_MAX,
+                                                            wire_id_used,
+                                                            cp_base.key, key_len,
+                                                            db_policy_id);
                     if (wire_id < 0) {
                         fprintf(stderr, "[DB CRYPTO] no free wire policy id (max 255 policies)\n");
                         PQclear(res);
@@ -544,7 +564,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
             PQclear(res);
             return -1;
         }
-
         char src_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
         char dst_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
         char sp_items[MAX_CIDR_LIST_ITEMS][MAX_CIDR_ITEM_LEN];
@@ -636,13 +655,6 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
         }
         strncpy(loc->ifname, v, IF_NAMESIZE - 1);
 
-        v = PQgetvalue(res, row, PQfnumber(res, "subnet"));
-        if (!v || v[0] == '\0' ||
-            parse_ip_cidr_pub(v, &loc->ip, &loc->netmask, &loc->network) != 0) {
-            fprintf(stderr, "[DB LOCAL][%d] %s: invalid or missing subnet\n", row, loc->ifname);
-            return -1;
-        }
-
         cfg->local_count++;
     }
     return 0;
@@ -675,23 +687,6 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
         v = PQgetvalue(res, row, PQfnumber(res, "dst_ip"));
         if (v && v[0] != '\0')
             (void)parse_ipv4_addr(v, &wan->dst_ip);
-        if (wan->dst_ip != 0) {
-            memset(wan->src_mac, 0, MAC_LEN);
-            memset(wan->dst_mac, 0, MAC_LEN);
-        }
-
-        int src_mac_col = PQfnumber(res, "src_mac");
-        int dst_mac_col = PQfnumber(res, "dst_mac");
-        if (src_mac_col >= 0) {
-            v = PQgetvalue(res, row, src_mac_col);
-            if (v && v[0] != '\0')
-                (void)parse_mac(v, wan->src_mac);
-        }
-        if (dst_mac_col >= 0) {
-            v = PQgetvalue(res, row, dst_mac_col);
-            if (v && v[0] != '\0')
-                (void)parse_mac(v, wan->dst_mac);
-        }
 
         wan->dataplane = wan->dst_ip == 0 ? 1 : 0;
         cfg->wan_count++;
@@ -728,7 +723,7 @@ static int db_load_lan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, subnet::text AS subnet "
+        "SELECT interface AS ifname "
         "FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
         1, NULL, params, NULL, NULL, 0);
 

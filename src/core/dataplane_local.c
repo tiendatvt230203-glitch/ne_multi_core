@@ -2,7 +2,6 @@
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
-#include "../../inc/core/interface.h"
 
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_layer3.h"
@@ -11,7 +10,6 @@
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
 
-#include <sched.h>
 #include <string.h>
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
@@ -86,9 +84,6 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
         return 0;
     }
 
-    if (dp_apply_wan_l2(pkt, l1, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0 ||
-        dp_apply_wan_l2(f2, l2, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
-        return -1;
     if (push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) != 0)
         return -1;
     return 1;
@@ -155,12 +150,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp)) {
-        if (wan_dp >= 0)
-            ne_dp_warn_mid_wan(sched_getcpu(), wan_dp, fwd_mid_to_wan_depth(fwd, wan_dp));
-        goto drop;
-    }
-    if (dp_apply_wan_l2(pkt, job.len, fwd->wans[wan_dp].dst_mac, fwd->wans[wan_dp].src_mac) != 0)
+    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
         goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {

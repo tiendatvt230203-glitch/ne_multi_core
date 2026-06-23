@@ -305,10 +305,7 @@ static const struct local_config *local_by_ifname(const struct app_config *cfg,
 
 static int local_db_equal(const struct local_config *a, const struct local_config *b)
 {
-    return strcmp(a->ifname, b->ifname) == 0 &&
-           a->ip == b->ip &&
-           a->netmask == b->netmask &&
-           a->network == b->network;
+    return strcmp(a->ifname, b->ifname) == 0;
 }
 
 static const struct wan_config *wan_by_ifname(const struct app_config *cfg,

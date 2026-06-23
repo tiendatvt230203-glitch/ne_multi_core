@@ -101,7 +101,9 @@ int crypto_layer3_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         size_t payload_len = pkt_len - (size_t)tunnel_off;
         int new_len = 0;
 
-        if (crypto_pqc_prep_encrypt(ctx, &pqc, nonce) != 0)
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+            return -1;
+        if (crypto_pqc_generate_nonce(nonce) != 0)
             return -1;
 
         memmove(packet + tunnel_off + tunnel_hdr_size, packet + tunnel_off, payload_len);
@@ -189,7 +191,7 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int dec_len = 0;
 
-        if (crypto_pqc_prep_decrypt(ctx, &pqc) != 0)
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
         crypto_read_l3_tunnel_header(packet + tunnel_off, pqc_nonce_size,
                                      nonce, NULL, NULL, &orig_proto);
@@ -359,7 +361,9 @@ int crypto_layer3_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
         memcpy(out_buf + ETH_HEADER_SIZE, ip_hdr, (size_t)ip_hdr_len);
 
-        if (crypto_pqc_prep_encrypt(ctx, &pqc, nonce) != 0)
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+            return -1;
+        if (crypto_pqc_generate_nonce(nonce) != 0)
             return -1;
 
         memmove(out_buf + enc_off, enc_plain, enc_plain_len);
@@ -461,7 +465,7 @@ int crypto_layer3_decrypt_fragment(struct packet_crypto_ctx *ctx,
         int dec_len = 0;
 
         memcpy(nonce, packet + tunnel_off, pqc_nonce_size);
-        if (crypto_pqc_prep_decrypt(ctx, &pqc) != 0)
+        if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
         if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
                                        (int)(pkt_len - (size_t)enc_off), &dec_len) != 0)

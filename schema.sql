@@ -86,7 +86,6 @@ CREATE INDEX idx_encryption_action      ON ne_policies (action);
 CREATE TABLE ne_lan (
     id          UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
     interface   VARCHAR(100)    NOT NULL,
-    subnet      CIDR            NOT NULL,
     profile_id  INT             NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE,
     created_at  TIMESTAMP       NOT NULL DEFAULT NOW(),
     created_by  VARCHAR(100)    NULL,

@@ -7,8 +7,6 @@
 struct fwd_iface {
     int ifindex;
     char ifname[IF_NAMESIZE];
-    uint8_t src_mac[MAC_LEN];
-    uint8_t dst_mac[MAC_LEN];
 };
 
 struct forwarder {
@@ -18,7 +16,7 @@ struct forwarder {
     int local_count;
     struct fwd_iface wans[MAX_INTERFACES];
     int wan_count;
-    int wan_cfg_idx[MAX_INTERFACES]; /* dataplane slot -> cfg->wans[] index */
+    int wan_cfg_idx[MAX_INTERFACES];
 
     struct ne_pair pair;
     struct ne_ring local_to_mid[NE_CRYPTO_WORKERS];

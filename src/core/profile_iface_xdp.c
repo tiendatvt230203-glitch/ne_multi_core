@@ -4,7 +4,6 @@
 #include "../../inc/core/forwarder_reload.h"
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/interface.h"
-#include "../../inc/core/local_hwaddr.h"
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -22,6 +21,7 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
     fprintf(stderr, "[PROFILE-XDP] prepare: detach xdp on configured LAN/WAN\n");
     fflush(stderr);
     interface_ip_xdp_off_config(cfg);
+    interface_reset_redirect_maps();
 }
 
 /* --- ifname / profile helpers --- */
@@ -181,10 +181,7 @@ static int profile_config_has_wan_ci(const struct profile_config *prof, int ci)
 
 static int local_db_equal(const struct local_config *a, const struct local_config *b)
 {
-    return strcmp(a->ifname, b->ifname) == 0 &&
-           a->ip == b->ip &&
-           a->netmask == b->netmask &&
-           a->network == b->network;
+    return strcmp(a->ifname, b->ifname) == 0;
 }
 
 static int wan_db_equal(const struct wan_config *a, const struct wan_config *b)
@@ -433,14 +430,10 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
 static void init_fwd_local_meta(struct forwarder *fwd, int li,
                                 const struct app_config *cfg, int cfg_local_idx)
 {
-    static const uint8_t zero_mac[MAC_LEN];
-
     memset(&fwd->locals[li], 0, sizeof(fwd->locals[li]));
     fwd->locals[li].ifindex = (int)if_nametoindex(cfg->locals[cfg_local_idx].ifname);
     strncpy(fwd->locals[li].ifname, cfg->locals[cfg_local_idx].ifname,
             sizeof(fwd->locals[li].ifname) - 1);
-    memcpy(fwd->locals[li].src_mac, cfg->locals[cfg_local_idx].src_mac, MAC_LEN);
-    memcpy(fwd->locals[li].dst_mac, zero_mac, MAC_LEN);
 }
 
 static void init_fwd_wan_meta(struct forwarder *fwd, int di,
@@ -449,8 +442,6 @@ static void init_fwd_wan_meta(struct forwarder *fwd, int di,
     memset(&fwd->wans[di], 0, sizeof(fwd->wans[di]));
     fwd->wans[di].ifindex = (int)if_nametoindex(cfg->wans[cfg_wan_idx].ifname);
     strncpy(fwd->wans[di].ifname, cfg->wans[cfg_wan_idx].ifname, sizeof(fwd->wans[di].ifname) - 1);
-    memcpy(fwd->wans[di].src_mac, cfg->wans[cfg_wan_idx].src_mac, MAC_LEN);
-    memcpy(fwd->wans[di].dst_mac, cfg->wans[cfg_wan_idx].dst_mac, MAC_LEN);
 }
 
 struct profile_attach_sess {
@@ -715,23 +706,6 @@ static int attach_profile_iface_rows(struct forwarder *fwd, const struct app_con
 static int crypto_finish_reload(struct forwarder *fwd, struct app_config *cfg,
                                 const struct app_config *old)
 {
-    if (local_hwaddr_prepare(cfg) != 0) {
-        fprintf(stderr, "[PROFILE-XDP] crypto reload failed: local_hwaddr_prepare\n");
-        return -1;
-    }
-    for (int li = 0; li < MAX_INTERFACES; li++) {
-        const char *ifn;
-
-        if (!fwd || !ne_pair_local_live(&fwd->pair, li))
-            continue;
-        ifn = fwd->pair.locals[li].ifname;
-        for (int ci = 0; ci < cfg->local_count; ci++) {
-            if (strcmp(cfg->locals[ci].ifname, ifn) != 0)
-                continue;
-            memcpy(fwd->locals[li].src_mac, cfg->locals[ci].src_mac, MAC_LEN);
-            break;
-        }
-    }
     fwd_wan_weight_blend_begin(old, cfg, fwd_crypto_profile_slot_for_id);
     if (fwd_crypto_ensure_profile_slots(cfg) != 0) {
         fprintf(stderr, "[PROFILE-XDP] crypto reload failed: ensure_profile_slots\n");

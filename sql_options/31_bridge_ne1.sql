@@ -76,9 +76,9 @@ INSERT INTO ne_policies (
 );
 
 
-INSERT INTO ne_lan (interface, subnet, profile_id, created_by) VALUES
-    ('enp6s0', '192.168.60.0/24', 31, 'seed'),
-    ('enp5s0', '192.168.50.0/24', 31, 'seed');
+INSERT INTO ne_lan (interface, profile_id, created_by) VALUES
+    ('enp6s0', 31, 'seed'),
+    ('enp5s0', 31, 'seed');
 
 
 INSERT INTO ne_wan (interface, profile_id, dst_ip, weight, created_by) VALUES

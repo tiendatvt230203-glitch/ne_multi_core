@@ -42,19 +42,6 @@ static inline int crypto_pqc_generate_nonce(byte nonce[CRYPTO_PQC_NONCE_BYTES]) 
     return trf_pqc_generate_nonce(nonce) == TRF_PQC_OK ? 0 : -1;
 }
 
-static inline int crypto_pqc_prep_encrypt(struct packet_crypto_ctx *ctx,
-                                            crypto_pqc_sess_t *sess,
-                                            byte nonce[CRYPTO_PQC_NONCE_BYTES]) {
-    if (crypto_pqc_sess_load(ctx, sess) != 0)
-        return -1;
-    return crypto_pqc_generate_nonce(nonce);
-}
-
-static inline int crypto_pqc_prep_decrypt(struct packet_crypto_ctx *ctx,
-                                          crypto_pqc_sess_t *sess) {
-    return crypto_pqc_sess_load(ctx, sess);
-}
-
 static inline int crypto_pqc_encrypt_payload(const crypto_pqc_sess_t *sess,
                                              const byte nonce[CRYPTO_PQC_NONCE_BYTES],
                                              byte *data, int len, int *out_len) {

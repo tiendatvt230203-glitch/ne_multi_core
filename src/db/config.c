@@ -7,18 +7,6 @@
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <netinet/in.h>
-int parse_mac(const char *str, uint8_t *mac) {
-    int values[6];
-    if (sscanf(str, "%x:%x:%x:%x:%x:%x",
-               &values[0], &values[1], &values[2],
-               &values[3], &values[4], &values[5]) != 6) {
-        return -1;
-    }
-    for (int i = 0; i < 6; i++) {
-        mac[i] = (uint8_t)values[i];
-    }
-    return 0;
-}
 
 static uint32_t ipv4_prefix_to_mask_be(int prefix_len) {
     if (prefix_len <= 0)
@@ -121,6 +109,17 @@ int config_policy_db_id_taken(const struct app_config *cfg, int db_id)
         return 0;
     for (int i = 0; i < cfg->policy_count; i++) {
         if (cfg->policies[i].db_id == db_id)
+            return 1;
+    }
+    return 0;
+}
+
+int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag)
+{
+    if (!cfg)
+        return 0;
+    for (int i = 0; i < cfg->policy_count; i++) {
+        if (cfg->policies[i].id == pkt_tag)
             return 1;
     }
     return 0;
@@ -288,23 +287,6 @@ int config_validate(struct app_config *cfg) {
             fprintf(stderr, "LOCAL[%d]: interface not specified\n", i);
             return -1;
         }
-        if (local->netmask == 0) {
-            fprintf(stderr, "LOCAL %s: subnet not configured\n", local->ifname);
-            return -1;
-        }
-    }
-
-    for (int i = 0; i < cfg->local_count; i++) {
-        const struct local_config *a = &cfg->locals[i];
-        for (int j = i + 1; j < cfg->local_count; j++) {
-            const struct local_config *b = &cfg->locals[j];
-            if (a->network == b->network && a->netmask == b->netmask) {
-                fprintf(stderr,
-                        "LOCAL %s and %s: duplicate subnet (LAN subnets must differ)\n",
-                        a->ifname, b->ifname);
-                return -1;
-            }
-        }
     }
 
     for (int i = 0; i < cfg->wan_count; i++) {
@@ -324,16 +306,6 @@ int config_validate(struct app_config *cfg) {
     if (config_validate_profiles(cfg) != 0)
         return -1;
     return 0;
-}
-
-int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip) {
-    for (int i = 0; i < cfg->local_count; i++) {
-        struct local_config *local = &cfg->locals[i];
-        if ((dest_ip & local->netmask) == local->network) {
-            return i;
-        }
-    }
-    return -1;
 }
 
 static int cidr_match_with_negate(int any_flag, int negate,
