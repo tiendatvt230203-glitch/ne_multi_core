@@ -9,6 +9,7 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/mac_learn.h"
 
 #include <string.h>
 
@@ -147,6 +148,8 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)
         goto drop;
+
+    mac_learn_local_ingress(fwd, li, pkt);
 
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);

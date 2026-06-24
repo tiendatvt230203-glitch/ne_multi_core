@@ -330,6 +330,28 @@ static int db_pick_handshake_wan(const struct app_config *cfg,
     return -1;
 }
 
+static void profile_append_locals_from_rows(struct app_config *cfg,
+                                            struct profile_config *p,
+                                            PGresult *res) {
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK)
+        return;
+    int ifn_col = PQfnumber(res, "ifname");
+    if (ifn_col < 0)
+        return;
+    int rows = PQntuples(res);
+    for (int r = 0; r < rows && p->local_count < MAX_PROFILE_INTERFACES; r++) {
+        const char *ifname = PQgetvalue(res, r, ifn_col);
+        int li = find_local_index_by_ifname(cfg, ifname);
+        if (li >= 0) {
+            p->local_indices[p->local_count++] = li;
+        } else {
+            fprintf(stderr,
+                    "[DB] profile \"%s\": ne_lan.interface=%s not in merged LAN list — row skipped\n",
+                    p->name, ifname);
+        }
+    }
+}
+
 static void profile_append_wans_from_rows(struct app_config *cfg,
                                             struct profile_config *p,
                                             PGresult *res) {
@@ -405,6 +427,13 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         "FROM ne_wan WHERE profile_id = $1 ORDER BY created_at",
         1, NULL, params, NULL, NULL, 0);
     profile_append_wans_from_rows(cfg, p, res);
+    PQclear(res);
+
+    res = PQexecParams(conn,
+        "SELECT interface AS ifname "
+        "FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
+        1, NULL, params, NULL, NULL, 0);
+    profile_append_locals_from_rows(cfg, p, res);
     PQclear(res);
 
     res = PQexecParams(conn,

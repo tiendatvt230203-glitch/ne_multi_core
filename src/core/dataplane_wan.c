@@ -11,6 +11,7 @@
 
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/mac_learn.h"
 
 #include <string.h>
 
@@ -256,38 +257,29 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     return 0;
 }
 
-static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
-{
-    (void)fwd;
-    (void)pkt;
-    (void)len;
-    return -1;
-}
-
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
-    int li;
+    int profile_pi;
     int dec;
 
-    if (wan_has_crypto(fwd, pkt, job.len)) {
-        dec = decrypt_wan(fwd, &job);
-        if (dec == 1) {
-            ne_frame_free(&fwd->pair, job.addr);
-            return;
-        }
-        if (dec != 0)
-            goto drop;
-        pkt = ne_packet_data(&fwd->pair, job.addr);
-    }
-
-    li = pick_local(fwd, pkt, job.len);
-    if (li < 0 || li >= fwd->local_count)
+    if (!fwd || !pkt || job.len < 14u)
         goto drop;
 
-    job.dir = NE_DIR_LOCAL;
-    job.local_idx = (uint8_t)li;
-    (void)dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], &job);
+    if (!wan_has_crypto(fwd, pkt, job.len))
+        goto drop;
+
+    profile_pi = mac_learn_wan_profile_pi(fwd, pkt, job.len);
+    dec = decrypt_wan(fwd, &job);
+    if (dec == 1) {
+        ne_frame_free(&fwd->pair, job.addr);
+        return;
+    }
+    if (dec != 0)
+        goto drop;
+
+    if (mac_learn_wan_forward(fwd, &job, profile_pi) != 0)
+        goto drop;
     return;
 
 drop:
