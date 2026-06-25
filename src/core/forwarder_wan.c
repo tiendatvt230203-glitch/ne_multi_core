@@ -99,15 +99,7 @@ void fwd_wan_mark_stopped(int dp)
 
 int fwd_wan_ifname_dataplane_in_cfg(const struct app_config *cfg, const char *ifname)
 {
-    if (!cfg || !ifname)
-        return 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (!cfg->wans[i].dataplane)
-            continue;
-        if (strcmp(cfg->wans[i].ifname, ifname) == 0)
-            return 1;
-    }
-    return 0;
+    return config_wan_live_in_cfg(cfg, ifname);
 }
 
 uint32_t fwd_wan_flush_queue(struct forwarder *fwd, int wan_idx)
@@ -191,7 +183,7 @@ void fwd_wan_configure_removal_drains(struct forwarder *fwd,
         int ci = fwd->wan_cfg_idx[dp];
         if (ci < 0 || ci >= old->wan_count)
             continue;
-        if (!old->wans[ci].dataplane)
+        if (!config_wan_live(old, ci))
             continue;
         if (fwd_wan_ifname_dataplane_in_cfg(cfg, old->wans[ci].ifname))
             continue;
@@ -216,7 +208,7 @@ void fwd_wan_configure_removal_drains(struct forwarder *fwd,
         int ci = -1;
         const char *want = fwd->wans[dp].ifname;
         for (int i = 0; i < cfg->wan_count; i++) {
-            if (!cfg->wans[i].dataplane)
+            if (!config_wan_live(cfg, i))
                 continue;
             if (strcmp(cfg->wans[i].ifname, want) == 0) {
                 ci = i;
@@ -226,6 +218,41 @@ void fwd_wan_configure_removal_drains(struct forwarder *fwd,
         if (ci >= 0)
             fwd->wan_cfg_idx[dp] = ci;
     }
+}
+
+void fwd_wan_configure_live_drains(struct forwarder *fwd,
+                                   const struct app_config *old,
+                                   const struct app_config *cfg)
+{
+    if (!fwd || !old || !cfg)
+        return;
+
+    int dp_n = fwd->wan_count;
+    if (dp_n > MAX_INTERFACES)
+        dp_n = MAX_INTERFACES;
+
+    for (int dp = 0; dp < dp_n; dp++) {
+        int ci = fwd->wan_cfg_idx[dp];
+
+        if (ci < 0 || ci >= old->wan_count)
+            continue;
+        if (!config_wan_live(old, ci) || config_wan_live(cfg, ci))
+            continue;
+        if (wan_drains[dp].active || wan_stopped[dp])
+            continue;
+
+        wan_drains[dp].active = 1;
+        wan_drains[dp].legacy_cfg_wan = ci;
+        wan_drains[dp].seed_weight = wan_seed_weight_from_cfg(old, ci);
+        snprintf(wan_drains[dp].ifname, sizeof(wan_drains[dp].ifname), "%s",
+                 old->wans[ci].ifname);
+        wan_drains[dp].start_ms = monotonic_ms();
+        wan_drains[dp].until_ms = wan_drains[dp].start_ms + WAN_DRAIN_GRACE_MS;
+        fprintf(stderr,
+                "[WAN-DRAIN] %s weight=0 — taper %us (bandwidth removed, no new flows)\n",
+                wan_drains[dp].ifname, (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
+    }
+    fflush(stderr);
 }
 
 static int wan_weight_blend_progress(const wan_weight_blend *b)

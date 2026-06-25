@@ -107,44 +107,12 @@ struct app_config {
     int policy_count;
 };
 
-static inline int config_count_dataplane_wans(const struct app_config *cfg)
-{
-    int n = 0;
-    if (!cfg)
-        return 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (cfg->wans[i].dataplane)
-            n++;
-    }
-    return n;
-}
-
-static inline int config_wan_cfg_to_dp(const struct app_config *cfg, int cfg_idx)
-{
-    if (!cfg || cfg_idx < 0 || cfg_idx >= cfg->wan_count || !cfg->wans[cfg_idx].dataplane)
-        return -1;
-    int dp = 0;
-    for (int i = 0; i < cfg_idx; i++) {
-        if (cfg->wans[i].dataplane)
-            dp++;
-    }
-    return dp;
-}
-
-static inline int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx)
-{
-    if (!cfg || dp_idx < 0)
-        return -1;
-    int seen = 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (!cfg->wans[i].dataplane)
-            continue;
-        if (seen == dp_idx)
-            return i;
-        seen++;
-    }
-    return -1;
-}
+int config_wan_profile_weight(const struct app_config *cfg, int wan_idx);
+int config_wan_live(const struct app_config *cfg, int wan_idx);
+int config_wan_live_in_cfg(const struct app_config *cfg, const char *ifname);
+int config_count_dataplane_wans(const struct app_config *cfg);
+int config_wan_cfg_to_dp(const struct app_config *cfg, int cfg_idx);
+int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx);
 
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network);
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);

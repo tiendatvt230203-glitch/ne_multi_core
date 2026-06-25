@@ -346,15 +346,16 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
     for (int r = 0; r < rows && p->wan_count < MAX_PROFILE_INTERFACES; r++) {
         const char *ifname = PQgetvalue(res, r, ifn_col);
         int wi = find_wan_index_by_ifname(cfg, ifname);
-        int weight = 1;
+        int weight = 0;
         if (wi >= 0) {
             if (wcol >= 0 && !PQgetisnull(res, r, wcol)) {
                 const char *wstr = PQgetvalue(res, r, wcol);
                 if (wstr && wstr[0]) {
-                    int parsed = atoi(wstr);  
-                    if (parsed > 0) {
-                        weight = parsed;
-                    }
+                    int parsed = atoi(wstr);
+
+                    if (parsed < 0)
+                        parsed = 0;
+                    weight = parsed;
                 }
             }
             p->wan_indices[p->wan_count] = wi;
@@ -629,9 +630,14 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
         }
         strncpy(wan->ifname, v, IF_NAMESIZE - 1);
 
-        v = PQgetvalue(res, row, PQfnumber(res, "dst_ip"));
-        if (v && v[0] != '\0')
-            (void)parse_ipv4_addr(v, &wan->dst_ip);
+        int dip_col = PQfnumber(res, "dst_ip");
+        if (dip_col >= 0 && PQgetisnull(res, row, dip_col)) {
+            wan->dst_ip = 0;
+        } else {
+            const char *v = PQgetvalue(res, row, dip_col);
+            if (v && v[0] != '\0')
+                (void)parse_ipv4_addr(v, &wan->dst_ip);
+        }
 
         wan->dataplane = wan->dst_ip == 0 ? 1 : 0;
         cfg->wan_count++;
@@ -692,7 +698,7 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, host(dst_ip)::text AS dst_ip "
+        "SELECT interface AS ifname, host(dst_ip) AS dst_ip "
         "FROM ne_wan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
 

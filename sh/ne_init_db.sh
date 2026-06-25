@@ -18,7 +18,7 @@ fi
 
 echo "=== ne_init_db ==="
 echo "postgres://${POSTGRES_USER}@${POSTGRES_SERVER}:${POSTGRES_PORT}/${POSTGRES_DB}"
-echo "scope: DROP/CREATE ne_* tables and enums only (no PostgreSQL users)"
+echo "scope: apply schema.sql (11 BE tables) — run once before sql_options seeds"
 echo
 
 ne_psql -c "SELECT version();" >/dev/null

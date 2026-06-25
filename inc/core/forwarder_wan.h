@@ -16,6 +16,10 @@ void fwd_wan_configure_removal_drains(struct forwarder *fwd,
                                       const struct app_config *old,
                                       const struct app_config *cfg);
 
+void fwd_wan_configure_live_drains(struct forwarder *fwd,
+                                   const struct app_config *old,
+                                   const struct app_config *cfg);
+
 int fwd_wan_ifname_dataplane_in_cfg(const struct app_config *cfg, const char *ifname);
 
 int fwd_wan_dp_ok_for_new_traffic(int dp);

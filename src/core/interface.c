@@ -479,7 +479,7 @@ static void prefill_iface(struct ne_pair *p, struct ne_iface *iface, uint32_t wa
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
 {
 #define NE_TRY(expr) do { if (expr) goto fail; } while (0)
-    if (!p || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
+    if (!p || !cfg || cfg->local_count <= 0)
         return -1;
 
     memset(p, 0, sizeof(*p));
@@ -489,6 +489,10 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->wan_count = config_count_dataplane_wans(cfg);
     if (p->wan_count > MAX_INTERFACES)
         p->wan_count = MAX_INTERFACES;
+    if (p->wan_count == 0) {
+        fprintf(stderr, "[DP-CONF] no live WAN rows (weight>0) — LAN-only dataplane\n");
+        fflush(stderr);
+    }
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 

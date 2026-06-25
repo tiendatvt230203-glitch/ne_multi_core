@@ -34,4 +34,7 @@ int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
                                   enum profile_iface_xdp_reload_mode mode,
                                   int trigger_profile_id);
 
+int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_config *new_cfg,
+                                    const struct app_config *old_cfg);
+
 #endif

@@ -505,7 +505,8 @@ static int detach_profile_wan_rows(struct forwarder *fwd, const struct app_confi
         if (!old_cfg->wans[oci].dataplane)
             continue;
         ifname = old_cfg->wans[oci].ifname;
-        if (new_prof && profile_config_has_wan_ci(new_prof, oci))
+        if (new_prof && profile_config_has_wan_ci(new_prof, oci) &&
+            config_wan_live(new_cfg, oci))
             continue;
         if (fwd_wan_ifname_dataplane_in_cfg(new_cfg, ifname))
             continue;
@@ -628,7 +629,7 @@ static void attach_profile_wan_rows(struct forwarder *fwd, const struct app_conf
             break;
         if (ci < 0 || ci >= new_cfg->wan_count)
             continue;
-        if (!new_cfg->wans[ci].dataplane)
+        if (!config_wan_live(new_cfg, ci))
             continue;
         ifname = new_cfg->wans[ci].ifname;
         if (if_nametoindex(ifname) == 0) {
@@ -738,6 +739,47 @@ static void fwd_reconcile_iface_counts(struct forwarder *fwd)
     fwd->pair.local_count = max_li;
     fwd->wan_count = max_di;
     fwd->pair.wan_count = max_di;
+}
+
+int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_config *new_cfg,
+                                    const struct app_config *old_cfg)
+{
+    if (!fwd || !new_cfg || !old_cfg || forwarder_should_stop())
+        return -1;
+
+    for (int pi = 0; pi < new_cfg->profile_count; pi++) {
+        const struct profile_config *prof = &new_cfg->profiles[pi];
+        struct profile_attach_sess sess;
+        int need_attach = 0;
+
+        for (int wi = 0; wi < prof->wan_count; wi++) {
+            int ci = prof->wan_indices[wi];
+
+            if (ci < 0 || ci >= new_cfg->wan_count)
+                continue;
+            if (!config_wan_live(new_cfg, ci))
+                continue;
+            if (pair_wan_dp_slot_live(fwd, new_cfg->wans[ci].ifname) >= 0)
+                continue;
+            need_attach = 1;
+            break;
+        }
+        if (!need_attach)
+            continue;
+
+        memset(&sess, 0, sizeof(sess));
+        attach_profile_wan_rows(fwd, new_cfg, prof->id, &sess);
+        if (sess.validate_failed) {
+            profile_attach_sess_rollback(fwd, &sess);
+            fprintf(stderr,
+                    "[PROFILE-XDP] profile %d: WAN live attach failed (weight>0)\n",
+                    prof->id);
+            return -1;
+        }
+        if (sess.wan_n > 0)
+            fwd_reconcile_iface_counts(fwd);
+    }
+    return 0;
 }
 
 int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,

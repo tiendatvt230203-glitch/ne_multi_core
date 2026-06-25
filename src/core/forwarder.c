@@ -319,10 +319,15 @@ static void *crypto_worker_thread(void *arg)
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
-    if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
+    if (!fwd || !cfg || cfg->local_count <= 0)
         return -1;
     if (forwarder_should_stop())
         return -1;
+    if (config_count_dataplane_wans(cfg) <= 0) {
+        fprintf(stderr,
+                "[FWD] no live WAN (weight>0) — LAN-only until bandwidth is assigned\n");
+        fflush(stderr);
+    }
 
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;

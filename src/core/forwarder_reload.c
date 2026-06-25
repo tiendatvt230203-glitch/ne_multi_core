@@ -62,20 +62,20 @@ int forwarder_is_wan_only_removal(const struct app_config *old, const struct app
 
     int old_dp = config_count_dataplane_wans(old);
     int new_dp = config_count_dataplane_wans(new);
-    if (new_dp >= old_dp || old_dp <= 0 || new_dp <= 0)
+    if (new_dp >= old_dp || old_dp <= 0)
         return 0;
 
     for (int i = 0; i < new->wan_count; i++) {
-        if (!new->wans[i].dataplane)
+        if (!config_wan_live(new, i))
             continue;
-        if (!fwd_wan_ifname_dataplane_in_cfg(old, new->wans[i].ifname))
+        if (!config_wan_live_in_cfg(old, new->wans[i].ifname))
             return 0;
     }
 
     for (int i = 0; i < old->wan_count; i++) {
-        if (!old->wans[i].dataplane)
+        if (!config_wan_live(old, i))
             continue;
-        if (!fwd_wan_ifname_dataplane_in_cfg(new, old->wans[i].ifname))
+        if (!config_wan_live_in_cfg(new, old->wans[i].ifname))
             return 1;
     }
     return 0;
@@ -144,6 +144,11 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
     if (forwarder_should_stop())
         return -1;
     const struct app_config *old_cfg = fwd->cfg;
+
+    fwd_wan_configure_live_drains(fwd, old_cfg, cfg);
+    if (profile_iface_xdp_sync_wan_live(fwd, cfg, old_cfg) != 0)
+        return -1;
+
     fwd->cfg = cfg;
     fwd_wan_weight_blend_begin(old_cfg, cfg, fwd_crypto_profile_slot_for_id);
     if (fwd_crypto_ensure_profile_slots(cfg) != 0) {

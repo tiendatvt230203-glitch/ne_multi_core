@@ -162,6 +162,87 @@ int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx
     return config_wan_owner_profile(cfg, wan_idx, skip_profile_id);
 }
 
+int config_wan_profile_weight(const struct app_config *cfg, int wan_idx)
+{
+    int best = 0;
+
+    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
+        return 0;
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        for (int wi = 0; wi < p->wan_count; wi++) {
+            if (p->wan_indices[wi] != wan_idx)
+                continue;
+            if (p->wan_bandwidth_weight[wi] > best)
+                best = p->wan_bandwidth_weight[wi];
+        }
+    }
+    return best;
+}
+
+int config_wan_live(const struct app_config *cfg, int wan_idx)
+{
+    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
+        return 0;
+    /* ne_wan.dst_ip set → handshake/PQC redirect, no dataplane XDP */
+    if (!cfg->wans[wan_idx].dataplane)
+        return 0;
+    /* weight 0 / unset → staged WAN row, no XDP until bandwidth assigned */
+    return config_wan_profile_weight(cfg, wan_idx) > 0;
+}
+
+int config_wan_live_in_cfg(const struct app_config *cfg, const char *ifname)
+{
+    if (!cfg || !ifname)
+        return 0;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (strcmp(cfg->wans[i].ifname, ifname) == 0)
+            return config_wan_live(cfg, i);
+    }
+    return 0;
+}
+
+int config_count_dataplane_wans(const struct app_config *cfg)
+{
+    int n = 0;
+
+    if (!cfg)
+        return 0;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (config_wan_live(cfg, i))
+            n++;
+    }
+    return n;
+}
+
+int config_wan_cfg_to_dp(const struct app_config *cfg, int cfg_idx)
+{
+    if (!config_wan_live(cfg, cfg_idx))
+        return -1;
+    int dp = 0;
+    for (int i = 0; i < cfg_idx; i++) {
+        if (config_wan_live(cfg, i))
+            dp++;
+    }
+    return dp;
+}
+
+int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx)
+{
+    if (!cfg || dp_idx < 0)
+        return -1;
+    int seen = 0;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (!config_wan_live(cfg, i))
+            continue;
+        if (seen == dp_idx)
+            return i;
+        seen++;
+    }
+    return -1;
+}
+
 int config_wan_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
 {
     if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
