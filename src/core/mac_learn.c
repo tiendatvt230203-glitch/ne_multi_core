@@ -3,22 +3,22 @@
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/core/crypto_route.h"
-#include "../../inc/db/db_env.h"
+#include "../../inc/core/config.h"
 
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/crypto_policy_utils.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
+#include <time.h>
 
-#define MAC_LEARN_STATE_MAGIC 0x4e454d41u
-#define MAC_LEARN_STATE_VER   1u
+/* --- config --- */
 
 #define MAC_LEARN_TEST_SEED 0
+
+#define MAC_LEARN_ENTRY_TTL_MS  (300000u)
 
 #if MAC_LEARN_TEST_SEED
 struct mac_learn_test_seed {
@@ -27,26 +27,43 @@ struct mac_learn_test_seed {
 };
 
 static const struct mac_learn_test_seed mac_learn_test_seeds[] = {
-    { "eno5s0", { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 } },
-    { "enp6s0", { 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 } },
+    { "enp5s0", { 0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4e } },
+    { "enp6s0", { 0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x4f } },
 };
 #endif
 
-struct mac_learn_file_hdr {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t count;
-    uint32_t reserved;
-};
+/* --- internal: time --- */
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+}
+
+/* --- internal: MAC table --- */
 
 static uint8_t mac_hash_key(const uint8_t mac[MAC_LEN])
 {
     return mac[5];
 }
 
+static void hash_rebuild_locked(struct mac_learn_table *t)
+{
+    memset(t->hash_head, -1, sizeof(t->hash_head));
+    memset(t->hash_next, -1, sizeof(t->hash_next));
+    for (int i = 0; i < t->count; i++) {
+        uint8_t b = mac_hash_key(t->list[i].mac);
+        t->hash_next[i] = t->hash_head[b];
+        t->hash_head[b] = i;
+    }
+}
+
 static int find_idx_by_mac_locked(const struct mac_learn_table *t, const uint8_t mac[MAC_LEN])
 {
     uint8_t b = mac_hash_key(mac);
+
     for (int i = t->hash_head[b]; i >= 0; i = t->hash_next[i]) {
         if (memcmp(t->list[i].mac, mac, MAC_LEN) == 0)
             return i;
@@ -54,16 +71,15 @@ static int find_idx_by_mac_locked(const struct mac_learn_table *t, const uint8_t
     return -1;
 }
 
-static void upsert_locked(struct mac_learn_table *t, const char *ifname, const uint8_t mac[MAC_LEN])
+static void upsert_locked(struct mac_learn_table *t, const char *ifname,
+                          const uint8_t mac[MAC_LEN], uint64_t now_ms)
 {
     int i = find_idx_by_mac_locked(t, mac);
 
     if (i >= 0) {
-        if (strncmp(t->list[i].ifname, ifname, IF_NAMESIZE) == 0)
-            return;
         strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
         t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
-        t->dirty = 1;
+        t->list[i].last_seen_ms = now_ms;
         return;
     }
     if (t->count >= MAC_LEARN_MAX_ENTRIES)
@@ -73,58 +89,16 @@ static void upsert_locked(struct mac_learn_table *t, const char *ifname, const u
     memcpy(t->list[i].mac, mac, MAC_LEN);
     strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
     t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
+    t->list[i].last_seen_ms = now_ms;
 
     {
         uint8_t b = mac_hash_key(mac);
         t->hash_next[i] = t->hash_head[b];
         t->hash_head[b] = i;
     }
-    t->dirty = 1;
 }
 
-static const struct crypto_policy *arp_match_policy(struct app_config *cfg, int local_idx,
-                                                    uint32_t sender_ip, uint32_t target_ip)
-{
-    const struct crypto_policy *best = NULL;
-    int best_pri = 0x7fffffff;
-    int best_id = 0x7fffffff;
-
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *prof = &cfg->profiles[pi];
-        const struct crypto_policy *cp;
-        int on_local = 0;
-
-        if (!prof->enabled)
-            continue;
-        for (int i = 0; i < prof->local_count; i++) {
-            if (prof->local_indices[i] == local_idx)
-                on_local = 1;
-        }
-        if (!on_local)
-            continue;
-
-        cp = config_select_crypto_policy(cfg, pi, sender_ip, target_ip, 0, 0, 0);
-        if (!cp)
-            continue;
-        if (!best || cp->priority < best_pri ||
-            (cp->priority == best_pri && cp->id < best_id)) {
-            best = cp;
-            best_pri = cp->priority;
-            best_id = cp->id;
-        }
-    }
-    return best;
-}
-
-static int mac_learn_state_path(char *out, size_t outsz)
-{
-    if (!out || outsz == 0)
-        return -1;
-    snprintf(out, outsz, "%s/mac_learn.bin", NE_STATE_DIR);
-    return 0;
-}
-
-void mac_learn_init(struct mac_learn_table *t)
+static void table_init(struct mac_learn_table *t)
 {
     memset(t, 0, sizeof(*t));
     memset(t->hash_head, -1, sizeof(t->hash_head));
@@ -132,69 +106,20 @@ void mac_learn_init(struct mac_learn_table *t)
     pthread_spin_init(&t->lock, PTHREAD_PROCESS_PRIVATE);
 }
 
-void mac_learn(struct mac_learn_table *t, const char *ifname, const uint8_t mac[MAC_LEN])
+static void table_learn(struct mac_learn_table *t, const char *ifname, const uint8_t mac[MAC_LEN])
 {
-    if (!t || !ifname || !mac)
+    uint64_t now_ms;
+
+    if (!t || !ifname || !mac || ifname[0] == '\0')
         return;
+    now_ms = monotonic_ms();
     pthread_spin_lock(&t->lock);
-    upsert_locked(t, ifname, mac);
+    upsert_locked(t, ifname, mac, now_ms);
     pthread_spin_unlock(&t->lock);
 }
 
-#if MAC_LEARN_TEST_SEED
-static void mac_learn_apply_test_seed(struct mac_learn_table *t)
-{
-    if (!t)
-        return;
-    for (size_t i = 0; i < sizeof(mac_learn_test_seeds) / sizeof(mac_learn_test_seeds[0]); i++) {
-        const struct mac_learn_test_seed *s = &mac_learn_test_seeds[i];
-        mac_learn(t, s->local_ifname, s->learned_mac);
-        fprintf(stderr, "[MAC-TEST] learned %02x:%02x:%02x:%02x:%02x:%02x -> %s\n",
-                s->learned_mac[0], s->learned_mac[1], s->learned_mac[2],
-                s->learned_mac[3], s->learned_mac[4], s->learned_mac[5],
-                s->local_ifname);
-    }
-}
-#endif
-
-void mac_learn_arp(struct mac_learn_table *t, struct app_config *cfg, int local_idx,
-                   const char *ifname, const uint8_t *pkt, uint32_t len)
-{
-    const uint8_t *arp;
-    uint16_t ethertype;
-    uint8_t sender_mac[MAC_LEN];
-    uint32_t sender_ip;
-    uint32_t target_ip;
-
-    if (!t || !cfg || !ifname || !pkt)
-        return;
-    if (len < 14u + 28u)
-        return;
-
-    ethertype = (uint16_t)((pkt[12] << 8) | pkt[13]);
-    if (ethertype != 0x0806u)
-        return;
-
-    arp = pkt + 14;
-    if (arp[0] != 0x00 || arp[1] != 0x01 || arp[2] != 0x08 || arp[3] != 0x00)
-        return;
-    if (arp[4] != 6 || arp[5] != 4)
-        return;
-
-    memcpy(sender_mac, arp + 8, MAC_LEN);
-    memcpy(&sender_ip, arp + 14, sizeof(sender_ip));
-    memcpy(&target_ip, arp + 24, sizeof(target_ip));
-
-    if (!arp_match_policy(cfg, local_idx, sender_ip, target_ip))
-        return;
-
-    pthread_spin_lock(&t->lock);
-    upsert_locked(t, ifname, sender_mac);
-    pthread_spin_unlock(&t->lock);
-}
-
-int mac_learn_lookup(struct mac_learn_table *t, const uint8_t mac[MAC_LEN],
-                     char ifname[IF_NAMESIZE])
+static int table_lookup(struct mac_learn_table *t, const uint8_t mac[MAC_LEN],
+                        char ifname[IF_NAMESIZE])
 {
     int i;
 
@@ -212,132 +137,97 @@ int mac_learn_lookup(struct mac_learn_table *t, const uint8_t mac[MAC_LEN],
     return 0;
 }
 
-int mac_learn_load(struct mac_learn_table *t)
+static int ifname_in_profile_locals(const struct app_config *cfg, const char *ifname)
 {
-    char path[256];
-    FILE *fp;
-    struct mac_learn_file_hdr hdr;
-    struct mac_learn_entry batch[MAC_LEARN_MAX_ENTRIES];
-    size_t n;
+    if (!cfg || !ifname || !ifname[0])
+        return 0;
 
-    if (!t)
-        return -1;
-    if (mac_learn_state_path(path, sizeof(path)) != 0)
-        return -1;
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *prof = &cfg->profiles[pi];
 
-    fp = fopen(path, "rb");
-    if (!fp) {
-        if (errno == ENOENT) {
-#if MAC_LEARN_TEST_SEED
-            mac_learn_apply_test_seed(t);
-#endif
-            return 0;
-        }
-        return -1;
-    }
-
-    if (fread(&hdr, sizeof(hdr), 1, fp) != 1) {
-        fclose(fp);
-        return -1;
-    }
-    if (hdr.magic != MAC_LEARN_STATE_MAGIC || hdr.version != MAC_LEARN_STATE_VER ||
-        hdr.count > MAC_LEARN_MAX_ENTRIES) {
-        fclose(fp);
-        return -1;
-    }
-
-    if (hdr.count > 0) {
-        n = fread(batch, sizeof(batch[0]), hdr.count, fp);
-        if (n != hdr.count) {
-            fclose(fp);
-            return -1;
-        }
-    }
-    fclose(fp);
-
-    pthread_spin_lock(&t->lock);
-    t->count = 0;
-    memset(t->hash_head, -1, sizeof(t->hash_head));
-    memset(t->hash_next, -1, sizeof(t->hash_next));
-    t->dirty = 0;
-    for (uint32_t i = 0; i < hdr.count; i++) {
-        if (batch[i].ifname[0] == '\0')
+        if (!prof->enabled)
             continue;
-        upsert_locked(t, batch[i].ifname, batch[i].mac);
+        for (int i = 0; i < prof->local_count; i++) {
+            int li = prof->local_indices[i];
+            if (li < 0 || li >= cfg->local_count)
+                continue;
+            if (strcmp(cfg->locals[li].ifname, ifname) == 0)
+                return 1;
+        }
     }
-    t->dirty = 0;
-    pthread_spin_unlock(&t->lock);
+    return 0;
+}
 
-    fprintf(stderr, "[MAC] loaded %u entries from %s\n", hdr.count, path);
+static void table_purge_orphan_locked(struct mac_learn_table *t, const struct app_config *cfg)
+{
+    int w = 0;
+
+    if (!t || !cfg)
+        return;
+
+    for (int i = 0; i < t->count; i++) {
+        if (ifname_in_profile_locals(cfg, t->list[i].ifname)) {
+            if (w != i)
+                t->list[w] = t->list[i];
+            w++;
+        }
+    }
+    if (w != t->count) {
+        t->count = w;
+        hash_rebuild_locked(t);
+    }
+}
+
+static void table_expire_stale_locked(struct mac_learn_table *t, uint64_t now_ms, uint64_t ttl_ms)
+{
+    int w = 0;
+
+    if (!t)
+        return;
+
+    for (int i = 0; i < t->count; i++) {
+        if (now_ms - t->list[i].last_seen_ms <= ttl_ms) {
+            if (w != i)
+                t->list[w] = t->list[i];
+            w++;
+        }
+    }
+    if (w != t->count) {
+        t->count = w;
+        hash_rebuild_locked(t);
+    }
+}
+
+static void table_maintain(struct mac_learn_table *t, const struct app_config *cfg)
+{
+    uint64_t now_ms;
+
+    if (!t)
+        return;
+    now_ms = monotonic_ms();
+    pthread_spin_lock(&t->lock);
+    table_purge_orphan_locked(t, cfg);
+    table_expire_stale_locked(t, now_ms, MAC_LEARN_ENTRY_TTL_MS);
+    pthread_spin_unlock(&t->lock);
+}
+
 #if MAC_LEARN_TEST_SEED
-    mac_learn_apply_test_seed(t);
+static void table_apply_test_seed(struct mac_learn_table *t)
+{
+    if (!t)
+        return;
+    for (size_t i = 0; i < sizeof(mac_learn_test_seeds) / sizeof(mac_learn_test_seeds[0]); i++) {
+        const struct mac_learn_test_seed *s = &mac_learn_test_seeds[i];
+        table_learn(t, s->local_ifname, s->learned_mac);
+        fprintf(stderr, "[MAC-TEST] learned %02x:%02x:%02x:%02x:%02x:%02x -> %s\n",
+                s->learned_mac[0], s->learned_mac[1], s->learned_mac[2],
+                s->learned_mac[3], s->learned_mac[4], s->learned_mac[5],
+                s->local_ifname);
+    }
+}
 #endif
-    return 0;
-}
 
-int mac_learn_save(struct mac_learn_table *t)
-{
-    char path[256];
-    char tmp[280];
-    FILE *fp;
-    struct mac_learn_file_hdr hdr;
-    struct mac_learn_entry snap[MAC_LEARN_MAX_ENTRIES];
-    int count;
-
-    if (!t)
-        return -1;
-    if (mac_learn_state_path(path, sizeof(path)) != 0)
-        return -1;
-
-    (void)mkdir(NE_STATE_DIR, 0755);
-
-    pthread_spin_lock(&t->lock);
-    count = t->count;
-    if (count > MAC_LEARN_MAX_ENTRIES)
-        count = MAC_LEARN_MAX_ENTRIES;
-    memcpy(snap, t->list, (size_t)count * sizeof(snap[0]));
-    t->dirty = 0;
-    pthread_spin_unlock(&t->lock);
-
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    fp = fopen(tmp, "wb");
-    if (!fp)
-        return -1;
-
-    hdr.magic = MAC_LEARN_STATE_MAGIC;
-    hdr.version = MAC_LEARN_STATE_VER;
-    hdr.count = (uint32_t)count;
-    hdr.reserved = 0;
-    if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1 ||
-        (count > 0 && fwrite(snap, sizeof(snap[0]), (size_t)count, fp) != (size_t)count)) {
-        fclose(fp);
-        remove(tmp);
-        return -1;
-    }
-    fflush(fp);
-    fclose(fp);
-    if (rename(tmp, path) != 0) {
-        remove(tmp);
-        return -1;
-    }
-    return 0;
-}
-
-void mac_learn_flush_if_dirty(struct mac_learn_table *t)
-{
-    int dirty;
-
-    if (!t)
-        return;
-    pthread_spin_lock(&t->lock);
-    dirty = t->dirty;
-    t->dirty = 0;
-    pthread_spin_unlock(&t->lock);
-    if (!dirty)
-        return;
-    if (mac_learn_save(t) != 0)
-        t->dirty = 1;
-}
+/* --- internal: WAN forward --- */
 
 static int local_idx_by_ifname(struct forwarder *fwd, const char *ifname)
 {
@@ -369,13 +259,13 @@ static int profile_owns_local(const struct app_config *cfg, int profile_pi, int 
     return 0;
 }
 
-static int profile_pi_for_wire_policy(struct forwarder *fwd, int action, uint8_t wire_id)
+static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
 {
     int profile_id;
 
     if (!fwd || !fwd->cfg)
         return -1;
-    profile_id = fwd_crypto_profile_id_for_policy_action_id(action, wire_id);
+    profile_id = fwd_crypto_profile_id_for_wire_id(wire_id);
     if (profile_id < 0)
         return -1;
     for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
@@ -391,7 +281,7 @@ static int pick_local_idx(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 
     if (!fwd || !pkt || len < 14u)
         return -1;
-    if (mac_learn_lookup(&fwd->mac_table, pkt, ifname) != 0)
+    if (table_lookup(&fwd->mac_table, pkt, ifname) != 0)
         return -1;
     return local_idx_by_ifname(fwd, ifname);
 }
@@ -451,29 +341,57 @@ static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
     return sent > 0 ? 0 : -1;
 }
 
-void mac_learn_local_ingress(struct forwarder *fwd, int local_idx, const uint8_t *pkt)
+static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
-    if (!fwd || !pkt || local_idx < 0 || local_idx >= fwd->local_count)
-        return;
-    mac_learn(&fwd->mac_table, fwd->locals[local_idx].ifname, pkt + 6);
+    uint32_t src_ip = 0, dst_ip = 0;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t proto = 0;
+    int best_pi = -1;
+    int best_pri = 0x7fffffff;
+    int best_id = 0x7fffffff;
+
+    if (!fwd || !pkt || !fwd->cfg)
+        return -1;
+    if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
+                      &src_port, &dst_port, &proto) != 0)
+        return -1;
+
+    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+        const struct profile_config *prof = &fwd->cfg->profiles[pi];
+        const struct crypto_policy *cp;
+
+        if (!prof->enabled)
+            continue;
+        cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
+                                         src_port, dst_port, proto);
+        if (!cp || cp->action != POLICY_ACTION_BYPASS)
+            continue;
+        if (best_pi < 0 || cp->priority < best_pri ||
+            (cp->priority == best_pri && cp->id < best_id)) {
+            best_pi = pi;
+            best_pri = cp->priority;
+            best_id = cp->id;
+        }
+    }
+    return best_pi;
 }
 
-int mac_learn_wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
+static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
     uint8_t pol = 0;
 
     if (!fwd || !pkt || !fwd->cfg)
         return -1;
     if (fwd_crypto_has_l2_marker(pkt, len))
-        return profile_pi_for_wire_policy(fwd, POLICY_ACTION_ENCRYPT_L2, pkt[CRYPTO_L2_POLICY_OFF]);
+        return profile_pi_for_wire_policy(fwd, pkt[CRYPTO_L2_POLICY_OFF]);
     if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return profile_pi_for_wire_policy(fwd, POLICY_ACTION_ENCRYPT_L3, pol);
+        return profile_pi_for_wire_policy(fwd, pol);
     if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return profile_pi_for_wire_policy(fwd, POLICY_ACTION_ENCRYPT_L4, pol);
-    return -1;
+        return profile_pi_for_wire_policy(fwd, pol);
+    return wan_profile_pi_bypass(fwd, pkt, len);
 }
 
-int mac_learn_wan_forward(struct forwarder *fwd, struct ne_packet *job, int profile_pi)
+static int wan_forward(struct forwarder *fwd, struct ne_packet *job, int profile_pi)
 {
     uint8_t *pkt;
     int li;
@@ -496,4 +414,48 @@ int mac_learn_wan_forward(struct forwarder *fwd, struct ne_packet *job, int prof
     }
 
     return flood_to_profile_locals(fwd, job, pkt, profile_pi);
+}
+
+/* --- public API --- */
+
+void mac_learn_bootstrap(struct mac_learn_table *t)
+{
+    if (!t)
+        return;
+    table_init(t);
+#if MAC_LEARN_TEST_SEED
+    table_apply_test_seed(t);
+#endif
+}
+
+void mac_learn_shutdown(struct mac_learn_table *t)
+{
+    if (!t)
+        return;
+    pthread_spin_destroy(&t->lock);
+}
+
+void mac_learn_tick(struct forwarder *fwd)
+{
+    if (!fwd)
+        return;
+    table_maintain(&fwd->mac_table, fwd->cfg);
+}
+
+void mac_learn_local(struct forwarder *fwd, int local_idx, const uint8_t *pkt)
+{
+    if (!fwd || !pkt || local_idx < 0 || local_idx >= fwd->local_count)
+        return;
+    table_learn(&fwd->mac_table, fwd->locals[local_idx].ifname, pkt + 6);
+}
+
+int mac_learn_wan(struct forwarder *fwd, struct ne_packet *job,
+                  const uint8_t *wire_pkt, uint32_t wire_len)
+{
+    int profile_pi;
+
+    if (!fwd || !job || !wire_pkt || wire_len < 14u)
+        return -1;
+    profile_pi = wan_profile_pi(fwd, wire_pkt, wire_len);
+    return wan_forward(fwd, job, profile_pi);
 }

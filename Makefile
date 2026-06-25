@@ -35,6 +35,8 @@ APP_SRC = main.c \
           src/crypto/crypto_layer4.c \
           src/crypto/pqc_handshake.c \
           src/crypto/pqc_l2_handshake.c \
+          src/crypto/pqc_logger.c \
+          src/crypto/pqc_ipc.c \
           src/core/flow_table.c \
           src/core/fragment.c
 APP_OBJ = $(APP_SRC:.c=.o)

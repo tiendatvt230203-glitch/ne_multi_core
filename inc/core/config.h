@@ -154,10 +154,10 @@ int config_local_owner_profile(const struct app_config *cfg, int local_idx, int 
 int config_wan_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id);
 int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id);
 int config_policy_db_id_taken(const struct app_config *cfg, int db_id);
+int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
                                                         uint8_t protocol);
-
 #endif

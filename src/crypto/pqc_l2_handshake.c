@@ -1,6 +1,6 @@
-#include "../inc/pqc_l2_handshake.h"
+#include "pqc_l2_handshake.h"
 #include "pqc_handshake.h"
-#include "../../inc/config.h"
+#include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -110,7 +110,13 @@ int pqc_l2_discover_peer_mac(struct pqc_l2_peer *peer, int timeout_sec) {
     sll.sll_family = AF_PACKET;
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, peer->ifname, IFNAMSIZ - 1);
+    // strncpy(ifr.ifr_name, peer->ifname, IFNAMSIZ - 1);
+    if (strlen(peer->ifname) >= sizeof(ifr.ifr_name)) {
+        fprintf(stderr, "[PQC-L2] Error: Interface name '%s' is too long (max %zu chars).\n", 
+                peer->ifname, sizeof(ifr.ifr_name) - 1);
+        return -1;
+    }
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", peer->ifname);
     if (ioctl(peer->raw_sock_fd, SIOCGIFINDEX, &ifr) >= 0) {
         sll.sll_ifindex = ifr.ifr_ifindex;
     }
@@ -179,7 +185,13 @@ int pqc_l2_send_payload_fragmented(struct pqc_l2_peer *peer, uint32_t msg_id,
     sll.sll_family = AF_PACKET;
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, peer->ifname, IFNAMSIZ - 1);
+    // strncpy(ifr.ifr_name, peer->ifname, IFNAMSIZ - 1);
+    if (strlen(peer->ifname) >= sizeof(ifr.ifr_name)) {
+        fprintf(stderr, "[PQC-L2] Error: Interface name '%s' is too long (max %zu chars).\n", 
+                peer->ifname, sizeof(ifr.ifr_name) - 1);
+        return -1;
+    }
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", peer->ifname);
     if (ioctl(peer->raw_sock_fd, SIOCGIFINDEX, &ifr) >= 0) {
         sll.sll_ifindex = ifr.ifr_ifindex;
     }
@@ -304,7 +316,13 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             sll.sll_family = AF_PACKET;
             struct ifreq ifr;
             memset(&ifr, 0, sizeof(ifr));
-            strncpy(ifr.ifr_name, peer->ifname, IFNAMSIZ - 1);
+            // strncpy(ifr.ifr_name, peer->ifname, IFNAMSIZ - 1);
+            if (strlen(peer->ifname) >= sizeof(ifr.ifr_name)) {
+                fprintf(stderr, "[PQC-L2] Error: Interface name '%s' is too long (max %zu chars).\n", 
+                        peer->ifname, sizeof(ifr.ifr_name) - 1);
+                return -1;
+            }
+            snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", peer->ifname);
             if (ioctl(peer->raw_sock_fd, SIOCGIFINDEX, &ifr) >= 0) {
                 sll.sll_ifindex = ifr.ifr_ifindex;
             }
@@ -430,37 +448,31 @@ void pqc_l2_cleanup_peer(struct pqc_l2_peer *peer) {
 
 int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
     if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+        fprintf(stderr, "[PQC-DEBUG] pqc_select_handshake_wan: invalid cfg or profile_idx %d (profile_count %d)\n", profile_idx, cfg ? cfg->profile_count : -1);
         return -1;
     }
     const struct profile_config *p = &cfg->profiles[profile_idx];
+    fprintf(stderr, "[PQC-DEBUG] profile_idx=%d (id=%d name%s wan_count=%d)\n", profile_idx, p->id, p->name, p->wan_count);
     if (p->wan_count <= 0) {
         return -1;
     }
 
-    fprintf(stderr,"p->wan_count=%d\n", p->wan_count);
+    // fprintf(stderr,"[PQC-DEBUG] p->wan_count=%d\n", p->wan_count);
     int chosen_w_idx = p->wan_indices[0];
     for (int w = 0; w < p->wan_count; w++) {
         int w_idx = p->wan_indices[w];
-        // if (w_idx >= 0 && w_idx < cfg->wan_count) {
-        //     if (cfg->wans[w_idx].dst_ip != 0) {
-        //         chosen_w_idx = w_idx;
-        //         break;
-        //     }
-        // }
         if (w_idx >= 0 && w_idx < cfg->wan_count) {
-            unsigned int ip = cfg->wans[w_idx].dst_ip;
-            fprintf(stderr, "[PQC]   -> WAN %d valid. Current dst_ip=0x%08X\n", w_idx, ip);
-
-            if (ip != 0) {
+            char ip_str[32] = "0.0.0.0";
+            struct in_addr addr = { .s_addr = cfg->wans[w_idx].dst_ip };
+            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+            fprintf(stderr, "[PQC-DEBUG]    Checking wan %d: index=%d, name=%s, dst_ip=%s (0x%08X)\n", 
+                     w, w_idx, cfg->wans[w_idx].ifname, ip_str, cfg->wans[w_idx].dst_ip);
+            if (cfg->wans[w_idx].dst_ip != 0) {
                 chosen_w_idx = w_idx;
-                // Log vị trí nhảy vào phần gán WAN chứa IP thành công
-                fprintf(stderr, "[PQC]   ==> SUCCESS: Found active IP! Selected wan_index=%d\n", chosen_w_idx);
                 break;
-            } else {
-                fprintf(stderr, "[PQC]   -> WAN %d skipped (dst_ip is 0)\n", w_idx);
             }
         } else {
-            fprintf(stderr, "[PQC]   -> WARNING: wan_index %d out of bounds (max %d)\n", w_idx, cfg->wan_count);
+            fprintf(stderr, "[PQC-DEBUG] Invalid wan_idx %d in profile (cfg->wan_count %d)\n", w_idx, cfg->wan_count);
         }
     }
     return chosen_w_idx;
@@ -468,18 +480,20 @@ int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
 
 void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_idx, char *out_peer_ip, const char **out_wan_ifname) {
     if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: invalid cfg or profile_idx %d\n", profile_idx);
         return;
     }
     int chosen_idx = pqc_select_handshake_wan(cfg, profile_idx);
+    // fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: chosen_idx %d\n", chosen_idx);
     if (chosen_idx >= 0 && chosen_idx < cfg->wan_count) {
         struct in_addr addr;
         addr.s_addr = cfg->wans[chosen_idx].dst_ip;
         inet_ntop(AF_INET, &addr, out_peer_ip, 64);
         *out_wan_ifname = cfg->wans[chosen_idx].ifname;
 
-        fprintf(stderr, "[PQC-Params] ==> Result for Profile %d:\n", profile_idx);
-        fprintf(stderr, "[PQC-Params]     out_wan_ifname = %s\n", *out_wan_ifname ? *out_wan_ifname : "NULL");
-        fprintf(stderr, "[PQC-Params]     out_peer_ip    = %s\n", out_peer_ip ? out_peer_ip : "NULL");
+        // fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: Resolved to wan_ifname=%s peer_ip=%s\n", *out_wan_ifname, out_peer_ip);
+    } else {
+        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: Failed to choose wan\n");
     }
 }
 
@@ -510,4 +524,3 @@ void pqc_handshake_start_all_profiles(struct app_config *cfg) {
         }
     }
 }
-

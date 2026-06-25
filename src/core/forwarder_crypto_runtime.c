@@ -19,14 +19,14 @@ static uint64_t monotonic_ms(void)
 static struct packet_crypto_ctx base_crypto_ctx;
 static struct packet_crypto_ctx policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int policy_crypto_ready[MAX_CRYPTO_POLICIES];
-static int policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
-static int policy_profile_id_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
+static int policy_index_by_wire_id[256];
+static int policy_profile_id_by_wire_id[256];
 static struct crypto_policy active_policies[MAX_CRYPTO_POLICIES];
 static int active_policy_count;
 static struct packet_crypto_ctx prev_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int prev_policy_crypto_ready[MAX_CRYPTO_POLICIES];
-static int prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
-static int prev_policy_profile_id_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
+static int prev_policy_index_by_wire_id[256];
+static int prev_policy_profile_id_by_wire_id[256];
 static struct crypto_policy prev_active_policies[MAX_CRYPTO_POLICIES];
 static int prev_active_policy_count;
 static int prev_grace_active;
@@ -157,9 +157,9 @@ void fwd_crypto_snapshot_active_to_prev(void)
 {
     memcpy(prev_policy_crypto_ctx, policy_crypto_ctx, sizeof(prev_policy_crypto_ctx));
     memcpy(prev_policy_crypto_ready, policy_crypto_ready, sizeof(prev_policy_crypto_ready));
-    memcpy(prev_policy_index_by_action_id, policy_index_by_action_id, sizeof(prev_policy_index_by_action_id));
-    memcpy(prev_policy_profile_id_by_action_id, policy_profile_id_by_action_id,
-           sizeof(prev_policy_profile_id_by_action_id));
+    memcpy(prev_policy_index_by_wire_id, policy_index_by_wire_id, sizeof(prev_policy_index_by_wire_id));
+    memcpy(prev_policy_profile_id_by_wire_id, policy_profile_id_by_wire_id,
+           sizeof(prev_policy_profile_id_by_wire_id));
     memcpy(prev_active_policies, active_policies, sizeof(prev_active_policies));
     prev_active_policy_count = active_policy_count;
     prev_grace_active = (prev_active_policy_count > 0) ? 1 : 0;
@@ -183,10 +183,8 @@ static int crypto_action_valid(int action)
 
 static void crypto_runtime_reset_indexes(void)
 {
-    for (int a = 0; a <= POLICY_ACTION_ENCRYPT_L4; a++) {
-        for (int id = 0; id < 256; id++)
-            policy_index_by_action_id[a][id] = -1;
-    }
+    for (int id = 0; id < 256; id++)
+        policy_index_by_wire_id[id] = -1;
 }
 
 void forwarder_pre_diversify_pqc_keys(int profile_id)
@@ -205,19 +203,19 @@ int fwd_crypto_rebuild(struct app_config *cfg)
 {
     struct packet_crypto_ctx old_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
     int old_policy_crypto_ready[MAX_CRYPTO_POLICIES];
-    int old_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
+    int old_policy_index_by_wire_id[256];
     struct crypto_policy old_active_policies[MAX_CRYPTO_POLICIES];
     int old_active_policy_count = active_policy_count;
     memcpy(old_policy_crypto_ctx, policy_crypto_ctx, sizeof(old_policy_crypto_ctx));
     memcpy(old_policy_crypto_ready, policy_crypto_ready, sizeof(old_policy_crypto_ready));
-    memcpy(old_policy_index_by_action_id, policy_index_by_action_id, sizeof(old_policy_index_by_action_id));
+    memcpy(old_policy_index_by_wire_id, policy_index_by_wire_id, sizeof(old_policy_index_by_wire_id));
     memcpy(old_active_policies, active_policies, sizeof(old_active_policies));
 
     memset(policy_crypto_ready, 0, sizeof(policy_crypto_ready));
     memset(active_policies, 0, sizeof(active_policies));
     active_policy_count = 0;
     crypto_runtime_reset_indexes();
-    memset(policy_profile_id_by_action_id, -1, sizeof(policy_profile_id_by_action_id));
+    memset(policy_profile_id_by_wire_id, -1, sizeof(policy_profile_id_by_wire_id));
 
     if (!cfg || !cfg->crypto_enabled)
         return 0;
@@ -243,11 +241,11 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         if (!crypto_action_valid(cp->action))
             continue;
         if (cp->id >= 0 && cp->id <= 255)
-            policy_index_by_action_id[cp->action][(uint8_t)cp->id] = i;
+            policy_index_by_wire_id[(uint8_t)cp->id] = i;
 
         int reused = 0;
         if (cp->id >= 0 && cp->id <= 255) {
-            int old_i = old_policy_index_by_action_id[cp->action][(uint8_t)cp->id];
+            int old_i = old_policy_index_by_wire_id[(uint8_t)cp->id];
             if (old_i >= 0 && old_i < old_active_policy_count && old_policy_crypto_ready[old_i]) {
                 const struct crypto_policy *old_cp = &old_active_policies[old_i];
                 if (old_cp->crypto_mode == cp->crypto_mode &&
@@ -289,13 +287,13 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             if (!crypto_action_valid(cp->action))
                 continue;
             if (cp->id >= 0 && cp->id <= 255) {
-                int old_pid = policy_profile_id_by_action_id[cp->action][(uint8_t)cp->id];
+                int old_pid = policy_profile_id_by_wire_id[(uint8_t)cp->id];
                 if (old_pid > 0 && old_pid != p->id) {
                     fprintf(stderr,
-                            "[RELOAD] policy id collision action=%d id=%d profile=%d conflicts with profile=%d (warn)\n",
-                            cp->action, cp->id, p->id, old_pid);
+                            "[RELOAD] wire id collision id=%d profile=%d conflicts with profile=%d (warn)\n",
+                            cp->id, p->id, old_pid);
                 }
-                policy_profile_id_by_action_id[cp->action][(uint8_t)cp->id] = p->id;
+                policy_profile_id_by_wire_id[(uint8_t)cp->id] = p->id;
             }
             if (cp->crypto_mode == CRYPTO_MODE_PQC && policy_crypto_ready[pi]) {
                 policy_crypto_ctx[pi].profile_id = p->id;
@@ -318,28 +316,26 @@ struct crypto_dispatch_ctx fwd_crypto_make_dispatch_ctx(void)
     dctx.per_policy_ready = policy_crypto_ready;
     dctx.policies = active_policies;
     dctx.policy_count = active_policy_count;
-    dctx.policy_index_by_action_id = policy_index_by_action_id;
+    dctx.policy_index_by_wire_id = policy_index_by_wire_id;
     dctx.prev_per_policy_ctx = prev_policy_crypto_ctx;
     dctx.prev_per_policy_ready = prev_policy_crypto_ready;
     dctx.prev_policies = prev_active_policies;
     dctx.prev_policy_count = prev_active_policy_count;
-    dctx.prev_policy_index_by_action_id = prev_policy_index_by_action_id;
+    dctx.prev_policy_index_by_wire_id = prev_policy_index_by_wire_id;
     dctx.prev_grace_active = prev_grace_active;
     return dctx;
 }
 
-struct packet_crypto_ctx *fwd_crypto_ctx_for_policy_action_id(int action, uint8_t id)
+struct packet_crypto_ctx *fwd_crypto_ctx_for_wire_id(uint8_t wire_id)
 {
     fwd_crypto_maybe_expire_prev_grace();
-    if (action < 0 || action > POLICY_ACTION_ENCRYPT_L4)
-        return NULL;
-    int pi = policy_index_by_action_id[action][id];
+    int pi = policy_index_by_wire_id[wire_id];
     if (pi >= 0 && pi < active_policy_count && policy_crypto_ready[pi]) {
         crypto_apply_from_policy(&active_policies[pi]);
         return &policy_crypto_ctx[pi];
     }
     if (prev_grace_active) {
-        int ppi = prev_policy_index_by_action_id[action][id];
+        int ppi = prev_policy_index_by_wire_id[wire_id];
         if (ppi >= 0 && ppi < prev_active_policy_count && prev_policy_crypto_ready[ppi]) {
             crypto_apply_from_policy(&prev_active_policies[ppi]);
             return &prev_policy_crypto_ctx[ppi];
@@ -348,16 +344,14 @@ struct packet_crypto_ctx *fwd_crypto_ctx_for_policy_action_id(int action, uint8_
     return NULL;
 }
 
-int fwd_crypto_profile_id_for_policy_action_id(int action, uint8_t id)
+int fwd_crypto_profile_id_for_wire_id(uint8_t wire_id)
 {
     fwd_crypto_maybe_expire_prev_grace();
-    if (action < 0 || action > POLICY_ACTION_ENCRYPT_L4)
-        return -1;
-    int pid = policy_profile_id_by_action_id[action][id];
+    int pid = policy_profile_id_by_wire_id[wire_id];
     if (pid > 0)
         return pid;
     if (prev_grace_active) {
-        int old_pid = prev_policy_profile_id_by_action_id[action][id];
+        int old_pid = prev_policy_profile_id_by_wire_id[wire_id];
         if (old_pid > 0)
             return old_pid;
     }
@@ -427,7 +421,7 @@ int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len)
     uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
     if (et != fake)
         return 0;
-    return policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][pkt[CRYPTO_L2_POLICY_OFF]] >= 0;
+    return policy_index_by_wire_id[pkt[CRYPTO_L2_POLICY_OFF]] >= 0;
 }
 
 struct frag_table *fwd_crypto_frag_l2(int slot, int worker_idx)
@@ -459,7 +453,8 @@ void fwd_crypto_reset_on_init(void)
     prev_grace_active = 0;
     prev_grace_until_ms = 0;
     memset(prev_policy_crypto_ready, 0, sizeof(prev_policy_crypto_ready));
-    memset(prev_policy_index_by_action_id, -1, sizeof(prev_policy_index_by_action_id));
+    memset(prev_policy_index_by_wire_id, -1, sizeof(prev_policy_index_by_wire_id));
+    memset(prev_policy_profile_id_by_wire_id, -1, sizeof(prev_policy_profile_id_by_wire_id));
     memset(prev_active_policies, 0, sizeof(prev_active_policies));
     memset(profile_flow_table_ready, 0, sizeof(profile_flow_table_ready));
     memset(profile_flow_profile_id, 0, sizeof(profile_flow_profile_id));

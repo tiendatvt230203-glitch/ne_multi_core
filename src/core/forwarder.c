@@ -242,7 +242,9 @@ static void crypto_worker_tick(struct forwarder *fwd, int is_primary)
     fwd_wan_drain_tick(fwd);
     fwd_wan_weight_blend_tick();
     fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
-    mac_learn_flush_if_dirty(&fwd->mac_table);
+    // MAC_LEARN
+    mac_learn_tick(fwd);
+    // MAC_LEARN
 }
 
 static void *crypto_worker_thread(void *arg)
@@ -393,11 +395,9 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     }
 
     fwd_wan_reset_on_init(fwd);
-
-    mac_learn_init(&fwd->mac_table);
-    if (mac_learn_load(&fwd->mac_table) != 0)
-        fprintf(stderr, "[MAC] load failed — starting with empty table\n");
-
+    // MAC_LEARN
+    mac_learn_bootstrap(&fwd->mac_table);
+    // MAC_LEARN
     atomic_store_explicit(&running, 1, memory_order_release);
     return 0;
 }
@@ -406,8 +406,9 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
-    mac_learn_save(&fwd->mac_table);
-    pthread_spin_destroy(&fwd->mac_table.lock);
+    // MAC_LEARN
+    mac_learn_shutdown(&fwd->mac_table);
+    // MAC_LEARN
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
         ne_ring_destroy(&fwd->local_to_mid[w]);
         ne_ring_destroy(&fwd->wan_to_mid[w]);

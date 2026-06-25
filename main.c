@@ -64,9 +64,13 @@ struct runtime_state {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s                    daemon, wait NOTIFY xdp_start\n"
-            "  %s -id <profile_id>   notify daemon (load / unload / reload)\n",
-            prog, prog);
+            "  %s               # daemon mode (LISTEN %s)\n"
+            "  %s -gi            # generate new identity key and load into RAM\n"
+            "  %s -check-identity # check PQC DB identity integrity and link to RAM cache\n"
+            "  %s -id <ID>       # notify daemon to apply config already stored in DB\n"
+            "  %s -check [ID]    # check database config consistency\n"
+            "  %s -r <policy_id> # trigger manual handshake retry for policy\n",
+            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog);
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {
@@ -800,8 +804,23 @@ static int handle_profile_notify(struct runtime_state *rt,
     }
     return 0;
 }
+static void handle_shutdown_signal(int sig) {
+    (void)sig;
+    sig_pqc_cleanup_ipc();
+    exit(0);
+}
 
 int main(int argc, char **argv) {
+    int ipc_rc = sig_pqc_handle_ipc_cli(argc, argv);
+    if (ipc_rc >= 0) {
+        return ipc_rc;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "-gi") == 0) {
+        sig_pqc_handle_gen_identity();
+        return 0;
+    }
+
     setbuf(stderr, NULL);
     if (trf_pqc_init_global() != TRF_PQC_OK) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
@@ -863,7 +882,10 @@ int main(int argc, char **argv) {
                 "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD in " NE_ENV_FILE "\n");
         return 1;
     }
+    signal(SIGTERM, handle_shutdown_signal);
+    signal(SIGINT, handle_shutdown_signal);
 
+    sig_pqc_start_ipc_server();
     libbpf_set_print(libbpf_print_silent);
 
     struct sigaction sa = { .sa_handler = on_stop_signal };

@@ -81,7 +81,7 @@ int run_db_check(const char *const *keywords, const char *const *values, int onl
         return 1;
     }
 
-    fprintf(stdout, "[CHECK] NE profile summary (ne_profiles / ne_lan / ne_wan / ne_policies):\n");
+    fprintf(stdout, "[CHECK] NE profile summary:\n");
     for (int i = 0; i < rows; i++) {
         fprintf(stdout,
                 "  profile_id=%s policies=%s lan=%s wan=%s\n",
@@ -349,15 +349,8 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
             return -1;
     }
 
-    merged.crypto_enabled = (merged.policy_count > 0) ? 1 : 0;
-    if (merged.crypto_enabled) {
-        merged.encrypt_layer = 3;
-        merged.fake_protocol = 99;
-        merged.fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
-        merged.crypto_mode = merged.policies[0].crypto_mode;
-        merged.aes_bits = merged.policies[0].aes_bits;
-        memcpy(merged.crypto_key, merged.policies[0].key, sizeof(merged.crypto_key));
-    }
+    if (config_apply_crypto_from_policies(&merged) != 0)
+        return -1;
 
     if (config_validate(&merged) != 0)
         return -1;

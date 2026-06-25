@@ -11,7 +11,6 @@ VALUES (
     TRUE, FALSE, FALSE, 'seed'
 );
 
-
 INSERT INTO ne_policies (
     id, profile_id, priority, action, proto,
     src_ip, invert_src_ip, dst_ip, invert_dst_ip,
@@ -19,20 +18,17 @@ INSERT INTO ne_policies (
 ) VALUES
 (
     100, 30, 1, 'L2', 'tcp/udp',
-    ARRAY['192.168.50.2/32']::text[], FALSE,
-    ARRAY['192.168.50.3/32']::text[], FALSE,
+    ARRAY['192.168.70.2/32']::text[], FALSE,
+    ARRAY['192.168.70.3/32']::text[], FALSE,
     NULL, ARRAY['7020']::text[],
     'aes-gcm-128', 'aac816a88e013feb4925f9f2af602b3s', 'seed'
 );
 
-
-INSERT INTO ne_lan (interface, profile_id, created_by) VALUES
-    ('enp5s0', 30, 'seed'),
-    ('enp6s0', 30, 'seed');
+INSERT INTO ne_lan (interface  profile_id, created_by) VALUES
+    ('eno3', 30, 'seed');
 
 INSERT INTO ne_wan (interface, profile_id, dst_ip, weight, created_by) VALUES
-    ('eno1', 30, NULL, 50, 'seed'),
-    ('eno2', 30, NULL, 50, 'seed');
+    ('eno4', 30, NULL, 100, 'seed');
 
 SELECT setval(pg_get_serial_sequence('ne_profiles', 'id')::regclass,
     COALESCE((SELECT MAX(id) FROM ne_profiles), 1), true);

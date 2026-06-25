@@ -84,7 +84,6 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
         job->len = (uint32_t)n;
         return 0;
     }
-
     if (push_split_to_wan(fwd, job, l1, f2, l2, wan_dp) != 0)
         return -1;
     return 1;
@@ -148,12 +147,12 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)
         goto drop;
-
-    mac_learn_local_ingress(fwd, li, pkt);
-
+    // MAC_LEARN
+    mac_learn_local(fwd, li, pkt);
+    // MAC_LEARN
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd, wan_dp))
+    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))
         goto drop;
 
     if (cp->action == POLICY_ACTION_BYPASS) {

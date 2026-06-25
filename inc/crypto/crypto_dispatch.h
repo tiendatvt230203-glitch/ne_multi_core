@@ -14,12 +14,12 @@ struct crypto_dispatch_ctx {
     int *per_policy_ready;                             
     struct crypto_policy *policies;
     int policy_count;
-    int (*policy_index_by_action_id)[256];
+    int *policy_index_by_wire_id;
     struct packet_crypto_ctx *prev_per_policy_ctx;
     int *prev_per_policy_ready;
     struct crypto_policy *prev_policies;
     int prev_policy_count;
-    int (*prev_policy_index_by_action_id)[256];
+    int *prev_policy_index_by_wire_id;
     int prev_grace_active;
 };
 
@@ -43,5 +43,4 @@ int crypto_decrypt_packet_auto_by_action(
     uint8_t *pkt, uint32_t *pkt_len,
     uint8_t *scratch, size_t scratch_sz);
 
-#endif 
-
+#endif

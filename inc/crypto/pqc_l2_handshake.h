@@ -3,14 +3,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "types.h"
-#include "crypto_layer2.h"
+#include "types.h" // For SCryptCipherCtx, byte, etc.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define PQC_ETH_TYPE_DISCOVERY NE_L2_FAKE_ETHERTYPE
+#define PQC_ETH_TYPE_DISCOVERY 0x88B5
 #define PQC_ETH_TYPE_HANDSHAKE 0x88B6
 #define PQC_L2_MAGIC           0x5051 // "PQ" in hex
 
@@ -42,14 +41,14 @@ struct pqc_frag_hdr {
 
 // 3. Reassembly state buffer
 struct pqc_l2_reassemble {
-    uint32_t msg_id;
     uint8_t  *data_buffer;
-    uint32_t total_len;
-    uint16_t frag_received;
-    uint16_t frag_count;
     uint8_t  *frag_bitmap;  // Bitmap to prevent duplicate fragment processing
     uint64_t start_time_ms; // Timestamp to handle drop timeout
     struct pqc_l2_reassemble* next; // Linked list pointer for active assemblies
+    uint32_t msg_id;
+    uint32_t total_len;
+    uint16_t frag_received;
+    uint16_t frag_count;
 };
 
 // Peer node MAC state
@@ -109,7 +108,7 @@ int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx);
 void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_idx, char *out_peer_ip, const char **out_wan_ifname);
 
 /**
- * Start handshake for profiles that have local_identity_fingerprint configured.
+ * Run handshake initialization across all configured profiles.
  */
 void pqc_handshake_start_all_profiles(struct app_config *cfg);
 

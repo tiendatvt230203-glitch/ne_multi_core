@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* --- config ifname helpers --- */
+
 
 void profile_iface_xdp_prepare_init(const struct app_config *cfg)
 {
@@ -23,8 +23,6 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
     interface_ip_xdp_off_config(cfg);
     interface_reset_redirect_maps();
 }
-
-/* --- ifname / profile helpers --- */
 
 static int cfg_has_wan_ifname(const struct app_config *cfg, const char *ifname)
 {

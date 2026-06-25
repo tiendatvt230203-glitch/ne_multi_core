@@ -5,7 +5,7 @@
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/types.h"
 #include "../../inc/crypto/traffic_crypto.h"
-#include "../../inc/scrypt.h"
+#include "../../inc/crypto/scrypt.h"
 #include <string.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>

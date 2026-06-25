@@ -9,7 +9,7 @@
 #include <libpq-fe.h>
 #include <strings.h>
 #include <openssl/sha.h>
-#include "../inc/crypto/pqc_handshake.h"
+#include "../../inc/crypto/pqc_handshake.h"
 
 static int str_is_any(const char *v) {
     if (!v) return 1;
@@ -309,27 +309,6 @@ static int find_wan_index_by_ifname(const struct app_config *cfg, const char *if
 }
 
 
-static int db_pick_handshake_wan(const struct app_config *cfg,
-                                 char peer_ip[64], char *wan_ifname, size_t wan_sz)
-{
-    if (!cfg || !peer_ip || !wan_ifname || wan_sz == 0)
-        return -1;
-    peer_ip[0] = '\0';
-    wan_ifname[0] = '\0';
-    for (int i = 0; i < cfg->wan_count; i++) {
-        const struct wan_config *w = &cfg->wans[i];
-        if (w->dst_ip == 0)
-            continue;
-        struct in_addr addr;
-        addr.s_addr = w->dst_ip;
-        inet_ntop(AF_INET, &addr, peer_ip, 64);
-        strncpy(wan_ifname, w->ifname, wan_sz - 1);
-        wan_ifname[wan_sz - 1] = '\0';
-        return 0;
-    }
-    return -1;
-}
-
 static void profile_append_locals_from_rows(struct app_config *cfg,
                                             struct profile_config *p,
                                             PGresult *res) {
@@ -424,25 +403,25 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
     res = PQexecParams(conn,
         "SELECT interface AS ifname, weight AS bandwidth_weight_percent "
-        "FROM ne_wan WHERE profile_id = $1 ORDER BY created_at",
+        "FROM ne_wan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
     profile_append_wans_from_rows(cfg, p, res);
     PQclear(res);
 
     res = PQexecParams(conn,
         "SELECT interface AS ifname "
-        "FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
+        "FROM ne_lan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
     profile_append_locals_from_rows(cfg, p, res);
     PQclear(res);
 
     res = PQexecParams(conn,
-        "SELECT id, priority, action::text, proto::text, "
+        "SELECT id, priority, action, protocol, "
         "array_to_string(src_ip, ','), invert_src_ip, "
         "array_to_string(dst_ip, ','), invert_dst_ip, "
         "array_to_string(src_port, ','), "
         "array_to_string(dst_port, ','), "
-        "method::text, encryption_key "
+        "method, encryption_key "
         "FROM ne_policies WHERE profile_id = $1 ORDER BY priority ASC, id ASC",
         1, NULL, params, NULL, NULL, 0);
 
@@ -490,81 +469,18 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         } else {
             (void)ne_parse_method(method_txt, method_null, &cp_base.crypto_mode, &cp_base.aes_bits);
             if (cp_base.crypto_mode == CRYPTO_MODE_PQC) {
-                    char peer_ip[64];
-                    char wan_ifname[IF_NAMESIZE];
-                    if (db_pick_handshake_wan(cfg, peer_ip, wan_ifname, sizeof(wan_ifname)) != 0) {
-                        fprintf(stderr,
-                                "[DB-PQC] ERROR: Policy %d — no ne_wan row with dst_ip for handshake\n",
-                                db_policy_id);
-                    }
-
-                    char policy_id_str[32];
-                    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
-                    const char *pqc_params[1] = { policy_id_str };
-                    PGresult *peer_res = PQexecParams(conn,
-                        "SELECT local_identity_fingerprint, peer_pub, peer_fingerprint, is_initiator "
-                        "FROM pqc_identities WHERE policy_id = $1",
-                        1, NULL, pqc_params, NULL, NULL, 0);
-
-                    if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
-                        const char *local_fg = PQgetvalue(peer_res, 0, 0);
-                        const char *peer_pub = PQgetvalue(peer_res, 0, 1);
-                        const char *peer_fg = (PQnfields(peer_res) > 2) ? PQgetvalue(peer_res, 0, 2) : NULL;
-                        const char *is_init_str = (PQnfields(peer_res) > 3) ? PQgetvalue(peer_res, 0, 3) : NULL;
-                        bool is_init = true;
-                        if (is_init_str) {
-                            is_init = (is_init_str[0] == 't' || is_init_str[0] == '1' || is_init_str[0] == 'T');
-                        }
-
-                        int role_mode = PQC_ROLE_RESPONDER;
-                        if (PQC_USE_DYNAMIC_ROLE) {
-                            role_mode = PQC_ROLE_DYNAMIC;
-                        } else {
-                            role_mode = is_init ? PQC_ROLE_INITIATOR : PQC_ROLE_RESPONDER;
-                        }
-
-                        bool valid = true;
-                        if (!local_fg || strlen(local_fg) == 0) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d missing local_identity_fingerprint\n", db_policy_id);
-                            valid = false;
-                        }
-                        if (!peer_pub || strlen(peer_pub) == 0) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d missing peer_pub\n", db_policy_id);
-                            valid = false;
-                        }
-
-                        char *found_priv = NULL;
-                        char *found_pub = NULL;
-                        if (valid) {
-                            sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
-                            if (!found_priv || !found_pub) {
-                                fprintf(stderr, "[DB-PQC] ERROR: Policy %d keys not in registry [%s]\n",
-                                        db_policy_id, local_fg);
-                                valid = false;
-                            }
-                        }
-                        if (valid && wan_ifname[0] != '\0' && peer_ip[0] != '\0') {
-                            int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
-                            if (wire_id < 0) {
-                                fprintf(stderr, "[DB CRYPTO] no free wire policy id for PQC policy %d\n",
-                                        db_policy_id);
-                                PQclear(peer_res);
-                                PQclear(res);
-                                return -1;
-                            }
-                            cp_base.id = wire_id;
-                            cp_base.aes_bits = 256;
-                            memset(cp_base.key, 0, sizeof(cp_base.key));
-                            sig_pqc_bind_policy(db_policy_id, p->id, role_mode, peer_ip,
-                                                local_fg, peer_fg, wan_ifname,
-                                                found_priv, found_pub, peer_pub);
-                        } else if (valid) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d missing handshake WAN/IP\n", db_policy_id);
-                        }
-                    } else {
-                        fprintf(stderr, "[DB-PQC] ERROR: No pqc_identities for policy %d\n", db_policy_id);
-                    }
-                    PQclear(peer_res);
+                const int profile_pi = cfg->profile_count - 1;
+                sig_pqc_load_and_bind_policy(conn, cfg, profile_pi, db_policy_id, p->id);
+                int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
+                if (wire_id < 0) {
+                    fprintf(stderr, "[DB CRYPTO] no free wire policy id for PQC policy %d\n",
+                            db_policy_id);
+                    PQclear(res);
+                    return -1;
+                }
+                cp_base.id = wire_id;
+                cp_base.aes_bits = 256;
+                memset(cp_base.key, 0, sizeof(cp_base.key));
             }
             else {
                 if (cp_base.aes_bits != 256)
@@ -753,7 +669,7 @@ static int db_load_lan_for_profile(PGconn *conn, struct app_config *cfg, int pro
 
     PGresult *res = PQexecParams(conn,
         "SELECT interface AS ifname "
-        "FROM ne_lan WHERE profile_id = $1 ORDER BY created_at",
+        "FROM ne_lan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -776,7 +692,8 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, dst_ip::text AS dst_ip FROM ne_wan WHERE profile_id = $1 ORDER BY created_at",
+        "SELECT interface AS ifname, host(dst_ip)::text AS dst_ip "
+        "FROM ne_wan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -793,7 +710,7 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     return 0;
 }
 
-static int apply_crypto_derived_from_policies(struct app_config *cfg) {
+int config_apply_crypto_from_policies(struct app_config *cfg) {
     cfg->crypto_enabled = 0;
     cfg->encrypt_layer = 0;
     cfg->fake_protocol = 0;
@@ -891,7 +808,7 @@ int config_load_from_db(struct app_config *cfg, int profile_id, const char *conn
 
     PQfinish(conn);
 
-    if (apply_crypto_derived_from_policies(cfg) != 0)
+    if (config_apply_crypto_from_policies(cfg) != 0)
         return -1;
 
     return config_validate(cfg);

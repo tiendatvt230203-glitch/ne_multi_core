@@ -30,9 +30,13 @@ echo "[OK] schema.sql applied"
 n=$(ne_psql -t -A -c "
 SELECT COUNT(*) FROM information_schema.tables
 WHERE table_schema = 'public'
-  AND table_name IN ('ne_profiles','ne_policies','ne_lan','ne_wan');")
-if [ "${n:-0}" != "4" ]; then
-  echo "[FATAL] expected 4 ne_* tables, found ${n:-?}" >&2
+  AND table_name IN (
+    'ne_profiles','ne_policies','ne_lan','ne_wan',
+    'bridges','bridge_interfaces','pqc_keys','pqc_exchange_tunnels',
+    'policy_pqc_ref','profile_tunnel_ref','profile_bridge_ref'
+  );")
+if [ "${n:-0}" != "11" ]; then
+  echo "[FATAL] expected 11 schema tables, found ${n:-?}" >&2
   exit 1
 fi
-echo "[OK] ne_profiles, ne_policies, ne_lan, ne_wan"
+echo "[OK] ne_profiles, ne_policies, ne_lan, ne_wan, bridges, pqc_keys, ..."

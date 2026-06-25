@@ -11,6 +11,7 @@
 
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/interface.h"
 #include "../../inc/core/mac_learn.h"
 
 #include <string.h>
@@ -41,13 +42,22 @@ static int wan_l2_plain_ipv4(const uint8_t *pkt, uint32_t len)
     return (((uint16_t)pkt[12] << 8) | pkt[13]) == 0x0800;
 }
 
+static int wan_is_bypass_plain(const uint8_t *pkt, uint32_t len)
+{
+    return wan_l2_plain_ipv4(pkt, len);
+}
+
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
     uint16_t pid = 0;
     uint8_t fidx = 0;
     uint8_t pol = 0;
 
-    if (!fwd->cfg->crypto_enabled || !pkt)
+    if (!pkt)
+        return 0;
+    if (wan_is_bypass_plain(pkt, len))
+        return 1;
+    if (!fwd->cfg || !fwd->cfg->crypto_enabled)
         return 0;
     if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx) ||
         frag_is_fragment(fwd->cfg, pkt, len, &pid, &fidx) ||
@@ -72,7 +82,7 @@ static int decrypt_l2(uint8_t *pkt, uint32_t *len)
         return 0;
     if ((((uint16_t)pkt[12] << 8) | pkt[13]) != fake)
         return 0;
-    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, pkt[CRYPTO_L2_POLICY_OFF]);
+    ctx = fwd_crypto_ctx_for_wire_id(pkt[CRYPTO_L2_POLICY_OFF]);
     if (!ctx)
         return -1;
     n = crypto_layer2_decrypt(ctx, pkt, *len);
@@ -92,11 +102,11 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t buf[4096];
     uint32_t blen = 0;
 
-    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
+    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
     if (!ctx)
         return -1;
     slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id));
+        fwd_crypto_profile_id_for_wire_id(policy_id));
     if (slot < 0)
         return -1;
     nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
@@ -125,11 +135,11 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t buf[4096];
     uint32_t blen = 0;
 
-    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L3, policy_id);
+    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
     if (!ctx)
         return -1;
     slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L3, policy_id));
+        fwd_crypto_profile_id_for_wire_id(policy_id));
     if (slot < 0)
         return -1;
     nd = crypto_layer3_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
@@ -157,11 +167,11 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t buf[4096];
     uint32_t blen = 0;
 
-    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L4, policy_id);
+    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
     if (!ctx)
         return -1;
     slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L4, policy_id));
+        fwd_crypto_profile_id_for_wire_id(policy_id));
     if (slot < 0)
         return -1;
     nd = crypto_layer4_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
@@ -260,16 +270,21 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
-    int profile_pi;
+    uint8_t wire_buf[NE_FRAME];
+    uint32_t wire_len;
     int dec;
 
-    if (!fwd || !pkt || job.len < 14u)
+    if (!fwd || !pkt)
         goto drop;
+
+    wire_len = job.len;
+    if (wire_len < 14u || wire_len > NE_FRAME)
+        goto drop;
+    memcpy(wire_buf, pkt, wire_len);
 
     if (!wan_has_crypto(fwd, pkt, job.len))
         goto drop;
 
-    profile_pi = mac_learn_wan_profile_pi(fwd, pkt, job.len);
     dec = decrypt_wan(fwd, &job);
     if (dec == 1) {
         ne_frame_free(&fwd->pair, job.addr);
@@ -278,7 +293,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     if (dec != 0)
         goto drop;
 
-    if (mac_learn_wan_forward(fwd, &job, profile_pi) != 0)
+    if (mac_learn_wan(fwd, &job, wire_buf, wire_len) != 0)
         goto drop;
     return;
 

@@ -139,7 +139,8 @@ void interface_ip_xdp_off(const char *ifname)
         return;
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
-    (void)system(cmd);
+    if (system(cmd) != 0)
+        fprintf(stderr, "[IF] warning: failed to run: %s\n", cmd);
 }
 
 void interface_ip_xdp_off_config(const struct app_config *cfg)
