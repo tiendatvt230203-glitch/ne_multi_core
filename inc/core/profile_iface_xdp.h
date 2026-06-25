@@ -30,6 +30,11 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
 int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, int dp_slot,
                                uint16_t fake_ethertype_ipv4);
 
+void profile_iface_xdp_detach_local(struct ne_pair *p, int pair_li);
+void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot);
+void profile_iface_xdp_detach_ifname(const char *ifname);
+void profile_iface_xdp_detach_config(const struct app_config *cfg);
+
 int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
                                   enum profile_iface_xdp_reload_mode mode,
                                   int trigger_profile_id);

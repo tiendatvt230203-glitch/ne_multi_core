@@ -1,4 +1,5 @@
 #include "../../inc/core/interface.h"
+#include "../../inc/core/profile_iface_xdp.h"
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
 #include <net/if.h>
@@ -131,26 +132,6 @@ static int ifname_is_safe(const char *ifname)
             return 0;
     }
     return 1;
-}
-
-void interface_ip_xdp_off(const char *ifname)
-{
-    if (!ifname || !ifname[0] || !ifname_is_safe(ifname))
-        return;
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
-    if (system(cmd) != 0)
-        fprintf(stderr, "[IF] warning: failed to run: %s\n", cmd);
-}
-
-void interface_ip_xdp_off_config(const struct app_config *cfg)
-{
-    if (!cfg)
-        return;
-    for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++)
-        interface_ip_xdp_off(cfg->locals[i].ifname);
-    for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++)
-        interface_ip_xdp_off(cfg->wans[i].ifname);
 }
 
 static int interface_set_promisc_off(const char *ifname)
@@ -583,10 +564,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     return 0;
 
 fail:
-    for (int i = 0; i < p->local_count && i < MAX_INTERFACES; i++)
-        interface_ip_xdp_off(p->locals[i].ifname);
-    for (int i = 0; i < p->wan_count && i < MAX_INTERFACES; i++)
-        interface_ip_xdp_off(p->wans[i].ifname);
+    profile_iface_xdp_detach_config(cfg);
     ne_pair_close(p);
     return -1;
 #undef NE_TRY
@@ -596,14 +574,10 @@ void ne_pair_close(struct ne_pair *p)
 {
     if (!p)
         return;
-    for (int i = 0; i < p->local_count; i++) {
-        if (p->bpf_locals[i])
-            bpf_object__close(p->bpf_locals[i]);
-    }
-    for (int i = 0; i < p->wan_count; i++) {
-        if (p->bpf_wans[i])
-            bpf_object__close(p->bpf_wans[i]);
-    }
+    for (int i = 0; i < p->local_count; i++)
+        profile_iface_xdp_detach_local(p, i);
+    for (int i = 0; i < p->wan_count; i++)
+        profile_iface_xdp_detach_wan(p, i);
     for (int i = 0; i < p->wan_count; i++) {
         for (int q = 0; q < p->wans[i].queue_count; q++) {
             if (p->wans[i].queues[q].xsk)
@@ -701,15 +675,10 @@ void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
     if (!p || pair_li < 0 || pair_li >= p->local_count || !p->local_live[pair_li])
         return;
 
-    interface_ip_xdp_off(p->locals[pair_li].ifname);
-    p->xdp_local_on[pair_li] = 0;
+    profile_iface_xdp_detach_local(p, pair_li);
     p->local_live[pair_li] = 0;
     int nq = p->locals[pair_li].queue_count;
     p->locals[pair_li].queue_count = 0;
-    if (p->bpf_locals[pair_li]) {
-        bpf_object__close(p->bpf_locals[pair_li]);
-        p->bpf_locals[pair_li] = NULL;
-    }
     for (int q = 0; q < nq; q++) {
         if (p->locals[pair_li].queues[q].xsk) {
             xsk_socket__delete(p->locals[pair_li].queues[q].xsk);
@@ -723,15 +692,10 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
     if (!p || dp_slot < 0 || dp_slot >= p->wan_count || !p->wan_live[dp_slot])
         return;
 
-    interface_ip_xdp_off(p->wans[dp_slot].ifname);
-    p->xdp_wan_on[dp_slot] = 0;
+    profile_iface_xdp_detach_wan(p, dp_slot);
     p->wan_live[dp_slot] = 0;
     int nq = p->wans[dp_slot].queue_count;
     p->wans[dp_slot].queue_count = 0;
-    if (p->bpf_wans[dp_slot]) {
-        bpf_object__close(p->bpf_wans[dp_slot]);
-        p->bpf_wans[dp_slot] = NULL;
-    }
     for (int q = 0; q < nq; q++) {
         if (p->wans[dp_slot].queues[q].xsk) {
             xsk_socket__delete(p->wans[dp_slot].queues[q].xsk);

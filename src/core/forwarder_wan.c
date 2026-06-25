@@ -1,4 +1,5 @@
 #include "../../inc/core/forwarder_wan.h"
+#include "../../inc/core/profile_iface_xdp.h"
 
 #include "../../inc/core/crypto_route.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
@@ -132,7 +133,7 @@ static void wan_drain_finish_slot(struct forwarder *fwd, int dp)
         return;
 
     uint32_t dropped = fwd_wan_flush_queue(fwd, dp);
-    interface_ip_xdp_off(wan_drains[dp].ifname);
+    profile_iface_xdp_detach_wan(&fwd->pair, dp);
     wan_stopped[dp] = 1;
     wan_drains[dp].active = 0;
     fprintf(stderr,

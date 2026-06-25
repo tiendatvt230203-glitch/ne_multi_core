@@ -7,12 +7,87 @@
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <ctype.h>
 #include <errno.h>
 #include <net/if.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+static int profile_iface_ifname_safe(const char *ifname)
+{
+    if (!ifname || !ifname[0])
+        return 0;
+    for (const char *p = ifname; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-' && *p != '.')
+            return 0;
+    }
+    return 1;
+}
 
+static void profile_iface_xdp_link_off(const char *ifname)
+{
+    char cmd[128];
+
+    if (!profile_iface_ifname_safe(ifname))
+        return;
+    snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
+    if (system(cmd) != 0)
+        fprintf(stderr, "[PROFILE-XDP] warning: failed to run: %s\n", cmd);
+}
+
+void profile_iface_xdp_detach_ifname(const char *ifname)
+{
+    if (!ifname || !ifname[0])
+        return;
+    profile_iface_xdp_link_off(ifname);
+}
+
+void profile_iface_xdp_detach_config(const struct app_config *cfg)
+{
+    if (!cfg)
+        return;
+    for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++)
+        profile_iface_xdp_detach_ifname(cfg->locals[i].ifname);
+    for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++)
+        profile_iface_xdp_detach_ifname(cfg->wans[i].ifname);
+}
+
+void profile_iface_xdp_detach_local(struct ne_pair *p, int pair_li)
+{
+    if (!p || pair_li < 0 || pair_li >= MAX_INTERFACES)
+        return;
+    if (!p->xdp_local_on[pair_li] && !p->bpf_locals[pair_li])
+        return;
+
+    fprintf(stderr, "[PROFILE-XDP] DETACH LAN %s (slot %d)\n",
+            p->locals[pair_li].ifname, pair_li);
+    fflush(stderr);
+    profile_iface_xdp_link_off(p->locals[pair_li].ifname);
+    if (p->bpf_locals[pair_li]) {
+        bpf_object__close(p->bpf_locals[pair_li]);
+        p->bpf_locals[pair_li] = NULL;
+    }
+    p->xdp_local_on[pair_li] = 0;
+}
+
+void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot)
+{
+    if (!p || dp_slot < 0 || dp_slot >= MAX_INTERFACES)
+        return;
+    if (!p->xdp_wan_on[dp_slot] && !p->bpf_wans[dp_slot])
+        return;
+
+    fprintf(stderr, "[PROFILE-XDP] DETACH WAN %s (dp slot %d)\n",
+            p->wans[dp_slot].ifname, dp_slot);
+    fflush(stderr);
+    profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
+    if (p->bpf_wans[dp_slot]) {
+        bpf_object__close(p->bpf_wans[dp_slot]);
+        p->bpf_wans[dp_slot] = NULL;
+    }
+    p->xdp_wan_on[dp_slot] = 0;
+}
 
 void profile_iface_xdp_prepare_init(const struct app_config *cfg)
 {
@@ -20,7 +95,7 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
         return;
     fprintf(stderr, "[PROFILE-XDP] prepare: detach xdp on configured LAN/WAN\n");
     fflush(stderr);
-    interface_ip_xdp_off_config(cfg);
+    profile_iface_xdp_detach_config(cfg);
     interface_reset_redirect_maps();
 }
 
@@ -359,7 +434,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     if (open_bpf_object(cfg->bpf_file, &p->bpf_locals[pair_li],
                         "xdp_redirect_prog", &prog, "xsks_map", &map) != 0)
         return -1;
-    interface_ip_xdp_off(ifname);
+    profile_iface_xdp_link_off(ifname);
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, ifname, "LAN") != 0) {
         bpf_object__close(p->bpf_locals[pair_li]);
@@ -384,7 +459,7 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
                         "xdp_wan_redirect_prog", &prog, "wan_xsks_map", &map) != 0)
         return -1;
     update_wan_fake_ethertype(p->bpf_wans[dp_slot], fake_ethertype_ipv4);
-    interface_ip_xdp_off(p->wans[dp_slot].ifname);
+    profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0) {
         bpf_object__close(p->bpf_wans[dp_slot]);

@@ -733,9 +733,9 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
         return 0;
 
     const struct app_config *cfg = runtime_active_cfg(rt);
-    fprintf(stderr, "[STOP] ip link xdp off (all LAN/WAN)...\n");
+    fprintf(stderr, "[STOP] profile-xdp detach (all LAN/WAN)...\n");
     fflush(stderr);
-    interface_ip_xdp_off_config(cfg);
+    profile_iface_xdp_detach_config(cfg);
 
     fprintf(stderr, "[STOP] stopping dataplane...\n");
     fflush(stderr);
@@ -743,7 +743,7 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
     forwarder_shutdown_resources();
     pthread_join(rt->thread, NULL);
     forwarder_cleanup(&rt->fwd);
-    interface_ip_xdp_off_config(cfg);
+    profile_iface_xdp_detach_config(cfg);
     interface_promisc_off_config(cfg);
     fprintf(stderr, "[STOP] done\n");
     fflush(stderr);

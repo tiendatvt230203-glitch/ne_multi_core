@@ -137,8 +137,6 @@ int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 
 void interface_reset_redirect_maps(void);
-void interface_ip_xdp_off(const char *ifname);
-void interface_ip_xdp_off_config(const struct app_config *cfg);
 void interface_promisc_off_config(const struct app_config *cfg);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
