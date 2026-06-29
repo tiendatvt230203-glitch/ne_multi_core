@@ -140,7 +140,7 @@ CREATE TABLE ne_policies (
     profile_id     INT          REFERENCES ne_profiles(id) ON DELETE SET NULL,
     priority       INT          NOT NULL,
     action         VARCHAR(10)  NOT NULL CHECK (action IN ('L2', 'L3', 'L4', 'bypass')),
-    protocol       VARCHAR(10)  CHECK (protocol IN ('tcp', 'udp', 'icmp', 'ospf') OR protocol IS NULL),
+    protocol       VARCHAR(10)  CHECK (protocol IN ('tcp', 'udp', 'icmp', 'ospf', 'tcp/udp') OR protocol IS NULL),
     src_ip         TEXT[],
     dst_ip         TEXT[],
     src_port       TEXT[],

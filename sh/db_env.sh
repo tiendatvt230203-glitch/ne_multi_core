@@ -50,5 +50,5 @@ ne_psql() {
 
 ne_psql_file() {
   local sql_file="$1"
-  ne_psql -f "${sql_file}"
+  ne_psql --single-transaction -f "${sql_file}"
 }

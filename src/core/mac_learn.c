@@ -48,6 +48,18 @@ static int find_idx_by_mac_locked(const struct mac_learn_table *t, const uint8_t
     return -1;
 }
 
+static int find_idx_by_ifname_locked(const struct mac_learn_table *t, const char *ifname)
+{
+    if (!ifname || !ifname[0])
+        return -1;
+
+    for (int i = 0; i < t->count; i++) {
+        if (strcmp(t->list[i].ifname, ifname) == 0)
+            return i;
+    }
+    return -1;
+}
+
 static void log_mac(const char *event, const uint8_t mac[MAC_LEN], const char *ifname)
 {
     fprintf(stderr, "[MAC] %s %02x:%02x:%02x:%02x:%02x:%02x iface=%s\n",
@@ -71,61 +83,66 @@ static void log_mac_stale(const uint8_t mac[MAC_LEN], const char *ifname, uint64
             ifname ? ifname : "-", (unsigned long long)idle_ms);
 }
 
-static void purge_ifname_except_locked(struct mac_learn_table *t, const char *ifname,
-                                       const uint8_t keep_mac[MAC_LEN])
+static void remove_idx_locked(struct mac_learn_table *t, int idx)
 {
-    int w = 0;
-
-    if (!t || !ifname || !keep_mac)
+    if (!t || idx < 0 || idx >= t->count)
         return;
-
-    for (int i = 0; i < t->count; i++) {
-        if (strcmp(t->list[i].ifname, ifname) == 0 &&
-            memcmp(t->list[i].mac, keep_mac, MAC_LEN) != 0) {
-            log_mac("clean-replace", t->list[i].mac, t->list[i].ifname);
-            continue;
-        }
-        if (w != i)
-            t->list[w] = t->list[i];
-        w++;
-    }
-    if (w != t->count) {
-        t->count = w;
-        hash_rebuild_locked(t);
-    }
+    if (idx != t->count - 1)
+        t->list[idx] = t->list[t->count - 1];
+    t->count--;
+    hash_rebuild_locked(t);
 }
 
 static void upsert_locked(struct mac_learn_table *t, const char *ifname,
                           const uint8_t mac[MAC_LEN], uint64_t now_ms)
 {
-    int i;
+    int if_idx = find_idx_by_ifname_locked(t, ifname);
+    int mac_idx;
 
-    purge_ifname_except_locked(t, ifname, mac);
-    i = find_idx_by_mac_locked(t, mac);
+    if (if_idx >= 0) {
+        if (memcmp(t->list[if_idx].mac, mac, MAC_LEN) == 0) {
+            t->list[if_idx].last_seen_ms = now_ms;
+            return;
+        }
 
-    if (i >= 0) {
-        if (strcmp(t->list[i].ifname, ifname) != 0)
-            log_mac_move(mac, t->list[i].ifname, ifname);
-        strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
-        t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
-        t->list[i].last_seen_ms = now_ms;
+        log_mac("clean-replace", t->list[if_idx].mac, t->list[if_idx].ifname);
+
+        mac_idx = find_idx_by_mac_locked(t, mac);
+        if (mac_idx >= 0 && mac_idx != if_idx) {
+            log_mac_move(mac, t->list[mac_idx].ifname, ifname);
+            remove_idx_locked(t, mac_idx);
+            if_idx = find_idx_by_ifname_locked(t, ifname);
+            if (if_idx < 0)
+                return;
+        }
+
+        memcpy(t->list[if_idx].mac, mac, MAC_LEN);
+        t->list[if_idx].last_seen_ms = now_ms;
+        log_mac("learn", mac, t->list[if_idx].ifname);
+        hash_rebuild_locked(t);
         return;
     }
+
+    mac_idx = find_idx_by_mac_locked(t, mac);
+    if (mac_idx >= 0) {
+        log_mac_move(mac, t->list[mac_idx].ifname, ifname);
+        strncpy(t->list[mac_idx].ifname, ifname, IF_NAMESIZE - 1);
+        t->list[mac_idx].ifname[IF_NAMESIZE - 1] = '\0';
+        t->list[mac_idx].last_seen_ms = now_ms;
+        return;
+    }
+
     if (t->count >= MAC_LEARN_MAX_ENTRIES)
         return;
 
-    i = t->count++;
+    int i = t->count++;
+
     memcpy(t->list[i].mac, mac, MAC_LEN);
     strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
     t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
     t->list[i].last_seen_ms = now_ms;
     log_mac("learn", mac, t->list[i].ifname);
-
-    {
-        uint8_t b = mac_hash_key(mac);
-        t->hash_next[i] = t->hash_head[b];
-        t->hash_head[b] = i;
-    }
+    hash_rebuild_locked(t);
 }
 
 static void table_init(struct mac_learn_table *t)
