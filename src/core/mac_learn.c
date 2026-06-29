@@ -106,8 +106,6 @@ static void upsert_locked(struct mac_learn_table *t, const char *ifname,
     if (i >= 0) {
         if (strcmp(t->list[i].ifname, ifname) != 0)
             log_mac_move(mac, t->list[i].ifname, ifname);
-        else
-            log_mac("refresh", mac, ifname);
         strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
         t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
         t->list[i].last_seen_ms = now_ms;
