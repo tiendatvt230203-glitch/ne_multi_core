@@ -1,0 +1,17 @@
+[Unit]
+Description=Network Encryptor
+After=network.target postgresql.service
+
+[Service]
+Environment="PATH=/usr/bin/bin-ne/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Type=simple
+User=root
+EnvironmentFile=/opt/SEP/be/.env
+WorkingDirectory=/usr/bin/bin-ne
+ExecStart=/usr/local/bin/network-encryptor
+Restart=always
+RestartSec=5s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target

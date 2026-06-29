@@ -338,7 +338,8 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
 
 static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
                            const char *ifname, const char *role)
-{
+{   
+
     int rc = bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
 
     if (rc) {
@@ -359,7 +360,7 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
     struct bpf_object *obj = bpf_object__open_file(path, NULL);
 
     if (libbpf_get_error(obj)) {
-        fprintf(stderr, "[PROFILE-XDP] bpf open failed: %s\n", path);
+        fprintf(stderr, "[PROFILE-XDP] PROFILE-XDP] bpf open failed: %s\n", path);
         return -1;
     }
     if (bpf_object__load(obj) != 0) {

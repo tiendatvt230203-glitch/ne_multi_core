@@ -194,10 +194,20 @@ static void *forwarder_thread_main(void *arg) {
     struct runtime_state *rt = (struct runtime_state *)arg;
     if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot]) != 0) {
         forwarder_cleanup(&rt->fwd);
-        if (forwarder_should_stop())
+        if (forwarder_should_stop()) {
             fprintf(stderr, "[STOP] forwarder init aborted\n");
-        else
-            fprintf(stderr, "[FATAL] forwarder_init failed\n");
+        } 
+        else {
+            int has_bin = (system("ps aux | grep -v grep | grep -E '(\\./bin/|/bin/|/usr/local/bin/)' | grep -q 'network-encryptor'") == 0);
+            
+            int has_systemd = (system("systemctl is-active --quiet network-encryptor") == 0);
+
+            if (has_bin || has_systemd) {
+                fprintf(stderr, "[FATAL] forwarder_init failed: 'network-encryptor' process or systemd service is already running!\n");
+            } else {
+                fprintf(stderr, "[FATAL] forwarder_init failed\n");
+            }
+        }
         rt->running = 0;
         return NULL;
     }
@@ -907,7 +917,6 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "[DAEMON] listening %s — use %s -id <id>\n", NOTIFY_CHANNEL, argv[0]);
 
-    /* forwarder is ~585 KiB; keep runtime off the main-thread stack (avoids segfault on small stacks). */
     struct runtime_state *rt = calloc(1, sizeof(*rt));
     if (!rt) {
         fprintf(stderr, "[FATAL] out of memory for runtime state\n");

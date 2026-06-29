@@ -31,8 +31,8 @@ void forwarder_pin_cpu(void)
     pin_cpu(ne_cpu_rx_lan(0));
 }
 
-#define DP_BURST_ROUNDS   1
-#define DP_TX_BURST_MAX   1
+#define DP_BURST_ROUNDS   8
+#define DP_TX_BURST_MAX   8
 
 static void dp_burst_refill_local(struct forwarder *fwd, int rx_slot)
 {
@@ -242,9 +242,7 @@ static void crypto_worker_tick(struct forwarder *fwd, int is_primary)
     fwd_wan_drain_tick(fwd);
     fwd_wan_weight_blend_tick();
     fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
-    // MAC_LEARN
     mac_learn_tick(fwd);
-    // MAC_LEARN
 }
 
 static void *crypto_worker_thread(void *arg)

@@ -144,12 +144,11 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     struct packet_crypto_ctx *pctx;
     int enc;
 
+    mac_learn(fwd, li, pkt, job.len);
+
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)
         goto drop;
-    // MAC_LEARN
-    mac_learn_local(fwd, li, pkt);
-    // MAC_LEARN
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))

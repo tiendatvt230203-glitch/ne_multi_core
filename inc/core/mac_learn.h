@@ -6,7 +6,6 @@
 #include <stdint.h>
 
 struct forwarder;
-struct ne_packet;
 
 #define MAC_LEARN_MAX_ENTRIES 256
 #define MAC_LEARN_HASH_BUCKETS 256
@@ -25,13 +24,11 @@ struct mac_learn_table {
     pthread_spinlock_t lock;
 };
 
-// API lean mac
 void mac_learn_bootstrap(struct mac_learn_table *t);
 void mac_learn_shutdown(struct mac_learn_table *t);
 void mac_learn_tick(struct forwarder *fwd);
 
-void mac_learn_local(struct forwarder *fwd, int local_idx, const uint8_t *pkt);
-int mac_learn_wan(struct forwarder *fwd, struct ne_packet *job,
-                  const uint8_t *wire_pkt, uint32_t wire_len);
+void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint32_t len);
+int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN]);
 
 #endif

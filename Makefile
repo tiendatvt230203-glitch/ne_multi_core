@@ -1,16 +1,14 @@
 CC     = gcc
 CLANG  = clang
 
-# frag_table x MAX_PROFILES x NE_CRYPTO_WORKERS exceeds ~2GiB .bss; medium model
-# avoids "relocation truncated to fit: R_X86_64_PC32 against .bss" at link time.
 CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 -mcmodel=medium $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
-LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
+LDFLAGS = -L./lib -Wl,-rpath,'lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
 
-BIN_DIR = bin
-TARGET  = $(BIN_DIR)/network-encryptor
+LIB_DIR = lib
+TARGET  = network-encryptor
 
 APP_SRC = main.c \
           src/core/main_diag.c \
@@ -47,17 +45,12 @@ DB_SRC = src/db/config.c \
          src/db/db_runtime.c
 DB_OBJ = $(DB_SRC:.c=.o)
 
-BPF_SRC = bpf/xdp_redirect.c \
-          bpf/xdp_wan_redirect.c
-BPF_OBJ = bpf/xdp_redirect.o \
-          bpf/xdp_wan_redirect.o
+BPF_OBJ = $(LIB_DIR)/lan.o \
+          $(LIB_DIR)/wan.o
 
 .PHONY: all clean dirs
 
 all: dirs $(BPF_OBJ) $(TARGET)
-
-dirs:
-	@mkdir -p $(BIN_DIR)
 
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
@@ -65,8 +58,8 @@ $(TARGET): $(APP_OBJ) $(DB_OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-bpf/%.o: bpf/%.c
+$(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)
+	rm -rf network-encryptor src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)

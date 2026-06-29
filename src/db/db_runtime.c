@@ -338,8 +338,8 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
     (void)db_pass;
     struct app_config merged;
     memset(&merged, 0, sizeof(merged));
-    strncpy(merged.bpf_file, "bpf/xdp_redirect.o", sizeof(merged.bpf_file) - 1);
-    strncpy(merged.bpf_wan_file, "bpf/xdp_wan_redirect.o", sizeof(merged.bpf_wan_file) - 1);
+    strncpy(merged.bpf_file, "lib/lan.o", sizeof(merged.bpf_file) - 1);
+    strncpy(merged.bpf_wan_file, "lib/wan.o", sizeof(merged.bpf_wan_file) - 1);
 
     for (int i = 0; i < id_count; i++) {
         struct app_config tmp;
