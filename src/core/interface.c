@@ -15,6 +15,10 @@
 #include <ctype.h>
 #include <dirent.h>
 
+#ifndef NE_DP_WARN_LOG_ENABLE
+#define NE_DP_WARN_LOG_ENABLE 0
+#endif
+
 #define NE_DP_WARN_RX_LAN   0
 #define NE_DP_WARN_RX_WAN   1
 #define NE_DP_WARN_TX_LAN0  2
@@ -25,14 +29,17 @@
 #define NE_DP_WARN_SLOTS    (NE_DP_WARN_CRYPTO0 + NE_CRYPTO_WORKERS)
 #define NE_DP_WARN_CLEAR    8192u
 
+#if NE_DP_WARN_LOG_ENABLE
 static int dp_warn_on[NE_DP_WARN_SLOTS];
 static uint32_t dp_warn_clear_streak[NE_DP_WARN_SLOTS];
 static pthread_mutex_t dp_warn_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread const char *tls_dp_tx_dir;
 static __thread int tls_dp_tx_slot = -1;
+#endif
 
 static void dp_warn_once(int id, int active, const char *fmt, ...)
 {
+#if NE_DP_WARN_LOG_ENABLE
     va_list ap;
 
     if (id < 0 || id >= NE_DP_WARN_SLOTS)
@@ -57,12 +64,22 @@ static void dp_warn_once(int id, int active, const char *fmt, ...)
         }
     }
     pthread_mutex_unlock(&dp_warn_lock);
+#else
+    (void)id;
+    (void)active;
+    (void)fmt;
+#endif
 }
 
 void ne_dp_tx_ctx(const char *dir, int tx_slot)
 {
+#if NE_DP_WARN_LOG_ENABLE
     tls_dp_tx_dir = dir;
     tls_dp_tx_slot = tx_slot;
+#else
+    (void)dir;
+    (void)tx_slot;
+#endif
 }
 
 void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
@@ -84,6 +101,7 @@ void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth)
 
 void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
 {
+#if NE_DP_WARN_LOG_ENABLE
     int id;
     int active;
 
@@ -97,6 +115,11 @@ void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
     dp_warn_once(id, active,
                  "core=%d TX %s slot=%d saturated pending=%u (TX ring full)",
                  cpu, tls_dp_tx_dir, tls_dp_tx_slot, pending);
+#else
+    (void)cpu;
+    (void)tx_full;
+    (void)pending;
+#endif
 }
 
 void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)

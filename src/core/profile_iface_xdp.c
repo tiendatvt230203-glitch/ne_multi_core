@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 static int profile_iface_ifname_safe(const char *ifname)
@@ -356,41 +355,6 @@ static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
     return 0;
 }
 
-static void debug_log_bpf_open(const char *path, int access_rc, int access_errno)
-{
-    char cwd[512];
-    FILE *fp;
-
-    if (!getcwd(cwd, sizeof(cwd)))
-        strncpy(cwd, "getcwd-failed", sizeof(cwd) - 1);
-    cwd[sizeof(cwd) - 1] = '\0';
-
-    fp = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-5f7a73.log", "a");
-    if (!fp)
-        return;
-    fprintf(fp,
-            "{\"sessionId\":\"5f7a73\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H1,H2,H3,H4\",\"location\":\"src/core/profile_iface_xdp.c:open_bpf_object\",\"message\":\"before bpf object open\",\"data\":{\"cwd\":\"%s\",\"path\":\"%s\",\"accessRc\":%d,\"accessErrno\":%d},\"timestamp\":%llu}\n",
-            cwd, path ? path : "-", access_rc, access_errno,
-            (unsigned long long)(time(NULL) * 1000ull));
-    fclose(fp);
-}
-
-static void debug_log_bpf_resolved(const char *path, const char *resolved_path,
-                                   int resolved_access_rc, int resolved_access_errno)
-{
-    FILE *fp;
-
-    fp = fopen("/home/tiendat/Downloads/NE/network-encryptor/.cursor/debug-5f7a73.log", "a");
-    if (!fp)
-        return;
-    fprintf(fp,
-            "{\"sessionId\":\"5f7a73\",\"runId\":\"post-fix\",\"hypothesisId\":\"H1,H4\",\"location\":\"src/core/profile_iface_xdp.c:resolve_bpf_object_path\",\"message\":\"resolved bpf object path\",\"data\":{\"path\":\"%s\",\"resolvedPath\":\"%s\",\"resolvedAccessRc\":%d,\"resolvedAccessErrno\":%d},\"timestamp\":%llu}\n",
-            path ? path : "-", resolved_path ? resolved_path : "-",
-            resolved_access_rc, resolved_access_errno,
-            (unsigned long long)(time(NULL) * 1000ull));
-    fclose(fp);
-}
-
 static const char *resolve_bpf_object_path(const char *path, char resolved[PATH_MAX])
 {
     char exe_path[PATH_MAX];
@@ -419,26 +383,11 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
                            const char *prog_name, struct bpf_program **prog_out,
                            const char *map_name, struct bpf_map **map_out)
 {
-    int access_rc;
-    int access_errno;
     char resolved_path[PATH_MAX];
     const char *open_path;
-    int resolved_access_rc;
-    int resolved_access_errno;
     struct bpf_object *obj;
 
-    access_rc = access(path, R_OK);
-    access_errno = access_rc == 0 ? 0 : errno;
-    // #region agent log
-    debug_log_bpf_open(path, access_rc, access_errno);
-    // #endregion
-
     open_path = resolve_bpf_object_path(path, resolved_path);
-    resolved_access_rc = access(open_path, R_OK);
-    resolved_access_errno = resolved_access_rc == 0 ? 0 : errno;
-    // #region agent log
-    debug_log_bpf_resolved(path, open_path, resolved_access_rc, resolved_access_errno);
-    // #endregion
 
     obj = bpf_object__open_file(open_path, NULL);
 
