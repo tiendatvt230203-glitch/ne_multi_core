@@ -198,15 +198,7 @@ static void *forwarder_thread_main(void *arg) {
             fprintf(stderr, "[STOP] forwarder init aborted\n");
         } 
         else {
-            int has_bin = (system("ps aux | grep -v grep | grep -E '(\\./bin/|/bin/|/usr/local/bin/)' | grep -q 'network-encryptor'") == 0);
-            
-            int has_systemd = (system("systemctl is-active --quiet network-encryptor") == 0);
-
-            if (has_bin || has_systemd) {
-                fprintf(stderr, "[FATAL] forwarder_init failed: 'network-encryptor' process or systemd service is already running!\n");
-            } else {
-                fprintf(stderr, "[FATAL] forwarder_init failed\n");
-            }
+            fprintf(stderr, "[FATAL] forwarder_init failed\n");
         }
         rt->running = 0;
         return NULL;
