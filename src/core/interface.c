@@ -445,8 +445,13 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
         int ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
                                             &slot->rx, &slot->tx,
                                             &slot->fq, &slot->cq, &cfg);
-        if (ret)
+        if (ret) {
+            int err = ret < 0 ? -ret : ret;
+            fprintf(stderr, "[DP-INIT] xsk socket failed iface=%s queue=%d ret=%d err=%s errno=%d:%s\n",
+                    ifname, q, ret, strerror(err), errno, strerror(errno));
+            fflush(stderr);
             return -1;
+        }
     }
     return 0;
 }
@@ -498,19 +503,37 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         fflush(stderr);
     }
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
-    (void)setrlimit(RLIMIT_MEMLOCK, &rl);
+    if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
+        fprintf(stderr, "[DP-INIT] setrlimit RLIMIT_MEMLOCK failed errno=%d:%s\n",
+                errno, strerror(errno));
+        fflush(stderr);
+    }
 
     p->frame_size = NE_FRAME;
     p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
     p->xdp_flags = XDP_FLAGS_DRV_MODE;
+    fprintf(stderr,
+            "[DP-INIT] mtu_profile=%d frame=%u base_frames=%u total_frames=%u ifaces=%d bufsize=%zu\n",
+            NE_MTU_PROFILE, p->frame_size, (uint32_t)NE_N_FRAMES, p->n_frames,
+            p->local_count + p->wan_count, p->bufsize);
+    fflush(stderr);
 
     p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p->bufs == MAP_FAILED)
+    if (p->bufs == MAP_FAILED) {
+        fprintf(stderr, "[DP-INIT] mmap UMEM failed size=%zu errno=%d:%s\n",
+                p->bufsize, errno, strerror(errno));
+        fflush(stderr);
         return -1;
+    }
 
-    NE_TRY(pool_init(&p->pool, p->n_frames));
+    if (pool_init(&p->pool, p->n_frames) != 0) {
+        fprintf(stderr, "[DP-INIT] pool_init failed frames=%u errno=%d:%s\n",
+                p->n_frames, errno, strerror(errno));
+        fflush(stderr);
+        goto fail;
+    }
     for (uint32_t i = 0; i < p->n_frames; i++) {
         uint64_t addr = (uint64_t)i * p->frame_size;
         (void)pool_push(&p->pool, &addr, 1);
@@ -556,9 +579,20 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         .flags = 0,
     };
 
-    NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize,
-                            &p->locals[0].queues[0].fq,
-                            &p->locals[0].queues[0].cq, &ucfg));
+    {
+        int ret = xsk_umem__create(&p->umem, p->bufs, p->bufsize,
+                                   &p->locals[0].queues[0].fq,
+                                   &p->locals[0].queues[0].cq, &ucfg);
+        if (ret != 0) {
+            int err = ret < 0 ? -ret : ret;
+            fprintf(stderr,
+                    "[DP-INIT] xsk_umem create failed ret=%d err=%s errno=%d:%s frame=%u size=%zu fill=%u comp=%u\n",
+                    ret, strerror(err), errno, strerror(errno), p->frame_size, p->bufsize,
+                    (uint32_t)NE_RING, (uint32_t)NE_RING);
+            fflush(stderr);
+            goto fail;
+        }
+    }
 
     for (int i = 0; i < p->local_count; i++)
         NE_TRY(open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
