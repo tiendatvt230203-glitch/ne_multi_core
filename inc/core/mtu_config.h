@@ -15,9 +15,9 @@
 #define FRAG_TABLE_SIZE     4096u
 #elif NE_MTU_PROFILE == NE_MTU_PROFILE_9000
 #define NE_FRAME            16384u
-#define NE_N_FRAMES         32768u
+#define NE_N_FRAMES         8192u
 #define FRAG_MTU            9000u
-#define FRAG_TABLE_SIZE     256u
+#define FRAG_TABLE_SIZE     64u
 #else
 #error "Unsupported NE_MTU_PROFILE"
 #endif
