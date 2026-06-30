@@ -132,6 +132,7 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
                         int wan_idx, int tx_slot);
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
+int ne_packet_alloc(struct ne_pair *p, uint32_t len, uint64_t *addr_out);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 

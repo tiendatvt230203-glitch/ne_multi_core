@@ -303,7 +303,7 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         enc_len = total_after_tunnel;
     }
 
-    uint8_t backup[NE_FRAME];
+    uint8_t backup[NE_PACKET_MAX];
     int has_backup = (enc_len <= sizeof(backup));
     if (has_backup)
         memcpy(backup, packet + enc_off, enc_len);
@@ -526,7 +526,7 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
         enc_len = total_after;
     }
 
-    uint8_t backup[NE_FRAME];
+    uint8_t backup[NE_PACKET_MAX];
     int has_backup = (enc_len <= sizeof(backup));
     if (has_backup)
         memcpy(backup, packet + enc_off, enc_len);

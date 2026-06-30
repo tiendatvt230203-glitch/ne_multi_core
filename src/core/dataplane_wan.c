@@ -99,7 +99,7 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[NE_FRAME];
+    uint8_t buf[NE_PACKET_MAX];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -132,7 +132,7 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[NE_FRAME];
+    uint8_t buf[NE_PACKET_MAX];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -164,7 +164,7 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[NE_FRAME];
+    uint8_t buf[NE_PACKET_MAX];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -191,7 +191,7 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
 
 static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 {
-    uint8_t scratch[NE_FRAME];
+    uint8_t scratch[NE_PACKET_MAX];
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
     uint16_t pid = 0;
@@ -345,7 +345,7 @@ static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
                 .dir = NE_DIR_LOCAL,
                 .local_idx = (uint8_t)li,
             };
-            if (ne_frame_alloc(&fwd->pair, &clone.addr) != 0)
+            if (ne_packet_alloc(&fwd->pair, job->len, &clone.addr) != 0)
                 return -1;
             memcpy(ne_packet_data(&fwd->pair, clone.addr), pkt, job->len);
             if (ne_ring_try_push(ring, &clone) != 0) {
@@ -441,7 +441,7 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
-    uint8_t wire_buf[NE_FRAME];
+    uint8_t wire_buf[NE_PACKET_MAX];
     uint32_t wire_len;
     int dec;
 
@@ -449,7 +449,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     wire_len = job.len;
-    if (wire_len < 14u || wire_len > NE_FRAME)
+    if (wire_len < 14u || wire_len > NE_PACKET_MAX)
         goto drop;
     memcpy(wire_buf, pkt, wire_len);
 

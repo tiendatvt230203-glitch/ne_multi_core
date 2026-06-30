@@ -28,11 +28,11 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
     struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
     if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap)
         return -1;
-    if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)
+    if (l1 == 0 || l2 == 0 || l1 > NE_PACKET_MAX || l2 > NE_PACKET_MAX)
         return -1;
 
     struct ne_packet tail = { .len = l2, .dir = NE_DIR_WAN, .wan_idx = (uint8_t)wan_dp };
-    if (ne_frame_alloc(&fwd->pair, &tail.addr) != 0)
+    if (ne_packet_alloc(&fwd->pair, l2, &tail.addr) != 0)
         return -1;
     memcpy(ne_packet_data(&fwd->pair, tail.addr), f2, l2);
     job->len = l1;
@@ -56,20 +56,20 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
-    uint8_t f2[NE_FRAME];
+    uint8_t f2[NE_PACKET_MAX];
     uint32_t l1 = 0, l2 = 0;
 
     if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(len)) {
-        if (frag_split_and_encrypt_l2(pctx, pkt, len, fwd->pair.frame_size, &l1,
-                                      f2, fwd->pair.frame_size, &l2) != 0)
+        if (frag_split_and_encrypt_l2(pctx, pkt, len, NE_PACKET_MAX, &l1,
+                                      f2, NE_PACKET_MAX, &l2) != 0)
             return -1;
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(len)) {
-        if (frag_split_and_encrypt(pctx, pkt, len, fwd->pair.frame_size, &l1,
-                                   f2, fwd->pair.frame_size, &l2) != 0)
+        if (frag_split_and_encrypt(pctx, pkt, len, NE_PACKET_MAX, &l1,
+                                   f2, NE_PACKET_MAX, &l2) != 0)
             return -1;
     } else if (cp->action == POLICY_ACTION_ENCRYPT_L4 && frag_need_split_l4(len)) {
-        if (frag_split_and_encrypt_l4(pctx, pkt, len, fwd->pair.frame_size, &l1,
-                                      f2, fwd->pair.frame_size, &l2) != 0)
+        if (frag_split_and_encrypt_l4(pctx, pkt, len, NE_PACKET_MAX, &l1,
+                                      f2, NE_PACKET_MAX, &l2) != 0)
             return -1;
     } else {
         int n = -1;

@@ -417,7 +417,7 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
         enc_len = total_after;
     }
 
-    uint8_t backup[NE_FRAME];
+    uint8_t backup[NE_PACKET_MAX];
     int has_backup = (enc_len <= sizeof(backup));
     if (has_backup)
         memcpy(backup, packet + enc_off, enc_len);
