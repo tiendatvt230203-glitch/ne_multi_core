@@ -15,6 +15,10 @@
 #include <ctype.h>
 #include <dirent.h>
 
+#ifndef XDP_PKT_CONTD
+#define XDP_PKT_CONTD (1 << 0)
+#endif
+
 #ifndef NE_DP_WARN_LOG_ENABLE
 #define NE_DP_WARN_LOG_ENABLE 0
 #endif
