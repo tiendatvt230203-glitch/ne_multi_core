@@ -14,12 +14,14 @@
 #define NE_N_FRAMES         131072u
 #define FRAG_MTU            1500u
 #define FRAG_TABLE_SIZE     4096u
+#define NE_XDP_MODE         XDP_FLAGS_DRV_MODE
 #elif NE_MTU_PROFILE == NE_MTU_PROFILE_9000
 #define NE_FRAME            4096u
 #define NE_PACKET_MAX       16384u
 #define NE_N_FRAMES         8192u
 #define FRAG_MTU            9000u
 #define FRAG_TABLE_SIZE     64u
+#define NE_XDP_MODE         XDP_FLAGS_SKB_MODE
 #else
 #error "Unsupported NE_MTU_PROFILE"
 #endif

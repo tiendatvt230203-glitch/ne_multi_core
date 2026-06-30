@@ -553,11 +553,11 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->frame_size = NE_FRAME;
     p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
-    p->xdp_flags = XDP_FLAGS_DRV_MODE;
+    p->xdp_flags = NE_XDP_MODE;
     fprintf(stderr,
-            "[DP-INIT] mtu_profile=%d frame=%u base_frames=%u total_frames=%u ifaces=%d bufsize=%zu\n",
+            "[DP-INIT] mtu_profile=%d frame=%u base_frames=%u total_frames=%u ifaces=%d bufsize=%zu xdp_flags=0x%x\n",
             NE_MTU_PROFILE, p->frame_size, (uint32_t)NE_N_FRAMES, p->n_frames,
-            p->local_count + p->wan_count, p->bufsize);
+            p->local_count + p->wan_count, p->bufsize, p->xdp_flags);
     fflush(stderr);
 
     p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,

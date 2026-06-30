@@ -338,18 +338,42 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
     return (int)idx;
 }
 
-static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
+static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t *flags,
                            const char *ifname, const char *role)
 {   
 
-    int rc = bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
+    uint32_t attach_flags = flags ? *flags : XDP_FLAGS_DRV_MODE;
+    int rc = bpf_xdp_attach(ifindex, prog_fd, attach_flags, NULL);
 
     if (rc) {
+        if ((attach_flags & XDP_FLAGS_DRV_MODE) != 0) {
+            uint32_t skb_flags = (attach_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
+            int rc_skb;
+
+            profile_iface_xdp_link_off(ifname);
+            rc_skb = bpf_xdp_attach(ifindex, prog_fd, skb_flags, NULL);
+            if (rc_skb == 0) {
+                if (flags)
+                    *flags = skb_flags;
+                fprintf(stderr,
+                        "[PROFILE-XDP] attach fallback %s %s: DRV unsupported, using SKB/generic\n",
+                        role, ifname);
+                fflush(stderr);
+                return 0;
+            }
+            fprintf(stderr,
+                    "[PROFILE-XDP] attach fallback failed %s %s: DRV=%s SKB=%s\n",
+                    role, ifname, strerror(-rc), strerror(-rc_skb));
+            fflush(stderr);
+            return -1;
+        }
         fprintf(stderr, "[PROFILE-XDP] attach failed %s %s: %s\n",
                 role, ifname, strerror(-rc));
         fflush(stderr);
         return -1;
     }
+    if (flags)
+        *flags = attach_flags;
     fprintf(stderr, "[PROFILE-XDP] attach OK %s %s\n", role, ifname);
     fflush(stderr);
     return 0;
@@ -469,7 +493,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         return -1;
     profile_iface_xdp_link_off(ifname);
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
-                        p->xdp_flags, ifname, "LAN") != 0) {
+                        &p->xdp_flags, ifname, "LAN") != 0) {
         bpf_object__close(p->bpf_locals[pair_li]);
         p->bpf_locals[pair_li] = NULL;
         return -1;
@@ -494,7 +518,7 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
     update_wan_fake_ethertype(p->bpf_wans[dp_slot], fake_ethertype_ipv4);
     profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
-                        p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0) {
+                        &p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0) {
         bpf_object__close(p->bpf_wans[dp_slot]);
         p->bpf_wans[dp_slot] = NULL;
         return -1;
