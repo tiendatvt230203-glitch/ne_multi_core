@@ -1,5 +1,6 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/core/config.h"
+#include "../../inc/core/interface.h"
 #include "../../inc/crypto/crypto_pqc_layer.h"
 #include <string.h>
 
@@ -265,7 +266,7 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         enc_len = total_after_tunnel;
     }
 
-    uint8_t backup[2048];
+    uint8_t backup[NE_FRAME];
     int has_backup = (enc_len <= sizeof(backup));
     if (has_backup)
         memcpy(backup, packet + enc_off, enc_len);
@@ -493,7 +494,7 @@ int crypto_layer3_decrypt_fragment(struct packet_crypto_ctx *ctx,
         enc_len = total_after;
     }
 
-    uint8_t backup[2048];
+    uint8_t backup[NE_FRAME];
     int has_backup = (enc_len <= sizeof(backup));
     if (has_backup)
         memcpy(backup, packet + enc_off, enc_len);

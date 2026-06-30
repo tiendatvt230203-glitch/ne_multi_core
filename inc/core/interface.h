@@ -3,12 +3,11 @@
 
 #include "common.h"
 #include "config.h"
+#include "mtu_config.h"
 #include <pthread.h>
 #include <signal.h>
 
 #define NE_RING        16384u
-#define NE_FRAME       2048u
-#define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
 
 #define NE_QUEUE_OVERRIDE 0

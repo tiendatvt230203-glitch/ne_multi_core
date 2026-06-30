@@ -56,7 +56,7 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
-    uint8_t f2[4096];
+    uint8_t f2[NE_FRAME];
     uint32_t l1 = 0, l2 = 0;
 
     if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(len)) {

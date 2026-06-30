@@ -99,7 +99,7 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[4096];
+    uint8_t buf[NE_FRAME];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -132,7 +132,7 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[4096];
+    uint8_t buf[NE_FRAME];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -164,7 +164,7 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[4096];
+    uint8_t buf[NE_FRAME];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -191,7 +191,7 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
 
 static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 {
-    uint8_t scratch[8192];
+    uint8_t scratch[NE_FRAME];
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
     uint16_t pid = 0;
