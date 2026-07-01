@@ -3,7 +3,6 @@
 
 #include "interface.h"
 #include "crypto_route.h"
-#include "mac_learn.h"
 
 struct fwd_iface {
     int ifindex;
@@ -31,8 +30,6 @@ struct forwarder {
     pthread_t wan_tx_threads[NE_TX_SLOTS];
     pthread_t wan_rx_threads[NE_RX_WAN_SLOTS];
     int threads_started;
-
-    struct mac_learn_table mac_table;
 };
 
 static inline uint32_t fwd_mid_to_wan_depth(const struct forwarder *fwd, int wan_dp)

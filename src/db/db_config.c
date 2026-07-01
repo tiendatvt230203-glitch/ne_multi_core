@@ -410,7 +410,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     PQclear(res);
 
     res = PQexecParams(conn,
-        "SELECT interface AS ifname "
+        "SELECT interface AS ifname, mac "
         "FROM ne_lan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
     profile_append_locals_from_rows(cfg, p, res);
@@ -601,6 +601,19 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
         }
         strncpy(loc->ifname, v, IF_NAMESIZE - 1);
 
+        {
+            int mac_col = PQfnumber(res, "mac");
+            if (mac_col >= 0 && !PQgetisnull(res, row, mac_col)) {
+                const char *mac_str = PQgetvalue(res, row, mac_col);
+                if (mac_str && mac_str[0] != '\0' &&
+                    parse_mac(mac_str, loc->mac) != 0) {
+                    fprintf(stderr, "[DB LOCAL][%d] bad mac '%s' for %s\n",
+                            row, mac_str, loc->ifname);
+                    return -1;
+                }
+            }
+        }
+
         cfg->local_count++;
     }
     return 0;
@@ -674,7 +687,7 @@ static int db_load_lan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname "
+        "SELECT interface AS ifname, mac "
         "FROM ne_lan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
 

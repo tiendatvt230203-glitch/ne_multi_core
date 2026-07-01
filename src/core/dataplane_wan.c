@@ -12,7 +12,7 @@
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
 #include "../../inc/core/interface.h"
-#include "../../inc/core/mac_learn.h"
+#include "../../inc/core/config.h"
 
 #include <string.h>
 
@@ -272,22 +272,6 @@ static int eth_dmac_is_unicast(const uint8_t *pkt)
     return (pkt[0] & 0x01u) == 0;
 }
 
-static int profile_owns_local(const struct app_config *cfg, int profile_pi, int local_idx)
-{
-    const struct profile_config *prof;
-
-    if (!cfg || profile_pi < 0 || profile_pi >= cfg->profile_count)
-        return 0;
-    prof = &cfg->profiles[profile_pi];
-    if (!prof->enabled)
-        return 0;
-    for (int i = 0; i < prof->local_count; i++) {
-        if (prof->local_indices[i] == local_idx)
-            return 1;
-    }
-    return 0;
-}
-
 static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
 {
     int profile_id;
@@ -302,61 +286,6 @@ static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
             return pi;
     }
     return -1;
-}
-
-static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
-                                   const uint8_t *pkt, int profile_pi)
-{
-    const struct profile_config *prof;
-    int wi;
-    int sent = 0;
-    uint16_t sent_mask = 0;
-
-    if (!fwd || !job || !pkt || !fwd->cfg || profile_pi < 0 ||
-        profile_pi >= fwd->cfg->profile_count)
-        return -1;
-
-    prof = &fwd->cfg->profiles[profile_pi];
-    if (!prof->enabled || prof->local_count <= 0)
-        return -1;
-
-    wi = dp_crypto_current_worker_idx();
-
-    for (int i = 0; i < prof->local_count; i++) {
-        int li = prof->local_indices[i];
-        struct ne_ring *ring;
-
-        if (li < 0 || li >= fwd->local_count)
-            continue;
-        if (li < (int)(sizeof(sent_mask) * 8) && (sent_mask & (1u << li)) != 0)
-            continue;
-
-        ring = &fwd->mid_to_local[li][wi];
-
-        if (sent == 0) {
-            job->dir = NE_DIR_LOCAL;
-            job->local_idx = (uint8_t)li;
-            if (ne_ring_try_push(ring, job) != 0)
-                return -1;
-            sent = 1;
-        } else {
-            struct ne_packet clone = {
-                .len = job->len,
-                .dir = NE_DIR_LOCAL,
-                .local_idx = (uint8_t)li,
-            };
-            if (ne_frame_alloc(&fwd->pair, &clone.addr) != 0)
-                return -1;
-            memcpy(ne_packet_data(&fwd->pair, clone.addr), pkt, job->len);
-            if (ne_ring_try_push(ring, &clone) != 0) {
-                ne_frame_free(&fwd->pair, clone.addr);
-                return -1;
-            }
-        }
-        if (li < (int)(sizeof(sent_mask) * 8))
-            sent_mask |= (1u << li);
-    }
-    return sent > 0 ? 0 : -1;
 }
 
 static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
@@ -409,6 +338,13 @@ static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
     return wan_profile_pi_bypass(fwd, pkt, len);
 }
 
+static int pick_local(struct forwarder *fwd, const uint8_t *pkt)
+{
+    if (!fwd || !pkt)
+        return -1;
+    return config_find_local_for_mac(fwd->cfg, pkt);
+}
+
 static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
                                 const uint8_t *wire_pkt, uint32_t wire_len)
 {
@@ -428,14 +364,15 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     if (profile_pi < 0)
         return -1;
 
-    li = mac_lookup(fwd, pkt);
-    if (li >= 0 && profile_owns_local(fwd->cfg, profile_pi, li)) {
-        job->dir = NE_DIR_LOCAL;
-        job->local_idx = (uint8_t)li;
-        return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
-    }
+    li = pick_local(fwd, pkt);
+    if (li < 0 || !profile_owns_local(fwd->cfg, profile_pi, li))
+        return -1;
 
-    return flood_to_profile_locals(fwd, job, pkt, profile_pi);
+    (void)dp_write_l2_src_only(pkt, job->len, fwd->cfg->locals[li].mac);
+
+    job->dir = NE_DIR_LOCAL;
+    job->local_idx = (uint8_t)li;
+    return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
 }
 
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)

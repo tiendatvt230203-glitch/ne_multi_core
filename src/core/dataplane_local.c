@@ -9,7 +9,6 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
-#include "../../inc/core/mac_learn.h"
 
 #include <string.h>
 
@@ -143,8 +142,6 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     int pi;
     struct packet_crypto_ctx *pctx;
     int enc;
-
-    mac_learn(fwd, li, pkt, job.len);
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)

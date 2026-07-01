@@ -8,7 +8,6 @@
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/core/profile_iface_xdp.h"
-#include "../../inc/core/mac_learn.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
 
 #include <net/if.h>
@@ -242,7 +241,6 @@ static void crypto_worker_tick(struct forwarder *fwd, int is_primary)
     fwd_wan_drain_tick(fwd);
     fwd_wan_weight_blend_tick();
     fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
-    mac_learn_tick(fwd);
 }
 
 static void *crypto_worker_thread(void *arg)
@@ -398,9 +396,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     }
 
     fwd_wan_reset_on_init(fwd);
-    // MAC_LEARN
-    mac_learn_bootstrap(&fwd->mac_table);
-    // MAC_LEARN
     atomic_store_explicit(&running, 1, memory_order_release);
     return 0;
 }
@@ -409,9 +404,6 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
-    // MAC_LEARN
-    mac_learn_shutdown(&fwd->mac_table);
-    // MAC_LEARN
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
         ne_ring_destroy(&fwd->local_to_mid[w]);
         ne_ring_destroy(&fwd->wan_to_mid[w]);

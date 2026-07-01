@@ -480,6 +480,52 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
     return best;
 }
 
+int parse_mac(const char *str, uint8_t *mac)
+{
+    int values[6];
+
+    if (!str || !mac)
+        return -1;
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x",
+               &values[0], &values[1], &values[2],
+               &values[3], &values[4], &values[5]) != 6)
+        return -1;
+    for (int i = 0; i < MAC_LEN; i++)
+        mac[i] = (uint8_t)values[i];
+    return 0;
+}
+
+int config_find_local_for_mac(const struct app_config *cfg, const uint8_t dmac[MAC_LEN])
+{
+    static const uint8_t zero[MAC_LEN];
+
+    if (!cfg || !dmac)
+        return -1;
+    for (int i = 0; i < cfg->local_count; i++) {
+        const struct local_config *loc = &cfg->locals[i];
+
+        if (memcmp(loc->mac, zero, MAC_LEN) == 0)
+            continue;
+        if (memcmp(loc->mac, dmac, MAC_LEN) == 0)
+            return i;
+    }
+    return -1;
+}
+
+int profile_owns_local(const struct app_config *cfg, int profile_pi, int local_idx)
+{
+    if (!cfg || profile_pi < 0 || profile_pi >= cfg->profile_count || local_idx < 0)
+        return 0;
+
+    const struct profile_config *prof = &cfg->profiles[profile_pi];
+
+    for (int i = 0; i < prof->local_count; i++) {
+        if (prof->local_indices[i] == local_idx)
+            return 1;
+    }
+    return 0;
+}
+
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network) {
     return parse_ip_cidr(str, ip, netmask, network);
 }
