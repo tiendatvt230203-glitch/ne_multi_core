@@ -75,7 +75,7 @@ struct profile_config {
 
 struct local_config {
     char ifname[IF_NAMESIZE];
-    uint8_t mac[MAC_LEN];
+    uint8_t mac[MAC_LEN];  /* ne_lan.mac: match packet DMAC -> this LAN */
 };
 
 struct wan_config {

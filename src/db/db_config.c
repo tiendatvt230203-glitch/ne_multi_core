@@ -581,6 +581,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
 static int load_local_rows(struct app_config *cfg, PGresult *res) {
     int nrows = PQntuples(res);
+    int mac_set = 0;
+
     if (nrows == 0) {
         fprintf(stderr, "[DB] No LAN (ne_lan) for this profile\n");
         return -1;
@@ -590,8 +592,19 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
         return -1;
     }
 
+    {
+        int mac_col = PQfnumber(res, "mac");
+        if (mac_col < 0) {
+            fprintf(stderr,
+                    "[DB LAN] warning: ne_lan.mac column missing — "
+                    "ALTER TABLE ne_lan ADD COLUMN mac VARCHAR(17) NULL;\n");
+        }
+    }
+
     for (int row = 0; row < nrows; row++) {
         struct local_config *loc = &cfg->locals[cfg->local_count];
+        static const uint8_t zero_mac[MAC_LEN];
+
         memset(loc, 0, sizeof(*loc));
 
         const char *v = PQgetvalue(res, row, PQfnumber(res, "ifname"));
@@ -614,8 +627,25 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
             }
         }
 
+        if (memcmp(loc->mac, zero_mac, MAC_LEN) != 0) {
+            mac_set++;
+            fprintf(stderr,
+                    "[DB LAN] %s mac=%02x:%02x:%02x:%02x:%02x:%02x (DMAC match)\n",
+                    loc->ifname,
+                    loc->mac[0], loc->mac[1], loc->mac[2],
+                    loc->mac[3], loc->mac[4], loc->mac[5]);
+        } else {
+            fprintf(stderr,
+                    "[DB LAN] %s mac=(not set) — WAN->LAN forward by DMAC will miss\n",
+                    loc->ifname);
+        }
+
         cfg->local_count++;
     }
+
+    fprintf(stderr, "[DB LAN] loaded %d interface(s), %d with mac configured\n",
+            cfg->local_count, mac_set);
+    fflush(stderr);
     return 0;
 }
 
