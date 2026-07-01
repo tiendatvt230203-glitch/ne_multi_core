@@ -3,11 +3,31 @@
 #include "../../inc/core/config.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #ifndef MAC_LEARN_CACHE_TTL_MIN
 #define MAC_LEARN_CACHE_TTL_MIN 5ull
+#endif
+
+/* --- hard MAC test: set 1 to seed fixed DMAC->interface table, skip dynamic learn --- */
+#ifndef MAC_LEARN_HARD_ENABLE
+#define MAC_LEARN_HARD_ENABLE 0
+#endif
+
+/*
+ * Edit DMACs below (MAC đích trong gói sau decrypt -> interface local).
+ * Có thể thêm dòng { "enp5s0", "aa:bb:..." } cho nhiều host cùng cổng.
+ */
+#if MAC_LEARN_HARD_ENABLE
+static const struct {
+    const char *ifname;
+    const char *mac;
+} mac_hard_table[] = {
+    { "enp5s0", "00:00:00:00:00:00" },  /* TODO: DMAC Server02 / gateway enp5 */
+    { "enp6s0", "00:00:00:00:00:00" },  /* TODO: DMAC enp6 nếu cần */
+};
 #endif
 
 #define MAC_LEARN_ENTRY_TTL_MS  (MAC_LEARN_CACHE_TTL_MIN * 60ull * 1000ull)
@@ -285,11 +305,63 @@ static int mac_is_multicast(const uint8_t mac[MAC_LEN])
     return (mac[0] & 0x01u) != 0;
 }
 
+#if MAC_LEARN_HARD_ENABLE
+static int parse_mac_str(const char *str, uint8_t mac[MAC_LEN])
+{
+    unsigned int b[MAC_LEN];
+    int n;
+
+    if (!str || !mac)
+        return -1;
+    n = sscanf(str, "%x:%x:%x:%x:%x:%x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]);
+    if (n != MAC_LEN)
+        return -1;
+    for (int i = 0; i < MAC_LEN; i++)
+        mac[i] = (uint8_t)b[i];
+    return 0;
+}
+
+static void mac_hard_seed(struct mac_learn_table *t)
+{
+    if (!t)
+        return;
+
+    fprintf(stderr, "[MAC] hard-table enabled (dynamic learn + TTL off)\n");
+
+    pthread_spin_lock(&t->lock);
+    t->count = 0;
+    for (size_t i = 0; i < sizeof(mac_hard_table) / sizeof(mac_hard_table[0]); i++) {
+        uint8_t mac[MAC_LEN];
+        const char *ifname = mac_hard_table[i].ifname;
+        const char *mac_str = mac_hard_table[i].mac;
+
+        if (parse_mac_str(mac_str, mac) != 0) {
+            fprintf(stderr, "[MAC] hard bad mac '%s' for %s\n", mac_str, ifname);
+            continue;
+        }
+        if (mac_is_zero(mac)) {
+            fprintf(stderr, "[MAC] hard skip zero mac for %s\n", ifname);
+            continue;
+        }
+        upsert_locked(t, ifname, mac, 0);
+        log_mac("hard-seed", mac, ifname);
+    }
+    pthread_spin_unlock(&t->lock);
+
+    fprintf(stderr, "[MAC] hard-table loaded %d entries\n", t->count);
+    fflush(stderr);
+}
+#endif
+
 void mac_learn_bootstrap(struct mac_learn_table *t)
 {
     if (!t)
         return;
     table_init(t);
+#if MAC_LEARN_HARD_ENABLE
+    mac_hard_seed(t);
+#endif
 }
 
 void mac_learn_shutdown(struct mac_learn_table *t)
@@ -303,6 +375,9 @@ void mac_learn_tick(struct forwarder *fwd)
 {
     if (!fwd)
         return;
+#if MAC_LEARN_HARD_ENABLE
+    return;
+#endif
     table_maintain(&fwd->mac_table, fwd->cfg);
 }
 
@@ -310,6 +385,9 @@ void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint3
 {
     const uint8_t *src;
 
+#if MAC_LEARN_HARD_ENABLE
+    return;
+#endif
     if (!fwd || !pkt || len < ETH_HEADER_SIZE ||
         ingress_idx < 0 || ingress_idx >= fwd->local_count)
         return;
@@ -331,3 +409,4 @@ int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN])
         return -1;
     return ingress_idx_by_ifname(fwd, ifname);
 }
+

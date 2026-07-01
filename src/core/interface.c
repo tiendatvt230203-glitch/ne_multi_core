@@ -15,10 +15,6 @@
 #include <ctype.h>
 #include <dirent.h>
 
-#ifndef XDP_PKT_CONTD
-#define XDP_PKT_CONTD (1 << 0)
-#endif
-
 #ifndef NE_DP_WARN_LOG_ENABLE
 #define NE_DP_WARN_LOG_ENABLE 0
 #endif
@@ -410,33 +406,6 @@ static uint32_t pool_pop(struct ne_pool *p, uint64_t *addrs, uint32_t n)
     return got;
 }
 
-#define NE_ADDR_EXTERNAL (1ULL << 63)
-#define NE_ADDR_MASK     (~NE_ADDR_EXTERNAL)
-
-static int ne_addr_is_external(uint64_t addr)
-{
-    return (addr & NE_ADDR_EXTERNAL) != 0;
-}
-
-static void *ne_addr_external_ptr(uint64_t addr)
-{
-    return (void *)(uintptr_t)(addr & NE_ADDR_MASK);
-}
-
-int ne_packet_alloc(struct ne_pair *p, uint32_t len, uint64_t *addr_out)
-{
-    if (!p || !addr_out || len > NE_PACKET_MAX)
-        return -1;
-    if (NE_PACKET_MAX > NE_FRAME || len > p->frame_size) {
-        void *buf = malloc(NE_PACKET_MAX);
-        if (!buf)
-            return -1;
-        *addr_out = ((uint64_t)(uintptr_t)buf) | NE_ADDR_EXTERNAL;
-        return 0;
-    }
-    return pool_pop(&p->pool, addr_out, 1) == 1 ? 0 : -1;
-}
-
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
 {
     return (p && addr_out && pool_pop(&p->pool, addr_out, 1) == 1) ? 0 : -1;
@@ -444,18 +413,12 @@ int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
 
 void ne_frame_free(struct ne_pair *p, uint64_t addr)
 {
-    if (ne_addr_is_external(addr)) {
-        free(ne_addr_external_ptr(addr));
-        return;
-    }
     if (p)
         (void)pool_push(&p->pool, &addr, 1);
 }
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr)
 {
-    if (ne_addr_is_external(addr))
-        return ne_addr_external_ptr(addr);
     return xsk_umem__get_data(p->bufs, addr);
 }
 
@@ -467,11 +430,7 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
         .tx_size = NE_RING,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = p->xdp_flags,
-        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP
-#ifdef XDP_USE_SG
-                    | XDP_USE_SG
-#endif
-        ,
+        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
     };
 
     iface->ifindex = (int)if_nametoindex(ifname);
@@ -486,13 +445,8 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
         int ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
                                             &slot->rx, &slot->tx,
                                             &slot->fq, &slot->cq, &cfg);
-        if (ret) {
-            int err = ret < 0 ? -ret : ret;
-            fprintf(stderr, "[DP-INIT] xsk socket failed iface=%s queue=%d ret=%d err=%s errno=%d:%s\n",
-                    ifname, q, ret, strerror(err), errno, strerror(errno));
-            fflush(stderr);
+        if (ret)
             return -1;
-        }
     }
     return 0;
 }
@@ -544,37 +498,19 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         fflush(stderr);
     }
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
-    if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
-        fprintf(stderr, "[DP-INIT] setrlimit RLIMIT_MEMLOCK failed errno=%d:%s\n",
-                errno, strerror(errno));
-        fflush(stderr);
-    }
+    (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
     p->frame_size = NE_FRAME;
     p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
-    p->xdp_flags = NE_XDP_MODE;
-    fprintf(stderr,
-            "[DP-INIT] mtu_profile=%d frame=%u base_frames=%u total_frames=%u ifaces=%d bufsize=%zu xdp_flags=0x%x\n",
-            NE_MTU_PROFILE, p->frame_size, (uint32_t)NE_N_FRAMES, p->n_frames,
-            p->local_count + p->wan_count, p->bufsize, p->xdp_flags);
-    fflush(stderr);
+    p->xdp_flags = XDP_FLAGS_DRV_MODE;
 
     p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p->bufs == MAP_FAILED) {
-        fprintf(stderr, "[DP-INIT] mmap UMEM failed size=%zu errno=%d:%s\n",
-                p->bufsize, errno, strerror(errno));
-        fflush(stderr);
+    if (p->bufs == MAP_FAILED)
         return -1;
-    }
 
-    if (pool_init(&p->pool, p->n_frames) != 0) {
-        fprintf(stderr, "[DP-INIT] pool_init failed frames=%u errno=%d:%s\n",
-                p->n_frames, errno, strerror(errno));
-        fflush(stderr);
-        goto fail;
-    }
+    NE_TRY(pool_init(&p->pool, p->n_frames));
     for (uint32_t i = 0; i < p->n_frames; i++) {
         uint64_t addr = (uint64_t)i * p->frame_size;
         (void)pool_push(&p->pool, &addr, 1);
@@ -620,20 +556,9 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         .flags = 0,
     };
 
-    {
-        int ret = xsk_umem__create(&p->umem, p->bufs, p->bufsize,
-                                   &p->locals[0].queues[0].fq,
-                                   &p->locals[0].queues[0].cq, &ucfg);
-        if (ret != 0) {
-            int err = ret < 0 ? -ret : ret;
-            fprintf(stderr,
-                    "[DP-INIT] xsk_umem create failed ret=%d err=%s errno=%d:%s frame=%u size=%zu fill=%u comp=%u\n",
-                    ret, strerror(err), errno, strerror(errno), p->frame_size, p->bufsize,
-                    (uint32_t)NE_RING, (uint32_t)NE_RING);
-            fflush(stderr);
-            goto fail;
-        }
-    }
+    NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize,
+                            &p->locals[0].queues[0].fq,
+                            &p->locals[0].queues[0].cq, &ucfg));
 
     for (int i = 0; i < p->local_count; i++)
         NE_TRY(open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
@@ -802,85 +727,21 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
     }
 }
 // RX
-static int recv_queue(struct ne_pair *p, struct ne_xsk_queue *slot, struct ne_packet *out,
-                      uint32_t max, uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
+static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t max,
+                      uint8_t dir, uint8_t wan_idx, uint8_t local_idx)
 {
     uint32_t idx = 0;
-    uint32_t n = xsk_ring_cons__peek(&slot->rx, NE_BATCH_SIZE, &idx);
-    uint32_t used = 0;
-    uint32_t produced = 0;
-    uint64_t recycle[NE_BATCH_SIZE];
-    uint32_t recycle_count = 0;
-
-    while (used < n && produced < max) {
-        uint32_t chain = 0;
-        uint32_t total_len = 0;
-        int complete = 0;
-
-        while (used + chain < n) {
-            const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + used + chain);
-            total_len += d->len;
-            chain++;
-            if ((d->options & XDP_PKT_CONTD) == 0) {
-                complete = 1;
-                break;
-            }
-        }
-        if (!complete)
-            break;
-
-        if (total_len == 0 || total_len > NE_PACKET_MAX) {
-            for (uint32_t j = 0; j < chain && recycle_count < NE_BATCH_SIZE; j++) {
-                const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + used + j);
-                recycle[recycle_count++] = d->addr;
-            }
-            used += chain;
-            continue;
-        }
-
-        if (NE_PACKET_MAX > NE_FRAME) {
-            uint64_t pkt_addr;
-            uint8_t *dst;
-            uint32_t off = 0;
-
-            if (ne_packet_alloc(p, total_len, &pkt_addr) != 0)
-                break;
-            dst = ne_packet_data(p, pkt_addr);
-            for (uint32_t j = 0; j < chain; j++) {
-                const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + used + j);
-                memcpy(dst + off, ne_packet_data(p, d->addr), d->len);
-                off += d->len;
-                if (recycle_count < NE_BATCH_SIZE)
-                    recycle[recycle_count++] = d->addr;
-            }
-            out[produced].addr = pkt_addr;
-        } else {
-            const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + used);
-            if (chain != 1) {
-                for (uint32_t j = 0; j < chain && recycle_count < NE_BATCH_SIZE; j++) {
-                    const struct xdp_desc *rd = xsk_ring_cons__rx_desc(&slot->rx, idx + used + j);
-                    recycle[recycle_count++] = rd->addr;
-                }
-                used += chain;
-                continue;
-            }
-            out[produced].addr = d->addr;
-        }
-
-        out[produced].len = total_len;
-        out[produced].dir = dir;
-        out[produced].wan_idx = wan_idx;
-        out[produced].local_idx = local_idx;
-        produced++;
-        used += chain;
+    uint32_t n = xsk_ring_cons__peek(&slot->rx, max, &idx);
+    for (uint32_t i = 0; i < n; i++) {
+        const struct xdp_desc *d = xsk_ring_cons__rx_desc(&slot->rx, idx + i);
+        out[i].addr = d->addr;
+        out[i].len = d->len;
+        out[i].dir = dir;
+        out[i].wan_idx = wan_idx;
+        out[i].local_idx = local_idx;
     }
-
-    if (used > 0)
-        xsk_ring_cons__release(&slot->rx, used);
-    if (recycle_count > 0)
-        (void)pool_push(&p->pool, recycle, recycle_count);
-    slot->rx_pending = 0;
-    return (int)produced;
+    slot->rx_pending = n;
+    return (int)n;
 }
 
 static int xsk_queue_for_rx_slot(int q, int rx_slot, int nq, int rx_slots)
@@ -911,7 +772,7 @@ int ne_recv_local_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, ui
                 continue;
             iface->queues[q].rx_pending = 0;
 
-            int n = recv_queue(p, &iface->queues[q], out_ptr, max - total,
+            int n = recv_queue(&iface->queues[q], out_ptr, max - total,
                                NE_DIR_LOCAL, 0, (uint8_t)i);
 
             total += (uint32_t)n;
@@ -945,7 +806,7 @@ int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint
                 continue;
             iface->queues[q].rx_pending = 0;
 
-            int n = recv_queue(p, &iface->queues[q], out_ptr, max - total,
+            int n = recv_queue(&iface->queues[q], out_ptr, max - total,
                                NE_DIR_WAN, (uint8_t)i, 0);
 
             total += (uint32_t)n;
@@ -1140,11 +1001,10 @@ void ne_refill_fq_wan(struct ne_pair *p)
 }
 
 // TX
-static int tx_drain_queue(struct ne_pair *p, struct ne_xsk_queue *slot, struct ne_ring *src,
-                          uint32_t max_frame,
+static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,
                           uint64_t *tx_no_free)
 {   
-    struct ne_packet job;
+    struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
     uint32_t pending = ne_ring_count(src);
     int cpu = sched_getcpu();
@@ -1160,75 +1020,43 @@ static int tx_drain_queue(struct ne_pair *p, struct ne_xsk_queue *slot, struct n
     }
     ne_dp_warn_tx(cpu, 0, pending);
 
-    if (ne_ring_try_pop(src, &job) != 0)
+    uint32_t popped = 0;
+    uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    while (popped < want && ne_ring_try_pop(src, &jobs[popped]) == 0)
+        popped++;
+    if (!popped)
         return 0;
-
-    uint32_t chunks = ne_addr_is_external(job.addr)
-        ? ((job.len + max_frame - 1u) / max_frame)
-        : 1u;
-    if (chunks == 0 || chunks > NE_BATCH_SIZE || chunks > free_slots) {
-        (void)ne_ring_try_push(src, &job);
-        return 0;
-    }
-
-    uint64_t chunk_addrs[NE_BATCH_SIZE];
-    memset(chunk_addrs, 0, sizeof(chunk_addrs));
-    if (ne_addr_is_external(job.addr)) {
-        for (uint32_t i = 0; i < chunks; i++) {
-            if (ne_frame_alloc(p, &chunk_addrs[i]) != 0) {
-                for (uint32_t j = 0; j < i; j++)
-                    ne_frame_free(p, chunk_addrs[j]);
-                (void)ne_ring_try_push(src, &job);
-                return 0;
-            }
-        }
-    }
 
     uint32_t idx = 0;
-    if (xsk_ring_prod__reserve(&slot->tx, chunks, &idx) != chunks) {
-        for (uint32_t i = 0; i < chunks; i++)
-            if (chunk_addrs[i])
-                ne_frame_free(p, chunk_addrs[i]);
-        (void)ne_ring_try_push(src, &job);
+    if (xsk_ring_prod__reserve(&slot->tx, popped, &idx) != popped) {
+        for (uint32_t i = 0; i < popped; i++)
+            (void)ne_ring_try_push(src, &jobs[i]);
         return 0;
     }
 
-    uint8_t *src_data = ne_packet_data(p, job.addr);
-    uint32_t off = 0;
-    for (uint32_t i = 0; i < chunks; i++) {
-        uint32_t left = job.len - off;
-        uint32_t seg_len = left > max_frame ? max_frame : left;
+    for (uint32_t i = 0; i < popped; i++) {
         struct xdp_desc *d = xsk_ring_prod__tx_desc(&slot->tx, idx + i);
-        if (ne_addr_is_external(job.addr)) {
-            d->addr = chunk_addrs[i];
-            memcpy(ne_packet_data(p, d->addr), src_data + off, seg_len);
-        } else {
-            d->addr = job.addr;
-        }
-        d->len = seg_len;
-        d->options = (i + 1u < chunks) ? XDP_PKT_CONTD : 0;
-        off += seg_len;
+        d->addr = jobs[i].addr;
+        d->len = jobs[i].len > max_frame ? max_frame : jobs[i].len;
     }
 
-    xsk_ring_prod__submit(&slot->tx, chunks);
-    if (ne_addr_is_external(job.addr))
-        ne_frame_free(p, job.addr);
+    xsk_ring_prod__submit(&slot->tx, popped);
     if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
         (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
     }
-    return 1;
+    return (int)popped;
 }
 
 
-static int tx_drain_iface_ring(struct ne_pair *p, struct ne_iface *iface, struct ne_ring *src,
-                               uint32_t max_frame, int tx_slot)
+static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint32_t max_frame,
+                               int tx_slot)
 {
     int nq = iface->queue_count;
 
     for (int q = 0; q < nq; q++) {
         if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
             continue;
-        int sent = tx_drain_queue(p, &iface->queues[q], src, max_frame, &iface->tx_no_free);
+        int sent = tx_drain_queue(&iface->queues[q], src, max_frame, &iface->tx_no_free);
         if (sent > 0)
             return sent;
     }
@@ -1237,9 +1065,8 @@ static int tx_drain_iface_ring(struct ne_pair *p, struct ne_iface *iface, struct
 
 static __thread uint32_t tls_tx_drain_rr;
 
-static int tx_drain_iface_all_rings(struct ne_pair *p, struct ne_iface *iface,
-                                    struct ne_ring *srcs[], int src_count,
-                                    uint32_t max_frame, int tx_slot)
+static int tx_drain_iface_all_rings(struct ne_iface *iface, struct ne_ring *srcs[],
+                                    int src_count, uint32_t max_frame, int tx_slot)
 {
     int sent = 0;
     int start;
@@ -1253,7 +1080,7 @@ static int tx_drain_iface_all_rings(struct ne_pair *p, struct ne_iface *iface,
 
         if (!srcs[s])
             continue;
-        sent += tx_drain_iface_ring(p, iface, srcs[s], max_frame, tx_slot);
+        sent += tx_drain_iface_ring(iface, srcs[s], max_frame, tx_slot);
     }
     if (sent > 0)
         tls_tx_drain_rr++;
@@ -1269,7 +1096,7 @@ int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_cou
         return 0;
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
-    return tx_drain_iface_all_rings(p, &p->locals[local_idx], srcs, src_count, p->frame_size,
+    return tx_drain_iface_all_rings(&p->locals[local_idx], srcs, src_count, p->frame_size,
                                     tx_slot);
 }
 
@@ -1282,6 +1109,5 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
         return 0;
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
-    return tx_drain_iface_all_rings(p, &p->wans[wan_idx], srcs, src_count, p->frame_size, tx_slot);
+    return tx_drain_iface_all_rings(&p->wans[wan_idx], srcs, src_count, p->frame_size, tx_slot);
 }
-

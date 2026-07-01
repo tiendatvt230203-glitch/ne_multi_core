@@ -6,19 +6,21 @@
 #include <string.h>
 #include <time.h>
 #include "config.h"
-#include "mtu_config.h"
 #include "packet_crypto.h"
 #include "crypto_layer4.h"
 #include "crypto_layer2.h"
 #include "crypto_layer3.h"
 
 #define FRAG_L4_HDR_SIZE    4
+#define FRAG_MTU            1500
+
+#define FRAG_TABLE_SIZE     4096
 #define FRAG_TIMEOUT_NS     (200ULL * 1000000ULL)
 
 struct frag_entry {
     uint16_t pkt_id;
-    uint8_t  first[FRAG_REASSEMBLY_MAX];
-    uint8_t  second[FRAG_REASSEMBLY_MAX];
+    uint8_t  first[1600];
+    uint8_t  second[1600];
     uint32_t first_len;
     uint32_t second_len;
     uint8_t  eth_hdr[14];

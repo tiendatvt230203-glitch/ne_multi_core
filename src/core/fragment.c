@@ -88,7 +88,7 @@ static int frag_store_second(struct frag_entry *entry, uint16_t pkt_id,
 static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len, int eth_len) {
     if (!entry->got_first || !entry->got_second)
         return 0;
-    if (entry->first_len + entry->second_len + (uint32_t)eth_len > FRAG_REASSEMBLY_MAX) {
+    if (entry->first_len + entry->second_len + (uint32_t)eth_len > 4096) {
         memset(entry, 0, sizeof(*entry));
         return -1;
     }

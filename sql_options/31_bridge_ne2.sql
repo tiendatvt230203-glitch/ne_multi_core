@@ -81,7 +81,14 @@ INSERT INTO ne_policies (
     'aes-gcm-256', '8bf23b1f8bd5719dcdaccd99e643d257397898e401ae27fd8218c7b724370933'
 ),
 (
-    9, 31, 9, 'bypass', NULL,
+    9, 31, 9, 'L2', 'tcp/udp',
+    ARRAY['192.168.50.3/32']::text[], FALSE,
+    ARRAY['192.168.50.2/32']::text[], FALSE,
+    ARRAY['7012']::text[], NULL,
+    'pqc-gcm', NULL
+),
+(
+    10, 31, 10, 'bypass', NULL,
     NULL, FALSE,
     NULL, FALSE,
     NULL, NULL,
@@ -94,7 +101,9 @@ INSERT INTO ne_lan (interface, profile_id) VALUES
 
 INSERT INTO ne_wan (interface, profile_id, dst_ip, weight) VALUES
     ('enp7s0', 31, NULL, 50),
-    ('enp8s0', 31, NULL, 50);
+    ('enp8s0', 31, NULL, 50),
+    ('eno2',31, 192.168.8.1/24, NULL);
+
 
 SELECT setval(pg_get_serial_sequence('ne_profiles', 'id')::regclass,
     COALESCE((SELECT MAX(id) FROM ne_profiles), 1), true);

@@ -3,11 +3,12 @@
 
 #include "common.h"
 #include "config.h"
-#include "mtu_config.h"
 #include <pthread.h>
 #include <signal.h>
 
-#define NE_RING        16384u
+#define NE_RING        65536u
+#define NE_FRAME       2048u
+#define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
 
 #define NE_QUEUE_OVERRIDE 0
@@ -132,7 +133,6 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
                         int wan_idx, int tx_slot);
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
-int ne_packet_alloc(struct ne_pair *p, uint32_t len, uint64_t *addr_out);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 

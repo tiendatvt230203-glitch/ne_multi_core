@@ -5,12 +5,13 @@ After=network.target postgresql.service
 [Service]
 Type=simple
 User=root
-Environment="LD_LIBRARY_PATH=/usr/bin/bin-ne/lib"
 EnvironmentFile=/opt/SEP/be/.env
-WorkingDirectory=/usr/bin/bin-ne
 ExecStart=/usr/bin/bin-ne/network-encryptor
 Restart=always
 RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
+# ln -s /usr/bin/bin-ne/network-encryptor /usr/local/bin/network-encryptor
+# /etc/ld.so.conf.d/network-encryptor.conf
+# ldconfig
