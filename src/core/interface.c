@@ -146,6 +146,61 @@ static uint32_t next_pow2_u32(uint32_t v)
     return v + 1;
 }
 
+static uint32_t ne_compute_n_frames(int local_count, int wan_count,
+                                    int local_q_total, int wan_q_total)
+{
+    int total_q = local_q_total + wan_q_total;
+
+    if (total_q < 1)
+        total_q = 1;
+    uint32_t base = NE_N_FRAMES * (uint32_t)(local_count + wan_count + 1);
+    uint32_t extra = (uint32_t)total_q * NE_POOL_QUEUE_EXTRA;
+
+    return next_pow2_u32(base + extra);
+}
+
+static uint32_t ne_fq_prefill_per_queue(const struct ne_pair *p)
+{
+    int total_q;
+    uint32_t fq_budget;
+    uint32_t per;
+
+    if (!p)
+        return NE_RING - 1;
+    total_q = p->local_queue_total + p->wan_queue_total;
+    if (total_q < 1)
+        return NE_RING - 1;
+
+    /* Keep majority of UMEM for encrypt in-flight (rings, split, reassembly) */
+    fq_budget = p->n_frames / 3u;
+    per = fq_budget / (uint32_t)total_q;
+    if (total_q >= NE_FQ_MANY_QUEUE_THRESH && per > NE_FQ_PREFILL_CAP_MANY)
+        per = NE_FQ_PREFILL_CAP_MANY;
+    if (per < NE_FQ_PREFILL_MIN)
+        per = NE_FQ_PREFILL_MIN;
+    if (per > NE_RING - 1)
+        per = NE_RING - 1;
+    return per;
+}
+
+static uint32_t pool_free_count(struct ne_pool *p)
+{
+    if (!p || !p->buf)
+        return 0;
+    return p->cap - (p->head - p->tail);
+}
+
+static void ne_dp_warn_pool_empty(void)
+{
+    static int warned;
+
+    if (warned)
+        return;
+    warned = 1;
+    fprintf(stderr, "[DP-WARN] UMEM pool empty (frame alloc/refill failed)\n");
+    fflush(stderr);
+}
+
 static int ifname_is_safe(const char *ifname)
 {
     if (!ifname || !ifname[0])
@@ -408,7 +463,17 @@ static uint32_t pool_pop(struct ne_pool *p, uint64_t *addrs, uint32_t n)
 
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
 {
-    return (p && addr_out && pool_pop(&p->pool, addr_out, 1) == 1) ? 0 : -1;
+    if (p && addr_out && pool_pop(&p->pool, addr_out, 1) == 1)
+        return 0;
+    ne_dp_warn_pool_empty();
+    return -1;
+}
+
+uint32_t ne_frame_alloc_batch(struct ne_pair *p, uint64_t *addrs_out, uint32_t max_n)
+{
+    if (!p || !addrs_out || max_n == 0)
+        return 0;
+    return pool_pop(&p->pool, addrs_out, max_n);
 }
 
 void ne_frame_free(struct ne_pair *p, uint64_t addr)
@@ -501,20 +566,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
     p->frame_size = NE_FRAME;
-    p->n_frames = next_pow2_u32(NE_N_FRAMES * (uint32_t)(p->local_count + p->wan_count + 1));
-    p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
     p->xdp_flags = XDP_FLAGS_DRV_MODE;
-
-    p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p->bufs == MAP_FAILED)
-        return -1;
-
-    NE_TRY(pool_init(&p->pool, p->n_frames));
-    for (uint32_t i = 0; i < p->n_frames; i++) {
-        uint64_t addr = (uint64_t)i * p->frame_size;
-        (void)pool_push(&p->pool, &addr, 1);
-    }
 
     p->local_queue_total = 0;
     p->wan_queue_total = 0;
@@ -537,6 +589,21 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         p->wan_queue_total += nq;
         fprintf(stderr, "[DP-CONF] %s WAN queues=%d%s\n", cfg->wans[ci].ifname, nq,
                 NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
+    }
+
+    p->n_frames = ne_compute_n_frames(p->local_count, p->wan_count,
+                                      p->local_queue_total, p->wan_queue_total);
+    p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
+
+    p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p->bufs == MAP_FAILED)
+        return -1;
+
+    NE_TRY(pool_init(&p->pool, p->n_frames));
+    for (uint32_t i = 0; i < p->n_frames; i++) {
+        uint64_t addr = (uint64_t)i * p->frame_size;
+        (void)pool_push(&p->pool, &addr, 1);
     }
 
     for (int i = 0; i < p->local_count; i++)
@@ -571,13 +638,24 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
                                  p->wans[di].queue_count));
     }
 
-    uint32_t prefill = NE_RING - 1;
-    if (prefill == 0)
-        prefill = 1;
+    uint32_t prefill = ne_fq_prefill_per_queue(p);
+    uint32_t fq_total = prefill * (uint32_t)(p->local_queue_total + p->wan_queue_total);
+
+    fprintf(stderr,
+            "[DP-CONF] UMEM frames=%u (~%zu MB) queues=%d fq_prefill/queue=%u (~%u in FQ, ~%u free)\n",
+            p->n_frames, p->bufsize / (1024u * 1024u),
+            p->local_queue_total + p->wan_queue_total, prefill, fq_total,
+            pool_free_count(&p->pool));
+    fflush(stderr);
+
     for (int i = 0; i < p->local_count; i++)
         prefill_iface(p, &p->locals[i], prefill);
     for (int i = 0; i < p->wan_count; i++)
         prefill_iface(p, &p->wans[i], prefill);
+
+    fprintf(stderr, "[DP-CONF] UMEM pool after FQ prefill: ~%u frames free\n",
+            pool_free_count(&p->pool));
+    fflush(stderr);
 
     for (int i = 0; i < p->local_count; i++)
         p->local_live[i] = 1;
@@ -653,14 +731,11 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
     if (open_iface_queues(p, &p->locals[pair_li], ifname, nq) != 0)
         return -1;
 
-    uint32_t prefill = NE_RING - 1;
-    if (prefill == 0)
-        prefill = 1;
-    prefill_iface(p, &p->locals[pair_li], prefill);
-    p->local_live[pair_li] = 1;
     if (pair_li >= p->local_count)
         p->local_count = pair_li + 1;
     p->local_queue_total += nq;
+    prefill_iface(p, &p->locals[pair_li], ne_fq_prefill_per_queue(p));
+    p->local_live[pair_li] = 1;
     return 0;
 }
 
@@ -682,14 +757,11 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
     if (open_iface_queues(p, &p->wans[dp_slot], ifname, nq) != 0)
         return -1;
 
-    uint32_t prefill = NE_RING - 1;
-    if (prefill == 0)
-        prefill = 1;
-    prefill_iface(p, &p->wans[dp_slot], prefill);
-    p->wan_live[dp_slot] = 1;
     if (dp_slot >= p->wan_count)
         p->wan_count = dp_slot + 1;
     p->wan_queue_total += nq;
+    prefill_iface(p, &p->wans[dp_slot], ne_fq_prefill_per_queue(p));
+    p->wan_live[dp_slot] = 1;
     return 0;
 }
 

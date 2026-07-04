@@ -6,12 +6,18 @@
 #include <pthread.h>
 #include <signal.h>
 
-#define NE_RING        65536u
+#define NE_RING        16384u
 #define NE_FRAME       2048u
 #define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
 
 #define NE_QUEUE_OVERRIDE 0
+
+/* FQ prefill scales down when many NIC queues (e.g. fiber 12q) share UMEM */
+#define NE_FQ_PREFILL_MIN       512u
+#define NE_FQ_PREFILL_CAP_MANY  2048u
+#define NE_FQ_MANY_QUEUE_THRESH 16
+#define NE_POOL_QUEUE_EXTRA     8192u
 
 #include "cpu_map.h"
 
@@ -134,6 +140,7 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
+uint32_t ne_frame_alloc_batch(struct ne_pair *p, uint64_t *addrs_out, uint32_t max_n);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 
 void interface_reset_redirect_maps(void);

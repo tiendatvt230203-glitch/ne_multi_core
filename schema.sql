@@ -69,7 +69,6 @@ CREATE TABLE ne_wan (
 CREATE TABLE ne_lan (
     id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     interface   VARCHAR(255) NOT NULL,
-    mac         VARCHAR(17)  NULL,
     profile_id  INT          NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE
 );
 

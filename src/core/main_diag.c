@@ -4,8 +4,6 @@
 
 #include "../../inc/core/config.h"
 
-#include "../../inc/core/config.h"
-
 #define DIAG_TBL_N     12
 #define DIAG_CIDR_LEN  24
 
@@ -112,40 +110,25 @@ static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_
              (unsigned)cp->aes_bits);
 }
 
-static void format_mac_diag(char *buf, size_t bufsz, const uint8_t mac[MAC_LEN])
-{
-    static const uint8_t zero[MAC_LEN];
-
-    if (!buf || bufsz == 0)
-        return;
-    if (memcmp(mac, zero, MAC_LEN) == 0) {
-        snprintf(buf, bufsz, "(not set)");
-        return;
-    }
-    snprintf(buf, bufsz, "%02x:%02x:%02x:%02x:%02x:%02x",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 static void print_iface_table(const struct app_config *cfg) {
-    static const int w[DIAG_TBL_N] = { 8, 12, 20, 0, 0, 0, 0, 0 };
+    static const int w[DIAG_TBL_N] = { 14, 12, 0, 0, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "dmac", "", "", "", "", ""
+        "role", "interface", "", "", "", "", "", ""
     };
 
-    fprintf(stderr, "\n  [interfaces]  dmac = ne_lan.mac (match dest MAC -> LAN)\n");
-    tbl_hline(w, 3);
-    tbl_row(w, 3, hdr);
-    tbl_hline(w, 3);
+    fprintf(stderr, "\n  [interfaces]\n");
+    tbl_hline(w, 2);
+    tbl_row(w, 2, hdr);
+    tbl_hline(w, 2);
 
     for (int i = 0; i < cfg->local_count; i++) {
-        char c0[32], c1[32], c2[32];
+        char c0[32], c1[32];
         snprintf(c0, sizeof(c0), "lan");
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        format_mac_diag(c2, sizeof(c2), cfg->locals[i].mac);
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
-        tbl_row(w, 3, row);
+        const char *row[DIAG_TBL_N] = { c0, c1, "", "", "", "", "", "" };
+        tbl_row(w, 2, row);
     }
-    tbl_hline(w, 3);
+    tbl_hline(w, 2);
 }
 
 static void print_policy_table(const struct app_config *cfg) {
