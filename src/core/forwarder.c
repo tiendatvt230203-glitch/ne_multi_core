@@ -460,15 +460,19 @@ void forwarder_run(struct forwarder *fwd)
     if (ne_cpu_map_validate() != 0)
         return;
 
-    for (int w = 0; w < (int)NE_RX_LAN_SLOTS; w++) {
-        local_rx_ctx[w].fwd = fwd;
-        local_rx_ctx[w].rx_slot = w;
-        local_rx_ctx[w].cpu_id = ne_cpu_rx_lan((uint32_t)w);
-        if (pthread_create(&fwd->local_rx_threads[w], NULL, local_rx_thread, &local_rx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, 0, 0, 0, 0);
-            return;
+    {
+        int lan_rx_active = ne_rx_lan_slots_for(fwd->pair.local_queue_total);
+
+        for (int w = 0; w < lan_rx_active; w++) {
+            local_rx_ctx[w].fwd = fwd;
+            local_rx_ctx[w].rx_slot = w;
+            local_rx_ctx[w].cpu_id = ne_cpu_rx_lan((uint32_t)w);
+            if (pthread_create(&fwd->local_rx_threads[w], NULL, local_rx_thread, &local_rx_ctx[w]) != 0) {
+                forwarder_join_started(fwd, local_rx_started, 0, 0, 0, 0);
+                return;
+            }
+            local_rx_started++;
         }
-        local_rx_started++;
     }
 
     for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
@@ -505,16 +509,20 @@ void forwarder_run(struct forwarder *fwd)
         wan_tx_started++;
     }
 
-    for (int w = 0; w < (int)NE_RX_WAN_SLOTS; w++) {
-        wan_rx_ctx[w].fwd = fwd;
-        wan_rx_ctx[w].rx_slot = w;
-        wan_rx_ctx[w].cpu_id = ne_cpu_rx_wan((uint32_t)w);
-        if (pthread_create(&fwd->wan_rx_threads[w], NULL, wan_rx_thread, &wan_rx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started,
-                                   wan_tx_started, wan_rx_started);
-            return;
+    {
+        int wan_rx_active = ne_rx_wan_slots_for(fwd->pair.wan_queue_total);
+
+        for (int w = 0; w < wan_rx_active; w++) {
+            wan_rx_ctx[w].fwd = fwd;
+            wan_rx_ctx[w].rx_slot = w;
+            wan_rx_ctx[w].cpu_id = ne_cpu_rx_wan((uint32_t)w);
+            if (pthread_create(&fwd->wan_rx_threads[w], NULL, wan_rx_thread, &wan_rx_ctx[w]) != 0) {
+                forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started,
+                                       wan_tx_started, wan_rx_started);
+                return;
+            }
+            wan_rx_started++;
         }
-        wan_rx_started++;
     }
 
     fwd->threads_started = 1;

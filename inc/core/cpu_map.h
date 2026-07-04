@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 
-/* 12 cores: 2x RX_WAN for fiber 12q (24 WAN sockets); 5 crypto workers */
 static const uint8_t NE_CPU_RX_LAN[]  = { 0u };
 static const uint8_t NE_CPU_TX_LAN[]  = { 1u, 2u };
 static const uint8_t NE_CPU_CRYPTO[]  = { 3u, 4u, 5u, 6u, 7u };

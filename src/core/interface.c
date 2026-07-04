@@ -162,7 +162,7 @@ static uint32_t ne_compute_n_frames(int local_count, int wan_count,
 static uint32_t ne_fq_prefill_per_queue(const struct ne_pair *p)
 {
     int total_q;
-    uint32_t fq_budget;
+    uint32_t fq_cap;
     uint32_t per;
 
     if (!p)
@@ -171,16 +171,59 @@ static uint32_t ne_fq_prefill_per_queue(const struct ne_pair *p)
     if (total_q < 1)
         return NE_RING - 1;
 
-    /* Keep majority of UMEM for encrypt in-flight (rings, split, reassembly) */
-    fq_budget = p->n_frames / 3u;
-    per = fq_budget / (uint32_t)total_q;
-    if (total_q >= NE_FQ_MANY_QUEUE_THRESH && per > NE_FQ_PREFILL_CAP_MANY)
-        per = NE_FQ_PREFILL_CAP_MANY;
+    fq_cap = (p->n_frames * NE_FQ_POOL_PCT_MAX) / 100u;
+    if (fq_cap < (uint32_t)total_q * NE_FQ_PREFILL_MIN)
+        fq_cap = (uint32_t)total_q * NE_FQ_PREFILL_MIN;
+    per = fq_cap / (uint32_t)total_q;
     if (per < NE_FQ_PREFILL_MIN)
         per = NE_FQ_PREFILL_MIN;
     if (per > NE_RING - 1)
         per = NE_RING - 1;
     return per;
+}
+
+static int ne_rx_slots_for_queues(int queue_total, uint32_t slots_max)
+{
+    int need;
+
+    if (queue_total <= 0)
+        return 1;
+    need = (queue_total + (int)NE_QUEUES_PER_RX_SLOT - 1) / (int)NE_QUEUES_PER_RX_SLOT;
+    if (need < 1)
+        need = 1;
+    if ((uint32_t)need > slots_max)
+        need = (int)slots_max;
+    return need;
+}
+
+int ne_rx_lan_slots_for(int local_queue_total)
+{
+    return ne_rx_slots_for_queues(local_queue_total, NE_RX_LAN_SLOTS);
+}
+
+int ne_rx_wan_slots_for(int wan_queue_total)
+{
+    return ne_rx_slots_for_queues(wan_queue_total, NE_RX_WAN_SLOTS);
+}
+
+void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total)
+{
+    int total_q = local_queue_total + wan_queue_total;
+    int lan_rx = ne_rx_lan_slots_for(local_queue_total);
+    int wan_rx = ne_rx_wan_slots_for(wan_queue_total);
+    int wan_rx_ideal = ne_rx_slots_for_queues(wan_queue_total, MAX_QUEUES);
+
+    fprintf(stderr,
+            "[DP-CONF] HW scale: queues(lan=%d wan=%d total=%d) "
+            "RX threads(lan=%d/%u wan=%d/%u)\n",
+            local_queue_total, wan_queue_total, total_q,
+            lan_rx, (unsigned)NE_RX_LAN_SLOTS, wan_rx, (unsigned)NE_RX_WAN_SLOTS);
+    if (wan_rx_ideal > wan_rx)
+        fprintf(stderr,
+                "[DP-CONF] hint: %d WAN queues benefit from %d RX_WAN cores "
+                "(cpu_map has %u; add cores or extend NE_CPU_RX_WAN[])\n",
+                wan_queue_total, wan_rx_ideal, (unsigned)NE_RX_WAN_SLOTS);
+    fflush(stderr);
 }
 
 static uint32_t pool_free_count(struct ne_pool *p)
@@ -655,6 +698,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
 
     fprintf(stderr, "[DP-CONF] UMEM pool after FQ prefill: ~%u frames free\n",
             pool_free_count(&p->pool));
+    ne_dp_log_hw_scale(p->local_queue_total, p->wan_queue_total);
     fflush(stderr);
 
     for (int i = 0; i < p->local_count; i++)

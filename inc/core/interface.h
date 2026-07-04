@@ -13,11 +13,10 @@
 
 #define NE_QUEUE_OVERRIDE 0
 
-/* FQ prefill scales down when many NIC queues (e.g. fiber 12q) share UMEM */
 #define NE_FQ_PREFILL_MIN       512u
-#define NE_FQ_PREFILL_CAP_MANY  2048u
-#define NE_FQ_MANY_QUEUE_THRESH 16
+#define NE_FQ_POOL_PCT_MAX      18u
 #define NE_POOL_QUEUE_EXTRA     8192u
+#define NE_QUEUES_PER_RX_SLOT   6u
 
 #include "cpu_map.h"
 
@@ -147,5 +146,9 @@ void interface_reset_redirect_maps(void);
 void interface_promisc_off_config(const struct app_config *cfg);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
+
+int ne_rx_lan_slots_for(int local_queue_total);
+int ne_rx_wan_slots_for(int wan_queue_total);
+void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total);
 
 #endif
