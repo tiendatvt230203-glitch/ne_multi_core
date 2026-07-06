@@ -58,12 +58,13 @@ static void dp_burst_drain_cq_wan(struct forwarder *fwd, int tx_slot)
         ne_drain_cq_wan(&fwd->pair, tx_slot);
 }
 
-static void dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
+static int dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int total = 0;
 
     if (!ne_pair_local_live(&fwd->pair, local_idx))
-        return;
+        return 0;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         rings[w] = &fwd->mid_to_local[local_idx][w];
@@ -73,15 +74,18 @@ static void dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
                                          local_idx, tx_slot);
         if (sent <= 0)
             break;
+        total += sent;
     }
+    return total;
 }
 
-static void dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
+static int dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int total = 0;
 
     if (!ne_pair_wan_live(&fwd->pair, wan_idx))
-        return;
+        return 0;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         rings[w] = &fwd->mid_to_wan[wan_idx][w];
@@ -91,7 +95,9 @@ static void dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
                                        wan_idx, tx_slot);
         if (sent <= 0)
             break;
+        total += sent;
     }
+    return total;
 }
 
 struct dp_tx_slot_ctx {
@@ -156,10 +162,15 @@ static void *local_tx_thread(void *arg)
     ne_dp_tx_ctx("LAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        int did_work = 0;
+
         dp_burst_drain_cq_local(fwd, tx_slot);
-        for (int li = 0; li < fwd->local_count; li++)
-            dp_burst_tx_local(fwd, li, tx_slot);
-        sched_yield();
+        for (int li = 0; li < fwd->local_count; li++) {
+            if (dp_burst_tx_local(fwd, li, tx_slot) > 0)
+                did_work = 1;
+        }
+        if (!did_work)
+            sched_yield();
     }
     return NULL;
 }
@@ -217,13 +228,17 @@ static void *wan_tx_thread(void *arg)
     ne_dp_tx_ctx("WAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
+        int did_work = 0;
+
         dp_burst_drain_cq_wan(fwd, tx_slot);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
             if (fwd_wan_is_stopped(wi))
                 continue;
-            dp_burst_tx_wan(fwd, wi, tx_slot);
+            if (dp_burst_tx_wan(fwd, wi, tx_slot) > 0)
+                did_work = 1;
         }
-        sched_yield();
+        if (!did_work)
+            sched_yield();
     }
     return NULL;
 }

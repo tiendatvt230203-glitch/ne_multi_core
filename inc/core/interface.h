@@ -14,8 +14,8 @@
 
 #define NE_QUEUE_OVERRIDE 0
 
-/* Số frame nạp sẵn vào FQ mỗi queue lúc khởi động (max 32 queue vẫn dư pool) */
-#define NE_FQ_PREFILL   8192u
+/* Số frame nạp sẵn vào FQ mỗi queue lúc khởi động (= NE_RING-1, như bản ~2.7G) */
+#define NE_FQ_PREFILL   16383u
 
 #include "cpu_map.h"
 
