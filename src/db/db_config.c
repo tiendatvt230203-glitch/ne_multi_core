@@ -698,7 +698,7 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, dst_ip "
+        "SELECT interface AS ifname,  dst_ip "
         "FROM ne_wan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
 

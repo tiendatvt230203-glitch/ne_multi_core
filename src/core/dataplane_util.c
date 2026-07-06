@@ -32,7 +32,7 @@ int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
     if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
         uint8_t *l4 = (uint8_t *)pkt_data + sizeof(*eth) + ihl;
         if (pkt_len < (uint32_t)(l4 - (uint8_t *)pkt_data + 4))
-            return 0;
+            return -1;
         uint16_t *ports = (uint16_t *)l4;
         *src_port = ntohs(ports[0]);
         *dst_port = ntohs(ports[1]);
