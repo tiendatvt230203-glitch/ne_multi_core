@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/include",
+                "/usr/local/include",
+                "/usr/include/postgresql"
+            ],
+            "defines": [
+                "_GNU_SOURCE",
+                "__USE_POSIX199309",
+                "_XOPEN_SOURCE=600",
+                "_POSIX_C_SOURCE=200112L"
+            ],
+            "compilerPath": "/usr/bin/clang",
+            "cStandard": "gnu17",
+            "cppStandard": "gnu++14",
+            "intelliSenseMode": "linux-clang-x64"
+        }
+    ],
+    "version": 4
+}
