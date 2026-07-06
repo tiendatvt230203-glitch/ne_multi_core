@@ -33,7 +33,8 @@ void forwarder_pin_cpu(void)
 
 #define DP_BURST_ROUNDS   16
 #define DP_TX_BURST_MAX   32
-#define CRYPTO_WORK_BURST 32
+#define CRYPTO_WORK_BURST 64
+#define RX_POLL_ROUNDS     4
 
 static void dp_burst_refill_local(struct forwarder *fwd, int rx_slot)
 {
@@ -130,25 +131,29 @@ static void *local_rx_thread(void *arg)
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        dp_burst_refill_local(fwd, ctx->rx_slot);
+        int did_work = 0;
 
-        int rcvd = ne_recv_local_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
-        if (rcvd <= 0) {
+        dp_burst_refill_local(fwd, ctx->rx_slot);
+        for (int round = 0; round < RX_POLL_ROUNDS; round++) {
+            int rcvd = ne_recv_local_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
+            if (rcvd <= 0)
+                break;
+            did_work = 1;
+            for (int i = 0; i < rcvd; i++) {
+                int wi = dp_crypto_pick_local_worker(
+                    ne_packet_data(&fwd->pair, batch[i].addr), batch[i].len);
+                if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
+                    ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
+                                       ne_ring_count(&fwd->local_to_mid[wi]));
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                }
+            }
+            ne_recv_release_local_slot(&fwd->pair, ctx->rx_slot);
+        }
+        if (!did_work) {
             ne_dp_warn_rx("LAN", (int)ctx->cpu_id, 0);
             sched_yield();
-            continue;
         }
-
-        for (int i = 0; i < rcvd; i++) {
-            int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
-                                                 batch[i].len);
-            if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
-                                   ne_ring_count(&fwd->local_to_mid[wi]));
-                ne_frame_free(&fwd->pair, batch[i].addr);
-            }
-        }
-        ne_recv_release_local_slot(&fwd->pair, ctx->rx_slot);
     }
     return NULL;
 }
@@ -185,36 +190,40 @@ static void *wan_rx_thread(void *arg)
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        dp_burst_refill_wan(fwd, ctx->rx_slot);
+        int did_work = 0;
 
-        int rcvd = ne_recv_wan_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
-        if (rcvd <= 0) {
+        dp_burst_refill_wan(fwd, ctx->rx_slot);
+        for (int round = 0; round < RX_POLL_ROUNDS; round++) {
+            int rcvd = ne_recv_wan_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
+            if (rcvd <= 0)
+                break;
+            did_work = 1;
+            for (int i = 0; i < rcvd; i++) {
+                int wi;
+                const uint8_t *pkt;
+
+                if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                    continue;
+                }
+                pkt = ne_packet_data(&fwd->pair, batch[i].addr);
+                wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
+                if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                    continue;
+                }
+                if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
+                    ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
+                                       ne_ring_count(&fwd->wan_to_mid[wi]));
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                }
+            }
+            ne_recv_release_wan_slot(&fwd->pair, ctx->rx_slot);
+        }
+        if (!did_work) {
             ne_dp_warn_rx("WAN", (int)ctx->cpu_id, 0);
             sched_yield();
-            continue;
         }
-
-        for (int i = 0; i < rcvd; i++) {
-            int wi;
-            const uint8_t *pkt;
-
-            if (batch[i].wan_idx < MAX_INTERFACES && fwd_wan_is_stopped(batch[i].wan_idx)) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
-                continue;
-            }
-            pkt = ne_packet_data(&fwd->pair, batch[i].addr);
-            wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
-            if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
-                ne_frame_free(&fwd->pair, batch[i].addr);
-                continue;
-            }
-            if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
-                                   ne_ring_count(&fwd->wan_to_mid[wi]));
-                ne_frame_free(&fwd->pair, batch[i].addr);
-            }
-        }
-        ne_recv_release_wan_slot(&fwd->pair, ctx->rx_slot);
     }
     return NULL;
 }
