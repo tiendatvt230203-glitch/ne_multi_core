@@ -133,13 +133,67 @@ void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)
                  cpu, worker, lan_q, wan_q);
 }
 
+static uint32_t next_pow2_u32(uint32_t v)
+{
+    if (v <= 1)
+        return 1;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
+static uint32_t ne_compute_n_frames(int local_count, int wan_count,
+                                    int local_q_total, int wan_q_total)
+{
+    int total_q = local_q_total + wan_q_total;
+
+    if (total_q < 1)
+        total_q = 1;
+    uint32_t base = NE_N_FRAMES * (uint32_t)(local_count + wan_count + 1);
+    uint32_t extra = (uint32_t)total_q * NE_POOL_QUEUE_EXTRA;
+
+    return next_pow2_u32(base + extra);
+}
+
+static uint32_t ne_fq_prefill_per_queue(const struct ne_pair *p)
+{
+    int total_q;
+    uint32_t fq_cap;
+    uint32_t per;
+
+    if (!p)
+        return NE_RING - 1;
+    total_q = p->local_queue_total + p->wan_queue_total;
+    if (total_q < 1)
+        return NE_RING - 1;
+
+    fq_cap = (p->n_frames * NE_FQ_POOL_PCT_MAX) / 100u;
+    if (fq_cap < (uint32_t)total_q * NE_FQ_PREFILL_MIN)
+        fq_cap = (uint32_t)total_q * NE_FQ_PREFILL_MIN;
+    per = fq_cap / (uint32_t)total_q;
+    if (per < NE_FQ_PREFILL_MIN)
+        per = NE_FQ_PREFILL_MIN;
+    if (per > NE_RING - 1)
+        per = NE_RING - 1;
+    return per;
+}
+
 static int ne_rx_slots_for_queues(int queue_total, uint32_t slots_max)
 {
+    int need;
+
     if (queue_total <= 0)
         return 1;
-    if ((uint32_t)queue_total < slots_max)
-        return queue_total;
-    return (int)slots_max;
+    need = (queue_total + (int)NE_QUEUES_PER_RX_SLOT - 1) / (int)NE_QUEUES_PER_RX_SLOT;
+    if (need < 1)
+        need = 1;
+    if ((uint32_t)need > slots_max)
+        need = (int)slots_max;
+    return need;
 }
 
 int ne_rx_lan_slots_for(int local_queue_total)
@@ -154,13 +208,21 @@ int ne_rx_wan_slots_for(int wan_queue_total)
 
 void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total)
 {
+    int total_q = local_queue_total + wan_queue_total;
+    int lan_rx = ne_rx_lan_slots_for(local_queue_total);
+    int wan_rx = ne_rx_wan_slots_for(wan_queue_total);
+    int wan_rx_ideal = ne_rx_slots_for_queues(wan_queue_total, MAX_QUEUES);
+
     fprintf(stderr,
             "[DP-CONF] HW scale: queues(lan=%d wan=%d total=%d) "
             "RX threads(lan=%d/%u wan=%d/%u)\n",
-            local_queue_total, wan_queue_total,
-            local_queue_total + wan_queue_total,
-            ne_rx_lan_slots_for(local_queue_total), (unsigned)NE_RX_LAN_SLOTS,
-            ne_rx_wan_slots_for(wan_queue_total), (unsigned)NE_RX_WAN_SLOTS);
+            local_queue_total, wan_queue_total, total_q,
+            lan_rx, (unsigned)NE_RX_LAN_SLOTS, wan_rx, (unsigned)NE_RX_WAN_SLOTS);
+    if (wan_rx_ideal > wan_rx)
+        fprintf(stderr,
+                "[DP-CONF] hint: %d WAN queues benefit from %d RX_WAN cores "
+                "(cpu_map has %u; add cores or extend NE_CPU_RX_WAN[])\n",
+                wan_queue_total, wan_rx_ideal, (unsigned)NE_RX_WAN_SLOTS);
     fflush(stderr);
 }
 
@@ -572,7 +634,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
                 NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
     }
 
-    p->n_frames = NE_N_FRAMES;
+    p->n_frames = ne_compute_n_frames(p->local_count, p->wan_count,
+                                      p->local_queue_total, p->wan_queue_total);
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
 
     p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
@@ -618,7 +681,7 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
                                  p->wans[di].queue_count));
     }
 
-    uint32_t prefill = NE_FQ_PREFILL;
+    uint32_t prefill = ne_fq_prefill_per_queue(p);
     uint32_t fq_total = prefill * (uint32_t)(p->local_queue_total + p->wan_queue_total);
 
     fprintf(stderr,
@@ -715,7 +778,7 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
     if (pair_li >= p->local_count)
         p->local_count = pair_li + 1;
     p->local_queue_total += nq;
-    prefill_iface(p, &p->locals[pair_li], NE_FQ_PREFILL);
+    prefill_iface(p, &p->locals[pair_li], ne_fq_prefill_per_queue(p));
     p->local_live[pair_li] = 1;
     return 0;
 }
@@ -741,7 +804,7 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
     if (dp_slot >= p->wan_count)
         p->wan_count = dp_slot + 1;
     p->wan_queue_total += nq;
-    prefill_iface(p, &p->wans[dp_slot], NE_FQ_PREFILL);
+    prefill_iface(p, &p->wans[dp_slot], ne_fq_prefill_per_queue(p));
     p->wan_live[dp_slot] = 1;
     return 0;
 }

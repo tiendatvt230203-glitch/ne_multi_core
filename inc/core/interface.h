@@ -8,14 +8,15 @@
 
 #define NE_RING        16384u
 #define NE_FRAME       2048u
-/* UMEM cấp dư sẵn cho ca tối đa (2 LAN + 2 WAN, WAN 12 queue): ~2 GB RAM */
-#define NE_N_FRAMES    1048576u
+#define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
 
 #define NE_QUEUE_OVERRIDE 0
 
-/* Số frame nạp sẵn vào FQ mỗi queue lúc khởi động (= NE_RING-1, như bản ~2.7G) */
-#define NE_FQ_PREFILL   16383u
+#define NE_FQ_PREFILL_MIN       512u
+#define NE_FQ_POOL_PCT_MAX      18u
+#define NE_POOL_QUEUE_EXTRA     8192u
+#define NE_QUEUES_PER_RX_SLOT   6u
 
 #include "cpu_map.h"
 

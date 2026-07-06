@@ -1,4 +1,4 @@
-#include "../../inc/core/dataplane.h"
+    #include "../../inc/core/dataplane.h"
     #include "../../inc/core/dataplane_util.h"
     #include "../../inc/core/forwarder_wan.h"
     #include "../../inc/core/forwarder_crypto_runtime.h"
@@ -44,8 +44,14 @@
             ne_frame_free(&fwd->pair, tail->addr);
             return -1;
         }
-        if (ne_ring_try_push(tx, tail) != 0)
+        if (ne_ring_try_push(tx, tail) != 0) {
+            struct ne_packet rollback;
+
+            if (ne_ring_try_pop(tx, &rollback) == 0)
+                (void)rollback;
             ne_frame_free(&fwd->pair, tail->addr);
+            return -1;
+        }
         return 0;
     }
 
@@ -128,40 +134,6 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         return 1;
     }
 
-    static int policy_is_catch_all(const struct crypto_policy *cp)
-    {
-        if (!cp || !cp->src_any || !cp->dst_any)
-            return 0;
-        if (cp->protocol != POLICY_PROTO_ANY && cp->protocol != POLICY_PROTO_TCP_UDP)
-            return 0;
-#if !CRYPTO_POLICY_MATCH_IP_ONLY
-        if (cp->src_port_from >= 0 || cp->dst_port_from >= 0)
-            return 0;
-#endif
-        return 1;
-    }
-
-    static const struct crypto_policy *pick_policy_for_profile(
-        const struct app_config *cfg, const struct profile_config *p,
-        int flow_ok, uint32_t src_ip, uint32_t dst_ip,
-        uint16_t src_port, uint16_t dst_port, uint8_t proto)
-    {
-        const struct crypto_policy *cp;
-
-        if (!flow_ok)
-            return NULL;
-        if (p->policy_count == 1) {
-            int pi = p->policy_indices[0];
-            if (pi >= 0 && pi < cfg->policy_count) {
-                cp = &cfg->policies[pi];
-                if (policy_is_catch_all(cp))
-                    return cp;
-            }
-        }
-        return config_select_crypto_policy(cfg, (int)(p - cfg->profiles),
-                                           src_ip, dst_ip, src_port, dst_port, proto);
-    }
-
     static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok,
                                 uint32_t src_ip, uint32_t dst_ip,
                                 uint16_t src_port, uint16_t dst_port, uint8_t proto,
@@ -183,8 +155,9 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
                     found = 1;
             if (!found)
                 continue;
-            const struct crypto_policy *c = pick_policy_for_profile(
-                fwd->cfg, p, flow_ok, src_ip, dst_ip, src_port, dst_port, proto);
+            const struct crypto_policy *c = flow_ok
+                ? config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto)
+                : NULL;
             if (!c)
                 continue;
             if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {

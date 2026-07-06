@@ -31,7 +31,8 @@ void forwarder_pin_cpu(void)
     pin_cpu(ne_cpu_rx_lan(0));
 }
 
-#define DP_BURST_ROUNDS 8
+#define DP_BURST_ROUNDS   8
+#define DP_TX_BURST_MAX   8
 
 static void dp_burst_refill_local(struct forwarder *fwd, int rx_slot)
 {
@@ -57,46 +58,40 @@ static void dp_burst_drain_cq_wan(struct forwarder *fwd, int tx_slot)
         ne_drain_cq_wan(&fwd->pair, tx_slot);
 }
 
-static int dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
+static void dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
-    int total = 0;
 
     if (!ne_pair_local_live(&fwd->pair, local_idx))
-        return 0;
+        return;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         rings[w] = &fwd->mid_to_local[local_idx][w];
 
-    for (int burst = 0; burst < DP_BURST_ROUNDS; burst++) {
+    for (int burst = 0; burst < DP_TX_BURST_MAX; burst++) {
         int sent = ne_tx_drain_local_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
                                          local_idx, tx_slot);
         if (sent <= 0)
             break;
-        total += sent;
     }
-    return total;
 }
 
-static int dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
+static void dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
-    int total = 0;
 
     if (!ne_pair_wan_live(&fwd->pair, wan_idx))
-        return 0;
+        return;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         rings[w] = &fwd->mid_to_wan[wan_idx][w];
 
-    for (int burst = 0; burst < DP_BURST_ROUNDS; burst++) {
+    for (int burst = 0; burst < DP_TX_BURST_MAX; burst++) {
         int sent = ne_tx_drain_wan_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
                                        wan_idx, tx_slot);
         if (sent <= 0)
             break;
-        total += sent;
     }
-    return total;
 }
 
 struct dp_tx_slot_ctx {
@@ -128,10 +123,9 @@ static void *local_rx_thread(void *arg)
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        int rcvd;
-
         dp_burst_refill_local(fwd, ctx->rx_slot);
-        rcvd = ne_recv_local_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
+
+        int rcvd = ne_recv_local_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             ne_dp_warn_rx("LAN", (int)ctx->cpu_id, 0);
             sched_yield();
@@ -162,15 +156,10 @@ static void *local_tx_thread(void *arg)
     ne_dp_tx_ctx("LAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        int did_work = 0;
-
         dp_burst_drain_cq_local(fwd, tx_slot);
-        for (int li = 0; li < fwd->local_count; li++) {
-            if (dp_burst_tx_local(fwd, li, tx_slot) > 0)
-                did_work = 1;
-        }
-        if (!did_work)
-            sched_yield();
+        for (int li = 0; li < fwd->local_count; li++)
+            dp_burst_tx_local(fwd, li, tx_slot);
+        sched_yield();
     }
     return NULL;
 }
@@ -184,10 +173,9 @@ static void *wan_rx_thread(void *arg)
     pin_cpu(ctx->cpu_id);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        int rcvd;
-
         dp_burst_refill_wan(fwd, ctx->rx_slot);
-        rcvd = ne_recv_wan_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
+
+        int rcvd = ne_recv_wan_slot(&fwd->pair, ctx->rx_slot, batch, NE_BATCH_SIZE);
         if (rcvd <= 0) {
             ne_dp_warn_rx("WAN", (int)ctx->cpu_id, 0);
             sched_yield();
@@ -229,17 +217,13 @@ static void *wan_tx_thread(void *arg)
     ne_dp_tx_ctx("WAN", tx_slot);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
-        int did_work = 0;
-
         dp_burst_drain_cq_wan(fwd, tx_slot);
         for (int wi = 0; wi < fwd->wan_count; wi++) {
             if (fwd_wan_is_stopped(wi))
                 continue;
-            if (dp_burst_tx_wan(fwd, wi, tx_slot) > 0)
-                did_work = 1;
+            dp_burst_tx_wan(fwd, wi, tx_slot);
         }
-        if (!did_work)
-            sched_yield();
+        sched_yield();
     }
     return NULL;
 }
