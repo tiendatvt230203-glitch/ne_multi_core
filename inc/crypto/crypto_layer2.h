@@ -8,7 +8,8 @@
 #define CRYPTO_L2_FRAG_TAG_SIZE  4
 #define CRYPTO_L2_FRAG_MAGIC     0x5B
 
-/* Byte 12-13: NE_L2_FAKE_ETHERTYPE; byte 14: policy_id; byte 15: core_id; then nonce. */
+/* Untagged: fake ethertype at byte 12-13; tagged: fake ethertype after VLAN tag.
+ * L2 metadata starts at the packet's dynamic L2 header length. */
 #define CRYPTO_L2_POLICY_OFF     ETH_HEADER_SIZE
 #define CRYPTO_L2_POLICY_LEN     1
 #define CRYPTO_L2_CORE_ID_OFF    (CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN)
@@ -19,11 +20,18 @@ void crypto_layer2_bind_worker_idx(uint8_t worker_idx);
 uint8_t crypto_layer2_worker_idx(void);
 
 int crypto_layer2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8_t *worker_idx_out);
+int crypto_layer2_policy_off(const uint8_t *packet, uint32_t pkt_len);
+int crypto_layer2_core_id_off(const uint8_t *packet, uint32_t pkt_len);
+int crypto_layer2_nonce_off(const uint8_t *packet, uint32_t pkt_len);
+int crypto_layer2_frag_magic_off(const uint8_t *packet, uint32_t pkt_len, int nonce_size);
+int crypto_layer2_frag_enc_off(const uint8_t *packet, uint32_t pkt_len, int nonce_size);
+int crypto_layer2_is_fake_ethertype(const uint8_t *packet, uint32_t pkt_len);
 
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 
 int crypto_layer2_wire_eth_len(void);
+int crypto_layer2_wire_hdr_len(const uint8_t *pkt, uint32_t pkt_len);
 int crypto_layer2_frag_meta_len(void);
 
 int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,

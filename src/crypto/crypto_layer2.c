@@ -1,23 +1,26 @@
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/core/config.h"
+#include "../../inc/core/eth_parse.h"
 #include "../../inc/crypto/crypto_pqc_layer.h"
 #include <string.h>
 
 #define L2_FRAG_MAGIC      0x5B
-#define MIN_ETH_PKT        (ETH_HEADER_SIZE + 8)
+#define MIN_ETH_PKT        (NE_ETH_HDR_LEN + 8)
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
 static __thread uint8_t tls_l2_worker_idx;
 
-static inline int l2_pkt_fake_ethertype(const uint8_t *packet) {
+static inline int l2_pkt_fake_ethertype(const uint8_t *packet, uint32_t pkt_len) {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
+    struct eth_l2_info l2;
     if (!fake)
         return 0;
-    uint16_t et = ((uint16_t)packet[12] << 8) | packet[13];
-    return et == fake;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return 0;
+    return eth_l2_is_ethertype(packet, &l2, fake);
 }
 
 void crypto_layer2_bind_worker_idx(uint8_t worker_idx)
@@ -30,46 +33,116 @@ uint8_t crypto_layer2_worker_idx(void)
     return tls_l2_worker_idx;
 }
 
-static inline int l2_enc_start_offset(int nonce_size) {
-    return CRYPTO_L2_NONCE_OFF + nonce_size;
+static inline int l2_policy_offset(const struct eth_l2_info *l2) {
+    return l2 ? (int)l2->l2_hdr_len : -1;
 }
 
-static inline int l2_frag_magic_offset(int nonce_size) {
-    return CRYPTO_L2_NONCE_OFF + nonce_size;
+static inline int l2_core_id_offset(const struct eth_l2_info *l2) {
+    return l2_policy_offset(l2) + CRYPTO_L2_POLICY_LEN;
 }
 
-static inline int l2_frag_enc_start_offset(int nonce_size) {
-    return CRYPTO_L2_NONCE_OFF + nonce_size + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
+static inline int l2_nonce_offset(const struct eth_l2_info *l2) {
+    return l2_core_id_offset(l2) + CRYPTO_L2_CORE_ID_LEN;
 }
 
-static void l2_write_wire_header(uint8_t *packet, uint8_t policy_id,
+static inline int l2_enc_start_offset_l2(const struct eth_l2_info *l2, int nonce_size) {
+    return l2_nonce_offset(l2) + nonce_size;
+}
+
+static inline int l2_frag_magic_offset_l2(const struct eth_l2_info *l2, int nonce_size) {
+    return l2_nonce_offset(l2) + nonce_size;
+}
+
+static inline int l2_frag_enc_start_offset_l2(const struct eth_l2_info *l2, int nonce_size) {
+    return l2_nonce_offset(l2) + nonce_size + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
+}
+
+static void l2_write_wire_header(uint8_t *packet, const struct eth_l2_info *l2, uint8_t policy_id,
                                  const uint8_t *nonce, int nonce_size)
 {
     uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
-    packet[12] = (uint8_t)(fake >> 8);
-    packet[13] = (uint8_t)(fake & 0xFF);
-    packet[CRYPTO_L2_POLICY_OFF] = policy_id;
-    packet[CRYPTO_L2_CORE_ID_OFF] = crypto_layer2_worker_idx();
-    memcpy(packet + CRYPTO_L2_NONCE_OFF, nonce, (size_t)nonce_size);
+    int policy_off = l2_policy_offset(l2);
+    int core_off = l2_core_id_offset(l2);
+    int nonce_off = l2_nonce_offset(l2);
+
+    eth_l2_write_ethertype(packet, l2, fake);
+    packet[policy_off] = policy_id;
+    packet[core_off] = crypto_layer2_worker_idx();
+    memcpy(packet + nonce_off, nonce, (size_t)nonce_size);
 }
 
 int crypto_layer2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8_t *worker_idx_out)
 {
-    if (!packet || !worker_idx_out || pkt_len < CRYPTO_L2_NONCE_OFF)
+    struct eth_l2_info l2;
+    if (!packet || !worker_idx_out || eth_parse_l2(packet, pkt_len, &l2) != 0)
         return -1;
-    if (!l2_pkt_fake_ethertype(packet))
+    if (pkt_len < (uint32_t)l2_nonce_offset(&l2))
         return -1;
-    *worker_idx_out = packet[CRYPTO_L2_CORE_ID_OFF];
+    if (!l2_pkt_fake_ethertype(packet, pkt_len))
+        return -1;
+    *worker_idx_out = packet[l2_core_id_offset(&l2)];
     return 0;
+}
+
+int crypto_layer2_policy_off(const uint8_t *packet, uint32_t pkt_len)
+{
+    struct eth_l2_info l2;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return -1;
+    return l2_policy_offset(&l2);
+}
+
+int crypto_layer2_core_id_off(const uint8_t *packet, uint32_t pkt_len)
+{
+    struct eth_l2_info l2;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return -1;
+    return l2_core_id_offset(&l2);
+}
+
+int crypto_layer2_nonce_off(const uint8_t *packet, uint32_t pkt_len)
+{
+    struct eth_l2_info l2;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return -1;
+    return l2_nonce_offset(&l2);
+}
+
+int crypto_layer2_frag_magic_off(const uint8_t *packet, uint32_t pkt_len, int nonce_size)
+{
+    struct eth_l2_info l2;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return -1;
+    return l2_frag_magic_offset_l2(&l2, nonce_size);
+}
+
+int crypto_layer2_frag_enc_off(const uint8_t *packet, uint32_t pkt_len, int nonce_size)
+{
+    struct eth_l2_info l2;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return -1;
+    return l2_frag_enc_start_offset_l2(&l2, nonce_size);
+}
+
+int crypto_layer2_is_fake_ethertype(const uint8_t *packet, uint32_t pkt_len)
+{
+    return l2_pkt_fake_ethertype(packet, pkt_len);
 }
 
 static inline int l2_wire_nonce_size(void) {
     return PACKET_CRYPTO_NONCE_BYTES;
 }
 
-static inline int pkt_is_ipv4_eth(const uint8_t *packet) {
-    uint16_t et = ((uint16_t)packet[12] << 8) | packet[13];
-    return et == 0x0800;
+static inline int pkt_is_ipv4_eth(const uint8_t *packet, uint32_t pkt_len,
+                                  struct eth_l2_info *l2_out) {
+    struct eth_l2_info l2;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return 0;
+    if (!eth_l2_is_ipv4(packet, &l2))
+        return 0;
+    if (l2_out)
+        *l2_out = l2;
+    return 1;
 }
 
 static inline int verify_ipv4_after_decrypt(const uint8_t *ip_payload, size_t len) {
@@ -86,12 +159,24 @@ static inline int verify_ipv4_after_decrypt(const uint8_t *ip_payload, size_t le
     return 0;
 }
 
-static int l2_has_fake_ethertype(const uint8_t *packet) {
-    return l2_pkt_fake_ethertype(packet);
+static int l2_has_fake_ethertype(const uint8_t *packet, uint32_t pkt_len,
+                                 struct eth_l2_info *l2_out) {
+    struct eth_l2_info l2;
+    if (eth_parse_l2(packet, pkt_len, &l2) != 0)
+        return 0;
+    if (!l2_pkt_fake_ethertype(packet, pkt_len))
+        return 0;
+    if (l2_out)
+        *l2_out = l2;
+    return 1;
 }
 
 int crypto_layer2_wire_eth_len(void) {
     return ETH_HEADER_SIZE;
+}
+
+int crypto_layer2_wire_hdr_len(const uint8_t *pkt, uint32_t pkt_len) {
+    return eth_l2_wire_hdr_len(pkt, pkt_len);
 }
 
 int crypto_layer2_frag_meta_len(void) {
@@ -103,32 +188,31 @@ int crypto_layer2_frag_meta_len(void) {
 }
 
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
+    struct eth_l2_info l2;
     if (unlikely(!ctx || !ctx->initialized || !packet || pkt_len < MIN_ETH_PKT))
         return -1;
-    if (!pkt_is_ipv4_eth(packet))
+    if (!pkt_is_ipv4_eth(packet, (uint32_t)pkt_len, &l2))
         return (int)pkt_len;
 
     if (crypto_mode_is_pqc()) {
         const int nonce_size = CRYPTO_PQC_NONCE_BYTES;
-        const int l2_enc_start = l2_enc_start_offset(nonce_size);
+        const int l2_enc_start = l2_enc_start_offset_l2(&l2, nonce_size);
         crypto_pqc_sess_t pqc;
         byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int new_len = 0;
 
-        if (!pkt_is_ipv4_eth(packet))
-            return (int)pkt_len;
         if (!packet_crypto_get_fake_ethertype_ipv4())
             return (int)pkt_len;
 
-        size_t payload_len = pkt_len - ETH_HEADER_SIZE;
-        memmove(packet + l2_enc_start, packet + ETH_HEADER_SIZE, payload_len);
+        size_t payload_len = pkt_len - l2.l2_hdr_len;
+        memmove(packet + l2_enc_start, packet + l2.l2_hdr_len, payload_len);
 
         if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
         if (crypto_pqc_generate_nonce(nonce) != 0)
             return -1;
 
-        l2_write_wire_header(packet, packet_crypto_get_policy_id(), nonce, nonce_size);
+        l2_write_wire_header(packet, &l2, packet_crypto_get_policy_id(), nonce, nonce_size);
 
         if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + l2_enc_start, (int)payload_len, &new_len) != 0)
             return -1;
@@ -136,10 +220,8 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     }
 
     const int nonce_size = packet_crypto_get_nonce_size();
-    const int l2_enc_start = l2_enc_start_offset(nonce_size);
+    const int l2_enc_start = l2_enc_start_offset_l2(&l2, nonce_size);
 
-    if (!pkt_is_ipv4_eth(packet))
-        return (int)pkt_len;
     if (!packet_crypto_get_fake_ethertype_ipv4())
         return (int)pkt_len;
 
@@ -151,10 +233,10 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     crypto_generate_nonce(counter, PROTO_FLAG_IPV4, nonce, &nonce_len);
 
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
-    const size_t payload_len = pkt_len - ETH_HEADER_SIZE;
+    const size_t payload_len = pkt_len - l2.l2_hdr_len;
 
-    memmove(packet + l2_enc_start, packet + ETH_HEADER_SIZE, payload_len);
-    l2_write_wire_header(packet, packet_crypto_get_policy_id(), nonce, nonce_size);
+    memmove(packet + l2_enc_start, packet + l2.l2_hdr_len, payload_len);
+    l2_write_wire_header(packet, &l2, packet_crypto_get_policy_id(), nonce, nonce_size);
 
     if (likely(is_gcm)) {
         uint8_t tag[AES_GCM_TAG_SIZE];
@@ -173,31 +255,34 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 }
 
 int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
+    struct eth_l2_info l2;
     if (unlikely(!ctx || !ctx->initialized || !packet))
         return -1;
 
     const int wire_ns = l2_wire_nonce_size();
-    const int l2_enc_start = l2_enc_start_offset(wire_ns);
 
-    if (unlikely(pkt_len < (size_t)l2_enc_start))
-        return -1;
-    if (!l2_has_fake_ethertype(packet))
+    if (!l2_has_fake_ethertype(packet, (uint32_t)pkt_len, &l2))
         return (int)pkt_len;
 
-    if (pkt_len >= (size_t)(l2_frag_magic_offset(wire_ns) + 1) &&
-        packet[l2_frag_magic_offset(wire_ns)] == L2_FRAG_MAGIC)
+    const int l2_enc_start = l2_enc_start_offset_l2(&l2, wire_ns);
+    if (unlikely(pkt_len < (size_t)l2_enc_start))
+        return -1;
+
+    if (pkt_len >= (size_t)(l2_frag_magic_offset_l2(&l2, wire_ns) + 1) &&
+        packet[l2_frag_magic_offset_l2(&l2, wire_ns)] == L2_FRAG_MAGIC)
         return (int)pkt_len;
 
     if (crypto_mode_is_pqc()) {
         const int pqc_nonce_size = CRYPTO_PQC_NONCE_BYTES;
-        const int pqc_l2_enc_start = l2_enc_start_offset(pqc_nonce_size);
+        const int pqc_l2_enc_start = l2_enc_start_offset_l2(&l2, pqc_nonce_size);
+        const int pqc_nonce_off = l2_nonce_offset(&l2);
         crypto_pqc_sess_t pqc;
         byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int dec_len = 0;
 
         if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
-        memcpy(nonce, packet + CRYPTO_L2_NONCE_OFF, (size_t)pqc_nonce_size);
+        memcpy(nonce, packet + pqc_nonce_off, (size_t)pqc_nonce_size);
 
         if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + pqc_l2_enc_start,
                                        (int)(pkt_len - pqc_l2_enc_start), &dec_len) != 0)
@@ -205,19 +290,17 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
         uint8_t *work_ptr = packet + pqc_l2_enc_start;
         if (dec_len >= 2 && work_ptr[0] == 0x08 && work_ptr[1] == 0x00) {
-            packet[12] = 0x08;
-            packet[13] = 0x00;
-            memmove(packet + ETH_HEADER_SIZE, work_ptr + 2, (size_t)dec_len - 2);
-            return ETH_HEADER_SIZE + dec_len - 2;
+            eth_l2_write_ethertype(packet, &l2, NE_ETH_P_IPV4);
+            memmove(packet + l2.l2_hdr_len, work_ptr + 2, (size_t)dec_len - 2);
+            return l2.l2_hdr_len + dec_len - 2;
         }
 
-        packet[12] = 0x08;
-        packet[13] = 0x00;
-        memmove(packet + ETH_HEADER_SIZE, work_ptr, (size_t)dec_len);
-        return ETH_HEADER_SIZE + dec_len;
+        eth_l2_write_ethertype(packet, &l2, NE_ETH_P_IPV4);
+        memmove(packet + l2.l2_hdr_len, work_ptr, (size_t)dec_len);
+        return l2.l2_hdr_len + dec_len;
     }
     uint8_t nonce[16];
-    memcpy(nonce, packet + CRYPTO_L2_NONCE_OFF, (size_t)wire_ns);
+    memcpy(nonce, packet + l2_nonce_offset(&l2), (size_t)wire_ns);
     const int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     const int nonce_len = is_gcm ? wire_ns : AES128_IV_SIZE;
 
@@ -246,16 +329,14 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     }
 
     if (work_ptr[0] == 0x08 && work_ptr[1] == 0x00) {
-        packet[12] = 0x08;
-        packet[13] = 0x00;
-        memmove(packet + ETH_HEADER_SIZE, work_ptr + 2, enc_len - 2);
-        return (int)(ETH_HEADER_SIZE + enc_len - 2);
+        eth_l2_write_ethertype(packet, &l2, NE_ETH_P_IPV4);
+        memmove(packet + l2.l2_hdr_len, work_ptr + 2, enc_len - 2);
+        return (int)(l2.l2_hdr_len + enc_len - 2);
     }
 
-    packet[12] = 0x08;
-    packet[13] = 0x00;
-    memmove(packet + ETH_HEADER_SIZE, work_ptr, enc_len);
-    return (int)(ETH_HEADER_SIZE + enc_len);
+    eth_l2_write_ethertype(packet, &l2, NE_ETH_P_IPV4);
+    memmove(packet + l2.l2_hdr_len, work_ptr, enc_len);
+    return (int)(l2.l2_hdr_len + enc_len);
 }
 
 static void l2_write_frag_tag(uint8_t *buf, uint16_t pkt_id, uint8_t frag_index) {
@@ -275,14 +356,15 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     const uint8_t *enc_plain, uint32_t enc_plain_len,
     uint16_t pkt_id, uint8_t frag_index,
     uint8_t *out_buf, size_t out_max, uint32_t *out_len) {
+    struct eth_l2_info l2;
     if (!ctx || !ctx->initialized || !eth_hdr || !enc_plain || !out_buf || !out_len)
         return -1;
-    if (enc_plain_len == 0 || !pkt_is_ipv4_eth(eth_hdr))
+    if (enc_plain_len == 0 || !pkt_is_ipv4_eth(eth_hdr, 64, &l2))
         return -1;
 
     if (crypto_mode_is_pqc()) {
         int nonce_size = CRYPTO_PQC_NONCE_BYTES;
-        int enc_off = l2_frag_enc_start_offset(nonce_size);
+        int enc_off = l2_frag_enc_start_offset_l2(&l2, nonce_size);
         crypto_pqc_sess_t pqc;
         byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int new_len = 0;
@@ -293,7 +375,7 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         if (!packet_crypto_get_fake_ethertype_ipv4())
             return -1;
 
-        memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
+        memcpy(out_buf, eth_hdr, l2.l2_hdr_len);
 
         if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
@@ -301,9 +383,9 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
             return -1;
 
         memmove(out_buf + enc_off, enc_plain, enc_plain_len);
-        l2_write_wire_header(out_buf, packet_crypto_get_policy_id(), nonce, nonce_size);
-        out_buf[l2_frag_magic_offset(nonce_size)] = L2_FRAG_MAGIC;
-        l2_write_frag_tag(out_buf + l2_frag_magic_offset(nonce_size) + 1, pkt_id, frag_index);
+        l2_write_wire_header(out_buf, &l2, packet_crypto_get_policy_id(), nonce, nonce_size);
+        out_buf[l2_frag_magic_offset_l2(&l2, nonce_size)] = L2_FRAG_MAGIC;
+        l2_write_frag_tag(out_buf + l2_frag_magic_offset_l2(&l2, nonce_size) + 1, pkt_id, frag_index);
 
         if (crypto_pqc_encrypt_payload(&pqc, nonce, out_buf + enc_off, (int)enc_plain_len, &new_len) != 0)
             return -1;
@@ -314,12 +396,12 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
     int nonce_size = packet_crypto_get_nonce_size();
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
-    int enc_off = l2_frag_enc_start_offset(nonce_size);
+    int enc_off = l2_frag_enc_start_offset_l2(&l2, nonce_size);
     size_t need = (size_t)enc_off + enc_plain_len + (is_gcm ? AES_GCM_TAG_SIZE : 0);
     if (need > out_max)
         return -1;
 
-    memcpy(out_buf, eth_hdr, ETH_HEADER_SIZE);
+    memcpy(out_buf, eth_hdr, l2.l2_hdr_len);
     if (!packet_crypto_get_fake_ethertype_ipv4())
         return -1;
 
@@ -334,9 +416,9 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         return -1;
 
     memmove(out_buf + enc_off, enc_plain, enc_plain_len);
-    l2_write_wire_header(out_buf, packet_crypto_get_policy_id(), nonce, nonce_size);
-    out_buf[l2_frag_magic_offset(nonce_size)] = L2_FRAG_MAGIC;
-    l2_write_frag_tag(out_buf + l2_frag_magic_offset(nonce_size) + 1, pkt_id, frag_index);
+    l2_write_wire_header(out_buf, &l2, packet_crypto_get_policy_id(), nonce, nonce_size);
+    out_buf[l2_frag_magic_offset_l2(&l2, nonce_size)] = L2_FRAG_MAGIC;
+    l2_write_frag_tag(out_buf + l2_frag_magic_offset_l2(&l2, nonce_size) + 1, pkt_id, frag_index);
 
     if (is_gcm) {
         uint8_t tag[AES_GCM_TAG_SIZE];
@@ -358,48 +440,51 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     uint8_t *packet, size_t pkt_len,
     uint16_t *out_pkt_id, uint8_t *out_frag_index) {
+    struct eth_l2_info l2;
     if (!ctx || !ctx->initialized || !packet || !out_pkt_id || !out_frag_index)
+        return -1;
+    if (!l2_has_fake_ethertype(packet, (uint32_t)pkt_len, &l2))
         return -1;
 
     if (crypto_mode_is_pqc()) {
         int nonce_size = CRYPTO_PQC_NONCE_BYTES;
-        int enc_off = l2_frag_enc_start_offset(nonce_size);
+        int enc_off = l2_frag_enc_start_offset_l2(&l2, nonce_size);
         crypto_pqc_sess_t pqc;
         byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int dec_len = 0;
 
-        if (pkt_len < (size_t)enc_off || !l2_has_fake_ethertype(packet))
+        if (pkt_len < (size_t)enc_off)
             return -1;
-        if (packet[l2_frag_magic_offset(nonce_size)] != L2_FRAG_MAGIC)
+        if (packet[l2_frag_magic_offset_l2(&l2, nonce_size)] != L2_FRAG_MAGIC)
             return -1;
 
-        l2_read_frag_tag(packet + l2_frag_magic_offset(nonce_size) + 1,
+        l2_read_frag_tag(packet + l2_frag_magic_offset_l2(&l2, nonce_size) + 1,
                          out_pkt_id, out_frag_index);
 
         if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
-        memcpy(nonce, packet + CRYPTO_L2_NONCE_OFF, (size_t)nonce_size);
+        memcpy(nonce, packet + l2_nonce_offset(&l2), (size_t)nonce_size);
 
         if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
                                        (int)(pkt_len - (size_t)enc_off), &dec_len) != 0)
             return -1;
-        memmove(packet + ETH_HEADER_SIZE, packet + enc_off, (size_t)dec_len);
-        return (int)(ETH_HEADER_SIZE + dec_len);
+        memmove(packet + l2.l2_hdr_len, packet + enc_off, (size_t)dec_len);
+        return (int)(l2.l2_hdr_len + dec_len);
     }
 
     int wire_ns = l2_wire_nonce_size();
-    int enc_off = l2_frag_enc_start_offset(wire_ns);
+    int enc_off = l2_frag_enc_start_offset_l2(&l2, wire_ns);
 
-    if (pkt_len < (size_t)enc_off || !l2_has_fake_ethertype(packet))
+    if (pkt_len < (size_t)enc_off)
         return -1;
-    if (packet[l2_frag_magic_offset(wire_ns)] != L2_FRAG_MAGIC)
+    if (packet[l2_frag_magic_offset_l2(&l2, wire_ns)] != L2_FRAG_MAGIC)
         return -1;
 
-    l2_read_frag_tag(packet + l2_frag_magic_offset(wire_ns) + 1,
+    l2_read_frag_tag(packet + l2_frag_magic_offset_l2(&l2, wire_ns) + 1,
                      out_pkt_id, out_frag_index);
 
     uint8_t nonce[16];
-    memcpy(nonce, packet + CRYPTO_L2_NONCE_OFF, (size_t)wire_ns);
+    memcpy(nonce, packet + l2_nonce_offset(&l2), (size_t)wire_ns);
 
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
     int nonce_len = is_gcm ? wire_ns : AES128_IV_SIZE;
@@ -443,8 +528,8 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
                 continue;
         }
 
-        memmove(packet + ETH_HEADER_SIZE, packet + enc_off, enc_len);
-        return (int)(ETH_HEADER_SIZE + enc_len);
+        memmove(packet + l2.l2_hdr_len, packet + enc_off, enc_len);
+        return (int)(l2.l2_hdr_len + enc_len);
     }
     return -1;
 }

@@ -13,6 +13,7 @@
 #include "../../inc/core/crypto_route.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/core/mac_learn.h"
+#include "../../inc/core/eth_parse.h"
 
 #include <string.h>
 
@@ -28,18 +29,25 @@ static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fw
     return NULL;
 }
 
-static void wan_apply_l2_policy(struct forwarder *fwd, const uint8_t *pkt)
+static void wan_apply_l2_policy(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
-    const struct crypto_policy *cp = fwd_l2_policy_by_wire_id(fwd, pkt[CRYPTO_L2_POLICY_OFF]);
+    int pol_off = crypto_layer2_policy_off(pkt, len);
+    const struct crypto_policy *cp;
+
+    if (pol_off < 0)
+        return;
+    cp = fwd_l2_policy_by_wire_id(fwd, pkt[pol_off]);
     if (cp)
         crypto_apply_from_policy(cp);
 }
 
 static int wan_l2_plain_ipv4(const uint8_t *pkt, uint32_t len)
 {
-    if (len < ETH_HEADER_SIZE)
+    struct eth_l2_info l2;
+
+    if (eth_parse_l2(pkt, len, &l2) != 0)
         return 0;
-    return (((uint16_t)pkt[12] << 8) | pkt[13]) == 0x0800;
+    return eth_l2_is_ipv4(pkt, &l2);
 }
 
 static int wan_is_bypass_plain(const uint8_t *pkt, uint32_t len)
@@ -74,15 +82,16 @@ static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 
 static int decrypt_l2(uint8_t *pkt, uint32_t *len)
 {
-    uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
     struct packet_crypto_ctx *ctx;
+    int pol_off;
     int n;
 
-    if (!fake || *len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN)
+    if (!crypto_layer2_is_fake_ethertype(pkt, *len))
         return 0;
-    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != fake)
+    pol_off = crypto_layer2_policy_off(pkt, *len);
+    if (pol_off < 0)
         return 0;
-    ctx = fwd_crypto_ctx_for_wire_id(pkt[CRYPTO_L2_POLICY_OFF]);
+    ctx = fwd_crypto_ctx_for_wire_id(pkt[pol_off]);
     if (!ctx)
         return -1;
     n = crypto_layer2_decrypt(ctx, pkt, *len);
@@ -203,11 +212,12 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     {
         int frag_mark = 0;
         int ns = PACKET_CRYPTO_NONCE_BYTES;
-        int mark_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
+        int mark_off = crypto_layer2_frag_magic_off(pkt, len, ns);
         uint32_t orig_len = len;
+        int pol_off;
 
-        wan_apply_l2_policy(fwd, pkt);
-        if (len > (uint32_t)mark_off)
+        wan_apply_l2_policy(fwd, pkt, len);
+        if (mark_off >= 0 && len > (uint32_t)mark_off)
             frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
 
         int need_backup = frag_mark ||
@@ -219,7 +229,10 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
                 memcpy(pkt, scratch, orig_len);
             len = orig_len;
             if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
+                pol_off = crypto_layer2_policy_off(pkt, len);
+                if (pol_off < 0)
+                    return -1;
+                if (reassemble_l2(fwd, pkt, &len, pkt[pol_off], &pending) != 0)
                     return -1;
             } else {
                 return -1;
@@ -400,8 +413,12 @@ static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 
     if (!fwd || !pkt || !fwd->cfg)
         return -1;
-    if (fwd_crypto_has_l2_marker(pkt, len))
-        return profile_pi_for_wire_policy(fwd, pkt[CRYPTO_L2_POLICY_OFF]);
+    if (fwd_crypto_has_l2_marker(pkt, len)) {
+        int pol_off = crypto_layer2_policy_off(pkt, len);
+        if (pol_off < 0)
+            return -1;
+        return profile_pi_for_wire_policy(fwd, pkt[pol_off]);
+    }
     if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
         return profile_pi_for_wire_policy(fwd, pol);
     if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)

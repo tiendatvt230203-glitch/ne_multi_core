@@ -5,6 +5,24 @@
 #include <bpf/bpf_endian.h>
 
 #define ETH_P_ARP_VAL 0x0806
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD 0x88A8
+#endif
+
+static __always_inline int skip_one_vlan(void **nh, void *data_end, __u16 *proto)
+{
+    if (*proto != bpf_htons(ETH_P_8021Q) && *proto != bpf_htons(ETH_P_8021AD))
+        return 0;
+
+    __u16 *vlan = *nh;
+    if ((void *)(vlan + 2) > data_end)
+        return -1;
+
+    *proto = vlan[1];
+    *nh = (void *)(vlan + 2);
+    return 0;
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __uint(max_entries, 64);
@@ -22,12 +40,17 @@ int xdp_redirect_prog(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    if (eth->h_proto == bpf_htons(ETH_P_ARP_VAL)) {
+    void *nh = (void *)(eth + 1);
+    __u16 proto = eth->h_proto;
+    if (skip_one_vlan(&nh, data_end, &proto) != 0)
+        return XDP_PASS;
+
+    if (proto == bpf_htons(ETH_P_ARP_VAL)) {
         return XDP_PASS;
     }
 
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-        struct iphdr *ip = (void *)(eth + 1);
+    if (proto == bpf_htons(ETH_P_IP)) {
+        struct iphdr *ip = nh;
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 

@@ -1,5 +1,5 @@
 #include "../../inc/crypto/crypto_layer4.h"
-#include "../../inc/core/config.h"
+#include "../../inc/core/eth_parse.h"
 #include "../../inc/core/fragment.h"
 #include "../../inc/crypto/crypto_pqc_layer.h"
 #include <string.h>
@@ -61,24 +61,15 @@ int crypto_layer4_frag_meta_len(void) {
 }
 
 int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len) {
-    if (!pkt || pkt_len < 14)
+    struct eth_l2_info l2;
+
+    if (!pkt || pkt_len < NE_ETH_HDR_LEN)
         return -1;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == 0x0800)
-        return 14;
-    if (et == 0x8100) {
-        if (pkt_len < 18)
-            return -1;
-        et = ((uint16_t)pkt[16] << 8) | pkt[17];
-        if (et == 0x0800)
-            return 18;
-        if (et == 0x8100 && pkt_len >= 22) {
-            et = ((uint16_t)pkt[20] << 8) | pkt[21];
-            if (et == 0x0800)
-                return 22;
-        }
-    }
-    return -1;
+    if (eth_parse_l2(pkt, (uint32_t)pkt_len, &l2) != 0)
+        return -1;
+    if (!eth_l2_is_ipv4(pkt, &l2))
+        return -1;
+    return (int)l2.network_off;
 }
 
 static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr_len,
@@ -358,10 +349,19 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     const uint8_t *enc_plain, uint32_t enc_plain_len,
     uint16_t pkt_id, uint8_t frag_index,
     uint8_t *out_buf, size_t out_max, uint32_t *out_len) {
+    struct eth_l2_info l2;
+    int eth_len;
+    int l3_off;
+
     if (!ctx || !ctx->initialized || !out_buf || !out_len || !wire_ports || !enc_plain)
         return -1;
     if (enc_plain_len == 0)
         return -1;
+    if (eth_parse_l2(eth_hdr, NE_L2_HDR_MAX + 20u, &l2) != 0)
+        return -1;
+
+    eth_len = (int)l2.l2_hdr_len;
+    l3_off = (int)l2.network_off;
 
     if (crypto_mode_is_pqc()) {
         int nonce_size = CRYPTO_PQC_NONCE_BYTES;
@@ -370,14 +370,14 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         crypto_pqc_sess_t pqc;
         byte nonce[CRYPTO_PQC_NONCE_BYTES];
         int new_len = 0;
-        size_t need = (size_t)(14 + ip_hdr_len + L4_WIRE_PORT_LEN + total_overhead + enc_plain_len);
+        size_t need = (size_t)(eth_len + ip_hdr_len + L4_WIRE_PORT_LEN + total_overhead + enc_plain_len);
 
         if (need > out_max)
             return -1;
 
         int offset = 0;
-        memcpy(out_buf, eth_hdr, 14);
-        offset += 14;
+        memcpy(out_buf, eth_hdr, (size_t)eth_len);
+        offset += eth_len;
         memcpy(out_buf + offset, ip_hdr, ip_hdr_len);
         offset += ip_hdr_len;
         memcpy(out_buf + offset, wire_ports, L4_WIRE_PORT_LEN);
@@ -399,7 +399,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
             return -1;
 
         size_t ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + (size_t)new_len;
-        l4_fix_ipv4_totlen_and_cksum(out_buf, 14, ip_hdr_len, ip_payload_len);
+        l4_fix_ipv4_totlen_and_cksum(out_buf, l3_off, ip_hdr_len, ip_payload_len);
         *out_len = (uint32_t)(enc_off + new_len);
         return 0;
     }
@@ -408,13 +408,13 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
     int total_overhead = tunnel_hdr_size + FRAG_L4_HDR_SIZE + (is_gcm ? AES_GCM_TAG_SIZE : 0);
-    size_t need = (size_t)(14 + ip_hdr_len + L4_WIRE_PORT_LEN + total_overhead + enc_plain_len);
+    size_t need = (size_t)(eth_len + ip_hdr_len + L4_WIRE_PORT_LEN + total_overhead + enc_plain_len);
     if (need > out_max)
         return -1;
 
     int offset = 0;
-    memcpy(out_buf, eth_hdr, 14);
-    offset += 14;
+    memcpy(out_buf, eth_hdr, (size_t)eth_len);
+    offset += eth_len;
     memcpy(out_buf + offset, ip_hdr, ip_hdr_len);
     offset += ip_hdr_len;
     memcpy(out_buf + offset, wire_ports, L4_WIRE_PORT_LEN);
@@ -451,7 +451,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     }
 
     size_t ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + enc_plain_len;
-    l4_fix_ipv4_totlen_and_cksum(out_buf, 14, ip_hdr_len, ip_payload_len);
+    l4_fix_ipv4_totlen_and_cksum(out_buf, l3_off, ip_hdr_len, ip_payload_len);
 
     *out_len = (uint32_t)(enc_off + enc_plain_len + (is_gcm ? AES_GCM_TAG_SIZE : 0));
     return 0;

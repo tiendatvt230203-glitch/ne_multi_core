@@ -417,7 +417,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     PQclear(res);
 
     res = PQexecParams(conn,
-        "SELECT id, priority, action, protocol, "
+        "SELECT id, priority, action, proto, "
         "array_to_string(src_ip, ','), invert_src_ip, "
         "array_to_string(dst_ip, ','), invert_dst_ip, "
         "array_to_string(src_port, ','), "
@@ -698,7 +698,7 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT interface AS ifname, host(dst_ip) AS dst_ip "
+        "SELECT interface AS ifname, dst_ip "
         "FROM ne_wan WHERE profile_id = $1 ORDER BY interface",
         1, NULL, params, NULL, NULL, 0);
 

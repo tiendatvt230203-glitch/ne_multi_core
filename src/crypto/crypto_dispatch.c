@@ -4,6 +4,7 @@
 #include "../../inc/crypto/crypto_layer2.h"
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
+#include "../../inc/core/eth_parse.h"
 
 #include <string.h>
 #include <unistd.h>
@@ -36,16 +37,16 @@ int crypto_l3_extract_policy_id(const struct app_config *cfg,
                                 uint8_t *pkt,
                                 uint32_t pkt_len,
                                 uint8_t *policy_id_out) {
-    if (!cfg || !pkt || !policy_id_out || pkt_len < 14 + 20)
+    struct eth_l2_info l2;
+    int ip_hdr_len;
+    int l3_off;
+
+    if (!cfg || !pkt || !policy_id_out)
+        return -1;
+    if (eth_l2_require_ipv4(pkt, pkt_len, &l2, &ip_hdr_len) != 0)
         return -1;
 
-    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != 0x0800)
-        return -1;
-
-    int l3_off = 14;
-    int ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20 || pkt_len < (uint32_t)(l3_off + ip_hdr_len + 1))
-        return -1;
+    l3_off = (int)l2.network_off;
 
     uint8_t marker = packet_crypto_get_fake_protocol();
     if (marker == 0)

@@ -1,4 +1,5 @@
 #include "../../inc/core/dataplane_util.h"
+#include "../../inc/core/eth_parse.h"
 
 #include <arpa/inet.h>
 #include <net/ethernet.h>
@@ -11,17 +12,17 @@ int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
                   uint32_t *src_ip, uint32_t *dst_ip,
                   uint16_t *src_port, uint16_t *dst_port, uint8_t *proto)
 {
-    if (!pkt_data || pkt_len < sizeof(struct ether_header) + sizeof(struct iphdr))
+    struct eth_l2_info l2;
+    int ip_hdr_len;
+    int l3_off;
+
+    if (!pkt_data || !src_ip || !dst_ip || !src_port || !dst_port || !proto)
+        return -1;
+    if (eth_l2_require_ipv4(pkt_data, pkt_len, &l2, &ip_hdr_len) != 0)
         return -1;
 
-    struct ether_header *eth = pkt_data;
-    if (ntohs(eth->ether_type) != ETHERTYPE_IP)
-        return -1;
-
-    struct iphdr *ip = (struct iphdr *)((uint8_t *)pkt_data + sizeof(*eth));
-    uint32_t ihl = (uint32_t)ip->ihl * 4U;
-    if (ihl < sizeof(struct iphdr) || pkt_len < sizeof(*eth) + ihl)
-        return -1;
+    l3_off = (int)l2.network_off;
+    struct iphdr *ip = (struct iphdr *)((uint8_t *)pkt_data + l3_off);
 
     *src_ip = ip->saddr;
     *dst_ip = ip->daddr;
@@ -30,7 +31,7 @@ int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
     *dst_port = 0;
 
     if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
-        uint8_t *l4 = (uint8_t *)pkt_data + sizeof(*eth) + ihl;
+        uint8_t *l4 = (uint8_t *)pkt_data + l3_off + ip_hdr_len;
         if (pkt_len < (uint32_t)(l4 - (uint8_t *)pkt_data + 4))
             return -1;
         uint16_t *ports = (uint16_t *)l4;
