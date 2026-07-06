@@ -99,7 +99,6 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[4096];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -113,15 +112,18 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     if (nd < 0)
         return -1;
     rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
-                                pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
+                                pkt, (uint32_t)nd, opid, ofidx, pkt, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
     if (rr != 1)
         return -1;
-    memcpy(pkt, buf, blen);
     *len = blen;
+    if (blen >= 14) {
+        pkt[12] = 0x08;
+        pkt[13] = 0x00;
+    }
     return 0;
 }
 
@@ -132,7 +134,6 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[4096];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -145,14 +146,14 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     nd = crypto_layer3_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
     if (nd < 0)
         return -1;
-    rr = frag_try_reassemble(fwd_crypto_frag_l3(slot), pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
+    rr = frag_try_reassemble(fwd_crypto_frag_l3(slot), pkt, (uint32_t)nd, opid, ofidx,
+                             pkt, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
     if (rr != 1)
         return -1;
-    memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
 }
@@ -164,7 +165,6 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint8_t buf[4096];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -177,14 +177,14 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     nd = crypto_layer4_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
     if (nd < 0)
         return -1;
-    rr = frag_try_reassemble_l4(fwd_crypto_frag_l4(slot), pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
+    rr = frag_try_reassemble_l4(fwd_crypto_frag_l4(slot), pkt, (uint32_t)nd, opid, ofidx,
+                                pkt, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
     if (rr != 1)
         return -1;
-    memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
 }

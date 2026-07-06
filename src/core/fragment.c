@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 199309L
+#include "../../inc/core/interface.h"
 #include "../../inc/core/fragment.h"
 #include "../../inc/crypto/packet_crypto.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -88,7 +89,7 @@ static int frag_store_second(struct frag_entry *entry, uint16_t pkt_id,
 static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len, int eth_len) {
     if (!entry->got_first || !entry->got_second)
         return 0;
-    if (entry->first_len + entry->second_len + (uint32_t)eth_len > 4096) {
+    if (entry->first_len + entry->second_len + (uint32_t)eth_len > NE_FRAME) {
         memset(entry, 0, sizeof(*entry));
         return -1;
     }
@@ -120,17 +121,18 @@ int frag_is_fragment(const struct app_config *cfg,
         return 0;
 
     int tunnel_off = 14 + ip_hdr_len;
+    int ns = PACKET_CRYPTO_NONCE_BYTES;
+
     if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + CRYPTO_L3_FRAG_TAG_SIZE))
+        return 0;
+    if (tunnel_off + ns + 1 >= (int)pkt_len)
+        return 0;
+    if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L3_FRAG_MAGIC)
         return 0;
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3)
-            continue;
-        int ns = PACKET_CRYPTO_NONCE_BYTES;
-        if (tunnel_off + ns + 1 >= (int)pkt_len)
-            continue;
-        if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L3_FRAG_MAGIC)
             continue;
         if (pkt_data[tunnel_off + ns] != (uint8_t)cp->id)
             continue;
@@ -479,18 +481,18 @@ int frag_is_fragment_l4(const struct app_config *cfg,
     int transport_off = 14 + ip_hdr_len;
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
     int tunnel_off = transport_off + crypto_layer4_wire_port_len();
+    int ns = PACKET_CRYPTO_NONCE_BYTES;
 
     if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE))
+        return 0;
+    if (tunnel_off + ns + 1 >= (int)pkt_len)
+        return 0;
+    if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L4_FRAG_MAGIC)
         return 0;
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4)
-            continue;
-        int ns = PACKET_CRYPTO_NONCE_BYTES;
-        if (tunnel_off + ns + 1 >= (int)pkt_len)
-            continue;
-        if (pkt_data[tunnel_off + ns + 1] != CRYPTO_L4_FRAG_MAGIC)
             continue;
         if (pkt_data[tunnel_off + ns] != (uint8_t)cp->id)
             continue;
