@@ -18,8 +18,13 @@ void crypto_apply_default_from_cfg(const struct app_config *cfg) {
 }
 
 void crypto_apply_from_policy(const struct crypto_policy *cp) {
+    static __thread const struct crypto_policy *applied;
+
     if (!cp)
         return;
+    if (applied == cp)
+        return;
+    applied = cp;
 
     packet_crypto_set_mode(cp->crypto_mode);
     packet_crypto_set_aes_bits(cp->aes_bits);

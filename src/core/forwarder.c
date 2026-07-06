@@ -31,8 +31,9 @@ void forwarder_pin_cpu(void)
     pin_cpu(ne_cpu_rx_lan(0));
 }
 
-#define DP_BURST_ROUNDS   8
-#define DP_TX_BURST_MAX   8
+#define DP_BURST_ROUNDS   16
+#define DP_TX_BURST_MAX   32
+#define CRYPTO_WORK_BURST 32
 
 static void dp_burst_refill_local(struct forwarder *fwd, int rx_slot)
 {
@@ -260,11 +261,31 @@ static void crypto_worker_tick(struct forwarder *fwd, int is_primary)
     mac_learn_tick(fwd);
 }
 
+static int crypto_worker_drain(struct forwarder *fwd, int worker_idx)
+{
+    struct ne_packet job;
+    int n = 0;
+
+    while (n < CRYPTO_WORK_BURST) {
+        if (ne_ring_try_pop(&fwd->wan_to_mid[worker_idx], &job) == 0) {
+            dataplane_process_wan(fwd, job);
+            n++;
+            continue;
+        }
+        if (ne_ring_try_pop(&fwd->local_to_mid[worker_idx], &job) == 0) {
+            dataplane_process_local(fwd, job);
+            n++;
+            continue;
+        }
+        break;
+    }
+    return n;
+}
+
 static void *crypto_worker_thread(void *arg)
 {
     struct crypto_worker_ctx *ctx = arg;
     struct forwarder *fwd = ctx->fwd;
-    struct ne_packet job;
     uint32_t gc_tick = 0;
     uint32_t maint_tick = 0;
     int is_primary = (ctx->worker_idx == 0);
@@ -280,14 +301,8 @@ static void *crypto_worker_thread(void *arg)
             if (pthread_mutex_trylock(&runtime_lock) != 0) {
                 if (!atomic_load_explicit(&running, memory_order_acquire))
                     break;
-                if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
-                    dataplane_process_wan(fwd, job);
+                if (crypto_worker_drain(fwd, ctx->worker_idx) > 0)
                     did_work = 1;
-                }
-                if (ne_ring_try_pop(&fwd->local_to_mid[ctx->worker_idx], &job) == 0) {
-                    dataplane_process_local(fwd, job);
-                    did_work = 1;
-                }
                 if (!did_work)
                     sched_yield();
                 continue;
@@ -304,14 +319,8 @@ static void *crypto_worker_thread(void *arg)
                 crypto_worker_tick(fwd, 1);
         }
 
-        if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
-            dataplane_process_wan(fwd, job);
+        if (crypto_worker_drain(fwd, ctx->worker_idx) > 0)
             did_work = 1;
-        }
-        if (ne_ring_try_pop(&fwd->local_to_mid[ctx->worker_idx], &job) == 0) {
-            dataplane_process_local(fwd, job);
-            did_work = 1;
-        }
         if (++gc_tick >= 2048) {
             fwd_crypto_frag_gc_worker_tick(ctx->worker_idx);
             gc_tick = 0;
