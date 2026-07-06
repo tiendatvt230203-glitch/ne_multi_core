@@ -25,24 +25,6 @@ struct {
 #define IPPROTO_OSPF_VAL 89
 #define IPPROTO_CUSTOM_VAL 99
 
-#ifndef ETH_P_8021AD
-#define ETH_P_8021AD 0x88A8
-#endif
-
-static __always_inline int skip_one_vlan(void **nh, void *data_end, __u16 *proto)
-{
-    if (*proto != bpf_htons(ETH_P_8021Q) && *proto != bpf_htons(ETH_P_8021AD))
-        return 0;
-
-    __u16 *vlan = *nh;
-    if ((void *)(vlan + 2) > data_end)
-        return -1;
-
-    *proto = vlan[1];
-    *nh = (void *)(vlan + 2);
-    return 0;
-}
-
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
 {
@@ -53,17 +35,14 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    void *nh = (void *)(eth + 1);
     __u16 proto = eth->h_proto;
-    if (skip_one_vlan(&nh, data_end, &proto) != 0)
-        return XDP_PASS;
 
     if (proto == __constant_htons(ETH_P_ARP)) {
         return XDP_PASS;
     }
 
     if (proto == __constant_htons(ETH_P_IP)) {
-        struct iphdr *ip = nh;
+        struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 

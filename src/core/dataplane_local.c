@@ -11,9 +11,30 @@
 #include "../../inc/core/crypto_route.h"
 #include "../../inc/core/mac_learn.h"
 
+    #include <stdio.h>
     #include <string.h>
 
 #define SPLIT_TAIL_REFILL_BATCH 32u
+
+static void dp_local_drop_log(const char *why)
+{
+    fprintf(stderr, "[DP-LOCAL] drop: %s\n", why);
+    fflush(stderr);
+}
+
+static int pair_to_cfg_local_idx(const struct forwarder *fwd, int pair_li)
+{
+    const char *ifname;
+
+    if (!fwd || !fwd->cfg || pair_li < 0 || pair_li >= fwd->local_count)
+        return -1;
+    ifname = fwd->locals[pair_li].ifname;
+    for (int i = 0; i < fwd->cfg->local_count; i++) {
+        if (strcmp(fwd->cfg->locals[i].ifname, ifname) == 0)
+            return i;
+    }
+    return pair_li;
+}
 
     static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
     {
@@ -139,7 +160,13 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
                                 uint16_t src_port, uint16_t dst_port, uint8_t proto,
                                 int *profile_idx, const struct crypto_policy **cp)
     {
+        int cfg_li;
+
         if (!fwd || !fwd->cfg || !profile_idx || !cp)
+            return -1;
+
+        cfg_li = pair_to_cfg_local_idx(fwd, local_idx);
+        if (cfg_li < 0)
             return -1;
 
         const struct crypto_policy *best = NULL;
@@ -148,16 +175,23 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
             const struct profile_config *p = &fwd->cfg->profiles[pi];
             int found = 0;
+            const struct crypto_policy *c;
+
             if (!p->enabled)
                 continue;
             for (int i = 0; i < p->local_count; i++)
-                if (p->local_indices[i] == local_idx)
+                if (p->local_indices[i] == cfg_li)
                     found = 1;
             if (!found)
                 continue;
-            const struct crypto_policy *c = flow_ok
-                ? config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto)
-                : NULL;
+            if (flow_ok) {
+                c = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
+                                                src_port, dst_port, proto);
+            } else {
+                c = config_select_crypto_policy(fwd->cfg, pi, 0, 0, 0, 0, 0);
+                if (c && c->action != POLICY_ACTION_BYPASS)
+                    c = NULL;
+            }
             if (!c)
                 continue;
             if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {
@@ -192,33 +226,50 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         mac_learn(fwd, li, pkt, job.len);
 
         if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                                &profile_idx, &cp) != 0)
+                                &profile_idx, &cp) != 0) {
+            dp_local_drop_log(flow_ok ? "no policy match" : "no bypass policy (flow parse failed)");
             goto drop;
+        }
         wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                         src_port, dst_port, proto, job.len);
-        if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))
+        if (wan_dp < 0) {
+            dp_local_drop_log("no live WAN (check ne_wan dst_ip NULL + weight>0)");
             goto drop;
+        }
+        if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
+            dp_local_drop_log("WAN tx ring full");
+            goto drop;
+        }
 
         if (cp->action == POLICY_ACTION_BYPASS) {
-            (void)push_to_wan(fwd, &job, wan_dp);
+            if (push_to_wan(fwd, &job, wan_dp) != 0)
+                dp_local_drop_log("push_to_wan failed");
             return;
         }
-        if (!fwd->cfg->crypto_enabled)
+        if (!fwd->cfg->crypto_enabled) {
+            dp_local_drop_log("crypto disabled");
             goto drop;
+        }
 
         pi = (int)(cp - fwd->cfg->policies);
-        if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
+        if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
+            dp_local_drop_log("crypto policy not ready");
             goto drop;
+        }
         pctx = fwd_crypto_policy_ctx(pi);
-        if (!pctx)
+        if (!pctx) {
+            dp_local_drop_log("crypto ctx missing");
             goto drop;
+        }
         pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
         pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
         crypto_apply_from_policy(cp);
         enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                             src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
-        if (enc < 0)
+        if (enc < 0) {
+            dp_local_drop_log("encrypt failed");
             goto drop;
+        }
         if (enc > 0)
             return;
         (void)push_to_wan(fwd, &job, wan_dp);
