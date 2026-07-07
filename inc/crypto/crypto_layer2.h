@@ -2,6 +2,7 @@
 #define CRYPTO_LAYER2_H
 
 #include "packet_crypto.h"
+#include "eth_parse.h"
 
 #define NE_L2_FAKE_ETHERTYPE     0x88B5u
 
@@ -19,6 +20,15 @@ void crypto_layer2_bind_worker_idx(uint8_t worker_idx);
 uint8_t crypto_layer2_worker_idx(void);
 
 int crypto_layer2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8_t *worker_idx_out);
+
+int crypto_layer2_policy_off(const uint8_t *packet, size_t pkt_len);
+int crypto_layer2_core_id_off(const uint8_t *packet, size_t pkt_len);
+int crypto_layer2_nonce_off(const uint8_t *packet, size_t pkt_len);
+int crypto_layer2_enc_start_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
+int crypto_layer2_frag_magic_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
+int crypto_layer2_has_fake_ethertype(const uint8_t *packet, size_t pkt_len);
+int crypto_layer2_read_policy_id(const uint8_t *packet, size_t pkt_len, uint8_t *policy_id_out);
+int crypto_layer2_wire_prefix_len(const uint8_t *packet, size_t pkt_len);
 
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);

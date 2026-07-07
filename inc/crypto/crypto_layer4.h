@@ -2,11 +2,10 @@
 #define CRYPTO_LAYER4_H
 
 #include "packet_crypto.h"
+#include "eth_parse.h"
 
 #define CRYPTO_L4_TUNNEL_MAGIC  0xA5
 #define CRYPTO_L4_FRAG_MAGIC    0x5A
-
-int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len);
 
 int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);

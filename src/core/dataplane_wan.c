@@ -28,18 +28,20 @@ static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fw
     return NULL;
 }
 
-static void wan_apply_l2_policy(struct forwarder *fwd, const uint8_t *pkt)
+static void wan_apply_l2_policy(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
-    const struct crypto_policy *cp = fwd_l2_policy_by_wire_id(fwd, pkt[CRYPTO_L2_POLICY_OFF]);
+    uint8_t wire_id = 0;
+
+    if (crypto_layer2_read_policy_id(pkt, len, &wire_id) != 0)
+        return;
+    const struct crypto_policy *cp = fwd_l2_policy_by_wire_id(fwd, wire_id);
     if (cp)
         crypto_apply_from_policy(cp);
 }
 
 static int wan_l2_plain_ipv4(const uint8_t *pkt, uint32_t len)
 {
-    if (len < ETH_HEADER_SIZE)
-        return 0;
-    return (((uint16_t)pkt[12] << 8) | pkt[13]) == 0x0800;
+    return crypto_pkt_is_ipv4(pkt, len);
 }
 
 static int wan_is_bypass_plain(const uint8_t *pkt, uint32_t len)
@@ -74,15 +76,17 @@ static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 
 static int decrypt_l2(uint8_t *pkt, uint32_t *len)
 {
-    uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
     struct packet_crypto_ctx *ctx;
+    uint8_t wire_id = 0;
     int n;
 
-    if (!fake || *len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN)
+    if (!pkt || !len)
         return 0;
-    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != fake)
+    if (!crypto_layer2_has_fake_ethertype(pkt, *len))
         return 0;
-    ctx = fwd_crypto_ctx_for_wire_id(pkt[CRYPTO_L2_POLICY_OFF]);
+    if (crypto_layer2_read_policy_id(pkt, *len, &wire_id) != 0)
+        return 0;
+    ctx = fwd_crypto_ctx_for_wire_id(wire_id);
     if (!ctx)
         return -1;
     n = crypto_layer2_decrypt(ctx, pkt, *len);
@@ -99,6 +103,7 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
+    uint8_t buf[4096];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -112,18 +117,15 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     if (nd < 0)
         return -1;
     rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
-                                pkt, (uint32_t)nd, opid, ofidx, pkt, &blen);
+                                pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
     if (rr != 1)
         return -1;
+    memcpy(pkt, buf, blen);
     *len = blen;
-    if (blen >= 14) {
-        pkt[12] = 0x08;
-        pkt[13] = 0x00;
-    }
     return 0;
 }
 
@@ -134,6 +136,7 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
+    uint8_t buf[4096];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -146,14 +149,14 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     nd = crypto_layer3_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
     if (nd < 0)
         return -1;
-    rr = frag_try_reassemble(fwd_crypto_frag_l3(slot), pkt, (uint32_t)nd, opid, ofidx,
-                             pkt, &blen);
+    rr = frag_try_reassemble(fwd_crypto_frag_l3(slot), pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
     if (rr != 1)
         return -1;
+    memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
 }
@@ -165,6 +168,7 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
+    uint8_t buf[4096];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -177,14 +181,14 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     nd = crypto_layer4_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
     if (nd < 0)
         return -1;
-    rr = frag_try_reassemble_l4(fwd_crypto_frag_l4(slot), pkt, (uint32_t)nd, opid, ofidx,
-                                pkt, &blen);
+    rr = frag_try_reassemble_l4(fwd_crypto_frag_l4(slot), pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;
     }
     if (rr != 1)
         return -1;
+    memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
 }
@@ -203,11 +207,13 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     {
         int frag_mark = 0;
         int ns = PACKET_CRYPTO_NONCE_BYTES;
-        int mark_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
+        int mark_off;
         uint32_t orig_len = len;
+        uint8_t wire_pol = 0;
 
-        wan_apply_l2_policy(fwd, pkt);
-        if (len > (uint32_t)mark_off)
+        wan_apply_l2_policy(fwd, pkt, len);
+        mark_off = crypto_layer2_frag_magic_off(pkt, len, ns);
+        if (mark_off >= 0 && len > (uint32_t)mark_off)
             frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
 
         int need_backup = frag_mark ||
@@ -219,7 +225,9 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
                 memcpy(pkt, scratch, orig_len);
             len = orig_len;
             if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
+                if (crypto_layer2_read_policy_id(pkt, len, &wire_pol) != 0)
+                    return -1;
+                if (reassemble_l2(fwd, pkt, &len, wire_pol, &pending) != 0)
                     return -1;
             } else {
                 return -1;
@@ -400,8 +408,13 @@ static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 
     if (!fwd || !pkt || !fwd->cfg)
         return -1;
-    if (fwd_crypto_has_l2_marker(pkt, len))
-        return profile_pi_for_wire_policy(fwd, pkt[CRYPTO_L2_POLICY_OFF]);
+    if (fwd_crypto_has_l2_marker(pkt, len)) {
+        uint8_t wire_pol = 0;
+
+        if (crypto_layer2_read_policy_id(pkt, len, &wire_pol) != 0)
+            return -1;
+        return profile_pi_for_wire_policy(fwd, wire_pol);
+    }
     if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
         return profile_pi_for_wire_policy(fwd, pol);
     if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)

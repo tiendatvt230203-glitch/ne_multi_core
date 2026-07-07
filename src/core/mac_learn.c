@@ -155,18 +155,13 @@ static void table_init(struct mac_learn_table *t)
 
 static void table_learn(struct mac_learn_table *t, const char *ifname, const uint8_t mac[MAC_LEN])
 {
-    int if_idx;
+    uint64_t now_ms;
 
     if (!t || !ifname || !mac || ifname[0] == '\0')
         return;
-
+    now_ms = monotonic_ms();
     pthread_spin_lock(&t->lock);
-    if_idx = find_idx_by_ifname_locked(t, ifname);
-    if (if_idx >= 0 && memcmp(t->list[if_idx].mac, mac, MAC_LEN) == 0) {
-        pthread_spin_unlock(&t->lock);
-        return;
-    }
-    upsert_locked(t, ifname, mac, monotonic_ms());
+    upsert_locked(t, ifname, mac, now_ms);
     pthread_spin_unlock(&t->lock);
 }
 

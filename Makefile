@@ -26,6 +26,7 @@ APP_SRC = main.c \
           src/core/dataplane_wan.c \
           src/core/mac_learn.c \
           src/crypto/crypto_policy_utils.c \
+          src/crypto/eth_parse.c \
           src/crypto/crypto_dispatch.c \
           src/crypto/packet_crypto.c \
           src/crypto/traffic_crypto.c \

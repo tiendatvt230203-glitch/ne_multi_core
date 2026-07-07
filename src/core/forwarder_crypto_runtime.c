@@ -415,13 +415,13 @@ struct packet_crypto_ctx *fwd_crypto_policy_ctx(int policy_index)
 
 int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len)
 {
-    uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
-    if (!fake || !pkt || pkt_len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN)
+    uint8_t wire_pol = 0;
+
+    if (!pkt || !crypto_layer2_has_fake_ethertype(pkt, pkt_len))
         return 0;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et != fake)
+    if (crypto_layer2_read_policy_id(pkt, pkt_len, &wire_pol) != 0)
         return 0;
-    return policy_index_by_wire_id[pkt[CRYPTO_L2_POLICY_OFF]] >= 0;
+    return policy_index_by_wire_id[wire_pol] >= 0;
 }
 
 struct frag_table *fwd_crypto_frag_l2(int slot, int worker_idx)

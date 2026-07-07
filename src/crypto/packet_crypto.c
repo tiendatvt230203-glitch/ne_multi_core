@@ -217,24 +217,14 @@ int packet_crypto_get_aes_bits(void)
     return g_aes_bits;
 }
 
-static __thread uint32_t tls_counter_lo;
-static __thread uint32_t tls_counter_hi;
-
 uint32_t packet_crypto_next_counter(void)
 {
-    if (tls_counter_lo >= tls_counter_hi) {
-        uint32_t base = atomic_fetch_add(&g_nonce_counter, 64u) & 0x7FFFFFFFu;
-        tls_counter_lo = base;
-        tls_counter_hi = base + 64u;
-    }
-    return tls_counter_lo++;
+    return atomic_fetch_add(&g_nonce_counter, 1) & 0x7FFFFFFFu;
 }
 
 void packet_crypto_reset_counter(void)
 {
     atomic_store(&g_nonce_counter, 0);
-    tls_counter_lo = 0;
-    tls_counter_hi = 0;
 }
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot)
@@ -321,8 +311,10 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t i
         return 0;
 
     evp = tls_ctx_get(&tls_ctr_ctx);
-    if (!evp)
+    if (!evp){
+        printf("Het ram\n");
         return -1;
+    }
 
     ks = key_size_bytes();
     if (tls_ctr_key_len != ks) {
@@ -365,8 +357,10 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
         return -1;  
     
     evp = tls_ctx_get(&tls_gcm_enc_ctx);
-    if (!evp)
+    if (!evp) {
+        printf("Het ram gcm\n");
         return -1;
+    }
     if (gcm_bind_key(evp, 1, key, nonce_len, tls_gcm_enc_key, &tls_gcm_enc_key_len,
                      &tls_gcm_enc_nonce_len) != 0) {
         tls_gcm_invalidate_enc();

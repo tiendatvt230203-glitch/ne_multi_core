@@ -1,4 +1,4 @@
-    #include "../../inc/core/dataplane.h"
+#include "../../inc/core/dataplane.h"
     #include "../../inc/core/dataplane_util.h"
     #include "../../inc/core/forwarder_wan.h"
     #include "../../inc/core/forwarder_crypto_runtime.h"
@@ -44,14 +44,8 @@
             ne_frame_free(&fwd->pair, tail->addr);
             return -1;
         }
-        if (ne_ring_try_push(tx, tail) != 0) {
-            struct ne_packet rollback;
-
-            if (ne_ring_try_pop(tx, &rollback) == 0)
-                (void)rollback;
+        if (ne_ring_try_push(tx, tail) != 0)
             ne_frame_free(&fwd->pair, tail->addr);
-            return -1;
-        }
         return 0;
     }
 

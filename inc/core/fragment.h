@@ -7,6 +7,7 @@
 #include <time.h>
 #include "config.h"
 #include "packet_crypto.h"
+#include "eth_parse.h"
 #include "crypto_layer4.h"
 #include "crypto_layer2.h"
 #include "crypto_layer3.h"
@@ -23,7 +24,8 @@ struct frag_entry {
     uint8_t  second[1600];
     uint32_t first_len;
     uint32_t second_len;
-    uint8_t  eth_hdr[14];
+    uint8_t  eth_hdr[ETH_L2_HDR_MAX];
+    uint8_t  eth_len;
     uint64_t timestamp_ns;
     uint8_t  got_first;
     uint8_t  got_second;

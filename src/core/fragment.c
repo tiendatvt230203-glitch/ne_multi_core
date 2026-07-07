@@ -62,14 +62,18 @@ static void frag_prepare_entry(struct frag_entry *entry, uint16_t pkt_id, uint64
 }
 
 static int frag_store_first(struct frag_entry *entry, uint16_t pkt_id,
-                            const uint8_t *eth, const uint8_t *data, uint32_t data_len,
+                            const uint8_t *eth, uint8_t eth_len,
+                            const uint8_t *data, uint32_t data_len,
                             uint64_t now) {
     if (data_len > sizeof(entry->first))
+        return -1;
+    if (eth_len == 0 || eth_len > sizeof(entry->eth_hdr))
         return -1;
     frag_prepare_entry(entry, pkt_id, now);
     entry->first_len = data_len;
     memcpy(entry->first, data, data_len);
-    memcpy(entry->eth_hdr, eth, 14);
+    memcpy(entry->eth_hdr, eth, eth_len);
+    entry->eth_len = eth_len;
     entry->got_first = 1;
     return 0;
 }
@@ -86,9 +90,10 @@ static int frag_store_second(struct frag_entry *entry, uint16_t pkt_id,
     return 0;
 }
 
-static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len, int eth_len) {
+static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len) {
     if (!entry->got_first || !entry->got_second)
         return 0;
+    int eth_len = entry->eth_len ? entry->eth_len : (int)ETH_HEADER_SIZE;
     if (entry->first_len + entry->second_len + (uint32_t)eth_len > NE_FRAME) {
         memset(entry, 0, sizeof(*entry));
         return -1;
@@ -222,9 +227,9 @@ int frag_try_reassemble(struct frag_table *ft,
         if (inner_ip_hdr_len < 20 || payload_len < (uint32_t)inner_ip_hdr_len)
             return -1;
 
-        if (frag_store_first(entry, pkt_id, pkt_data, payload, payload_len, now) != 0)
+        if (frag_store_first(entry, pkt_id, pkt_data, ETH_HEADER_SIZE, payload, payload_len, now) != 0)
             return -1;
-        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        int joined = frag_emit_join(entry, out_buf, out_len);
         return joined;
     }
 
@@ -234,7 +239,7 @@ int frag_try_reassemble(struct frag_table *ft,
             memset(entry, 0, sizeof(*entry));
         if (frag_store_second(entry, pkt_id, payload, payload_len, now) != 0)
             return -1;
-        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        int joined = frag_emit_join(entry, out_buf, out_len);
         return joined;
     }
 
@@ -246,20 +251,22 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
                               size_t frag0_max, uint32_t *frag0_len,
                               uint8_t *frag1, size_t frag1_max,
                               uint32_t *frag1_len) {
-    if (pkt_len < 14 + 20)
+    int l3_off = crypto_eth_ipv4_offset(pkt_data, pkt_len);
+    if (l3_off < 0)
         return -1;
 
     const uint8_t *eth_hdr = pkt_data;
-    const uint8_t *ip_hdr = pkt_data + 14;
+    const uint8_t *ip_hdr = pkt_data + l3_off;
 
-    int ip_hdr_len;
-    if (frag_require_ipv4(pkt_data, pkt_len, &ip_hdr_len) != 0)
+    int ip_hdr_len = (ip_hdr[0] & 0x0F) * 4;
+    if ((ip_hdr[0] >> 4) != 4 || ip_hdr_len < 20 ||
+        pkt_len < (uint32_t)(l3_off + ip_hdr_len))
         return -1;
 
     uint8_t ip_proto = ip_hdr[9];
 
-    const uint8_t *ip_payload = pkt_data + 14 + ip_hdr_len;
-    uint32_t ip_payload_len = pkt_len - 14 - ip_hdr_len;
+    const uint8_t *ip_payload = pkt_data + l3_off + ip_hdr_len;
+    uint32_t ip_payload_len = pkt_len - (uint32_t)l3_off - (uint32_t)ip_hdr_len;
 
     int transport_hdr_len = -1;
     uint32_t app_off = 0;
@@ -277,7 +284,7 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
     if (app_len == 0)
         return -1;
 
-    uint32_t frag_overhead = 14u + (uint32_t)crypto_layer2_frag_meta_len();
+    uint32_t frag_overhead = (uint32_t)l3_off + (uint32_t)crypto_layer2_frag_meta_len();
     if (frag_overhead >= FRAG_MTU)
         return -1;
     uint32_t max_plain0 = FRAG_MTU - frag_overhead;
@@ -315,30 +322,27 @@ int frag_is_fragment_l2(const struct app_config *cfg,
                         const uint8_t *pkt_data, uint32_t pkt_len,
                         uint16_t *pkt_id, uint8_t *frag_index) {
     int ns, tag_off;
-    uint16_t fake_ipv4;
-    uint16_t et;
     uint8_t wire_pol;
 
     if (!cfg || !pkt_id || !frag_index)
         return 0;
 
-    ns = PACKET_CRYPTO_NONCE_BYTES;
-    tag_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
-    if (pkt_len < (uint32_t)(tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
+    if (!crypto_layer2_has_fake_ethertype(pkt_data, pkt_len))
         return 0;
 
-    fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
-    if (!fake_ipv4)
+    ns = PACKET_CRYPTO_NONCE_BYTES;
+    tag_off = crypto_layer2_frag_magic_off(pkt_data, pkt_len, ns);
+    if (tag_off < 0)
         return 0;
-    et = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
-    if (et != fake_ipv4)
+    if (pkt_len < (uint32_t)(tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
         return 0;
 
     /* Non-frag L2 crypto hits this on every WAN packet — bail before policy scan. */
     if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
         return 0;
 
-    wire_pol = pkt_data[CRYPTO_L2_POLICY_OFF];
+    if (crypto_layer2_read_policy_id(pkt_data, pkt_len, &wire_pol) != 0)
+        return 0;
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L2)
@@ -357,7 +361,10 @@ int frag_try_reassemble_l2(struct frag_table *ft,
                            const uint8_t *pkt_data, uint32_t pkt_len,
                            uint16_t pkt_id, uint8_t frag_index,
                            uint8_t *out_buf, uint32_t *out_len) {
-    int wire_eth = crypto_layer2_wire_eth_len();
+    /* Wire prefix = MAC + optional VLAN tags + inner ethertype (fake). */
+    int wire_eth = crypto_layer2_wire_prefix_len(pkt_data, pkt_len);
+    if (wire_eth < 0 || wire_eth > (int)ETH_L2_HDR_MAX)
+        return -1;
     if (pkt_len < (uint32_t)(wire_eth + 20))
         return -1;
 
@@ -374,15 +381,14 @@ int frag_try_reassemble_l2(struct frag_table *ft,
         int ip_hdr_len = (inner[0] & 0x0F) * 4;
         if (ip_hdr_len < 20 || inner_len < (uint32_t)ip_hdr_len)
             return -1;
-        if (frag_store_first(entry, pkt_id, pkt_data, inner, inner_len, now) != 0)
+        if (frag_store_first(entry, pkt_id, pkt_data, (uint8_t)wire_eth, inner, inner_len, now) != 0)
             return -1;
-        int joined = frag_emit_join(entry, out_buf, out_len, wire_eth);
+        int joined = frag_emit_join(entry, out_buf, out_len);
         if (joined < 0)
             return -1;
         if (joined == 0)
             return 0;
-        out_buf[12] = 0x08;
-        out_buf[13] = 0x00;
+        crypto_eth_set_ipv4_et(out_buf, wire_eth - 2);
         return 1;
     }
 
@@ -392,13 +398,13 @@ int frag_try_reassemble_l2(struct frag_table *ft,
             memset(entry, 0, sizeof(*entry));
         if (frag_store_second(entry, pkt_id, inner, inner_len, now) != 0)
             return -1;
-        int joined = frag_emit_join(entry, out_buf, out_len, wire_eth);
+        int out_eth_len = entry->eth_len ? entry->eth_len : wire_eth;
+        int joined = frag_emit_join(entry, out_buf, out_len);
         if (joined < 0)
             return -1;
         if (joined == 0)
             return 0;
-        out_buf[12] = 0x08;
-        out_buf[13] = 0x00;
+        crypto_eth_set_ipv4_et(out_buf, out_eth_len - 2);
         return 1;
     }
 
@@ -534,9 +540,9 @@ int frag_try_reassemble_l4(struct frag_table *ft,
         if (inner_proto != 6 && inner_proto != 17)
             return -1;
 
-        if (frag_store_first(entry, pkt_id, pkt_data, plain, plain_len, now) != 0)
+        if (frag_store_first(entry, pkt_id, pkt_data, ETH_HEADER_SIZE, plain, plain_len, now) != 0)
             return -1;
-        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        int joined = frag_emit_join(entry, out_buf, out_len);
         if (joined == 1)
             (void)crypto_layer4_fixup_packet(out_buf, *out_len);
         return joined;
@@ -554,7 +560,7 @@ int frag_try_reassemble_l4(struct frag_table *ft,
             return -1;
         if (frag_store_second(entry, pkt_id, payload + wire_ports, second_half_len, now) != 0)
             return -1;
-        int joined = frag_emit_join(entry, out_buf, out_len, 14);
+        int joined = frag_emit_join(entry, out_buf, out_len);
         if (joined == 1)
             (void)crypto_layer4_fixup_packet(out_buf, *out_len);
         return joined;

@@ -60,27 +60,6 @@ int crypto_layer4_frag_meta_len(void) {
     return meta;
 }
 
-int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len) {
-    if (!pkt || pkt_len < 14)
-        return -1;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == 0x0800)
-        return 14;
-    if (et == 0x8100) {
-        if (pkt_len < 18)
-            return -1;
-        et = ((uint16_t)pkt[16] << 8) | pkt[17];
-        if (et == 0x0800)
-            return 18;
-        if (et == 0x8100 && pkt_len >= 22) {
-            et = ((uint16_t)pkt[20] << 8) | pkt[21];
-            if (et == 0x0800)
-                return 22;
-        }
-    }
-    return -1;
-}
-
 static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr_len,
                                          size_t ip_payload_len) {
     uint16_t new_totlen = (uint16_t)(ip_hdr_len + ip_payload_len);

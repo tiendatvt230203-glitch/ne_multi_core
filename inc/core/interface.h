@@ -8,15 +8,12 @@
 
 #define NE_RING        16384u
 #define NE_FRAME       2048u
-#define NE_N_FRAMES    131072u
+#define NE_N_FRAMES    1048576u
 #define NE_BATCH_SIZE   64u
 
 #define NE_QUEUE_OVERRIDE 0
 
-#define NE_FQ_PREFILL_MIN       512u
-#define NE_FQ_POOL_PCT_MAX      18u
-#define NE_POOL_QUEUE_EXTRA     8192u
-#define NE_QUEUES_PER_RX_SLOT   6u
+#define NE_FQ_PREFILL   16384u
 
 #include "cpu_map.h"
 
