@@ -34,12 +34,6 @@ int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len)
     if (eth_match_et(eth_read_et(pkt, 16), ETH_P_IP, fake))
         return 16;
 
-    if (eth_read_et(pkt, 16) != ETH_P_8021Q || pkt_len < 22)
-        return -1;
-
-    if (eth_match_et(eth_read_et(pkt, 20), ETH_P_IP, fake))
-        return 20;
-
     return -1;
 }
 

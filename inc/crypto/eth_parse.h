@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ETH_L2_HDR_MAX  22
+#define ETH_L2_HDR_MAX  18
 
 int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len);
 int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len);
