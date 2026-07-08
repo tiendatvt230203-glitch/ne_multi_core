@@ -26,6 +26,7 @@ int crypto_layer2_core_id_off(const uint8_t *packet, size_t pkt_len);
 int crypto_layer2_nonce_off(const uint8_t *packet, size_t pkt_len);
 int crypto_layer2_enc_start_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
 int crypto_layer2_frag_magic_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
+int crypto_layer2_frag_enc_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
 int crypto_layer2_has_fake_ethertype(const uint8_t *packet, size_t pkt_len);
 int crypto_layer2_read_policy_id(const uint8_t *packet, size_t pkt_len, uint8_t *policy_id_out);
 int crypto_layer2_wire_prefix_len(const uint8_t *packet, size_t pkt_len);

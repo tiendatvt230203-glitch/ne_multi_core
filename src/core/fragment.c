@@ -416,18 +416,18 @@ int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
                               size_t frag0_max, uint32_t *frag0_len,
                               uint8_t *frag1, size_t frag1_max,
                               uint32_t *frag1_len) {
-    if (pkt_len < 14 + 20 + 8) return -1;
+    if (pkt_len < 14 + 20 + 4) return -1;
 
     uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
     if (ether_type != 0x0800) return -1;
 
     uint8_t ip_proto = pkt_data[14 + 9];
-    if (ip_proto != 6 && ip_proto != 17) return -1;
 
     int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
     if (ip_hdr_len < 20) return -1;
 
     int transport_off = 14 + ip_hdr_len;
+    if (pkt_len < (uint32_t)transport_off) return -1;
     size_t remaining = pkt_len - transport_off;
     int transport_hdr_len = crypto_layer4_get_transport_hdr_size(
         pkt_data + transport_off, ip_proto, remaining);
@@ -473,18 +473,21 @@ int frag_is_fragment_l4(const struct app_config *cfg,
                         uint16_t *pkt_id, uint8_t *frag_index) {
     if (!cfg)
         return 0;
-    if (pkt_len < 14 + 20 + 8) return 0;
+    if (pkt_len < 14 + 20 + 4) return 0;
 
     uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
     if (ether_type != 0x0800) return 0;
 
     uint8_t ip_proto = pkt_data[14 + 9];
-    if (ip_proto != 6 && ip_proto != 17) return 0;
 
     int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
     if (ip_hdr_len < 20) return 0;
 
     int transport_off = 14 + ip_hdr_len;
+    if (pkt_len < (uint32_t)transport_off) return 0;
+    if (crypto_layer4_get_transport_hdr_size(pkt_data + transport_off, ip_proto,
+                                             pkt_len - (size_t)transport_off) < 0)
+        return 0;
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
     int tunnel_off = transport_off + crypto_layer4_wire_port_len();
     int ns = PACKET_CRYPTO_NONCE_BYTES;
@@ -531,13 +534,14 @@ int frag_try_reassemble_l4(struct frag_table *ft,
                                  ? payload_len - (uint32_t)wire_ports
                                  : 0;
         const uint8_t *plain = payload + wire_ports;
-        if (plain_len < 28 || (plain[0] >> 4) != 4)
+        if (plain_len < 24 || (plain[0] >> 4) != 4)
             return -1;
         int inner_ip_hdr_len = (plain[0] & 0x0F) * 4;
-        if (inner_ip_hdr_len < 20 || plain_len < (uint32_t)(inner_ip_hdr_len + 8))
+        if (inner_ip_hdr_len < 20 || plain_len < (uint32_t)(inner_ip_hdr_len + 4))
             return -1;
         uint8_t inner_proto = plain[9];
-        if (inner_proto != 6 && inner_proto != 17)
+        if (crypto_layer4_get_transport_hdr_size(plain + inner_ip_hdr_len, inner_proto,
+                                                 plain_len - (uint32_t)inner_ip_hdr_len) < 0)
             return -1;
 
         if (frag_store_first(entry, pkt_id, pkt_data, ETH_HEADER_SIZE, plain, plain_len, now) != 0)

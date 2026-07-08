@@ -92,7 +92,7 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
     if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 8))
         return -1;
 
-    if (pkt[l3_off + 9] != 6 && pkt[l3_off + 9] != 17)
+    if (pkt[l3_off + 9] != 6 && pkt[l3_off + 9] != 17 && pkt[l3_off + 9] != 1)
         return -1;
 
     int transport_off = l3_off + ip_hdr_len;
@@ -185,10 +185,6 @@ int crypto_decrypt_packet_auto_by_action(
         if (ip_hdr_len < 20)
             return 0;
         if (*pkt_len < (uint32_t)(l3_off + ip_hdr_len + 8))
-            return 0;
-
-        uint8_t ip_proto = pkt[l3_off + 9];
-        if (ip_proto != 6 && ip_proto != 17)
             return 0;
 
         int transport_off = l3_off + ip_hdr_len;
