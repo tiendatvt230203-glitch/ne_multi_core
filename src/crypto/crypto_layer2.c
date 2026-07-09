@@ -67,17 +67,6 @@ int crypto_layer2_frag_magic_off(const uint8_t *packet, size_t pkt_len, int nonc
     return crypto_layer2_enc_start_off(packet, pkt_len, nonce_size);
 }
 
-int crypto_layer2_frag_enc_off(const uint8_t *packet, size_t pkt_len, int nonce_size)
-{
-    int magic_off = crypto_layer2_frag_magic_off(packet, pkt_len, nonce_size);
-
-    if (magic_off < 0)
-        return -1;
-    if (pkt_len < (size_t)(magic_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
-        return -1;
-    return magic_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
-}
-
 int crypto_layer2_has_fake_ethertype(const uint8_t *packet, size_t pkt_len)
 {
     int et_off = crypto_eth_inner_et_off(packet, pkt_len);
@@ -484,9 +473,8 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
         frag_magic_off = crypto_layer2_frag_magic_off(packet, pkt_len, nonce_size);
         if (frag_magic_off < 0 || packet[frag_magic_off] != L2_FRAG_MAGIC)
             return -1;
-
-        enc_off = crypto_layer2_frag_enc_off(packet, pkt_len, nonce_size);
-        if (enc_off < 0)
+        enc_off = frag_magic_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
+        if (pkt_len < (size_t)enc_off)
             return -1;
 
         l2_read_frag_tag(packet + frag_magic_off + 1, out_pkt_id, out_frag_index);
@@ -522,9 +510,8 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
         frag_magic_off = crypto_layer2_frag_magic_off(packet, pkt_len, wire_ns);
         if (frag_magic_off < 0 || packet[frag_magic_off] != L2_FRAG_MAGIC)
             return -1;
-
-        enc_off = crypto_layer2_frag_enc_off(packet, pkt_len, wire_ns);
-        if (enc_off < 0)
+        enc_off = frag_magic_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE;
+        if (pkt_len < (size_t)enc_off)
             return -1;
 
         l2_read_frag_tag(packet + frag_magic_off + 1, out_pkt_id, out_frag_index);

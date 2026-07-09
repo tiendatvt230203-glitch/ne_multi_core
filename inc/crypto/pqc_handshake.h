@@ -53,6 +53,7 @@ typedef struct {
 } pqc_rx_pkt_info_t;
 
 typedef struct {
+    // 8-Byte Aligned Members
     uint64_t last_rotation_time;
     uint64_t last_sent_time;
     uint64_t last_recv_time;
@@ -68,6 +69,7 @@ typedef struct {
     pthread_mutex_t rx_mutex;
     pthread_cond_t rx_cond;
 
+    // 4-Byte Aligned Members
     int policy_id;
     int profile_id;
     int role_mode;
@@ -76,6 +78,7 @@ typedef struct {
     int rx_len[PQC_RX_QUEUE_SIZE];
     pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
 
+    // 1-Byte Aligned Members
     uint8_t encrypt_key[PQC_TRAFFIC_KEY_SZ];
     uint8_t decrypt_key[PQC_TRAFFIC_KEY_SZ];
     uint8_t keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
@@ -86,6 +89,7 @@ typedef struct {
     char local_fingerprint[16];
     char peer_fingerprint[16];
     char wan_ifname[64];
+    char key_id[256];
 
     bool key_ready;
     bool is_initiator;
@@ -93,6 +97,7 @@ typedef struct {
     bool handshake_give_up;
     bool rotation_give_up;
     bool send_poke;
+    bool is_tunnel;
 } policy_key_binding_t;
 
 typedef struct {
@@ -166,11 +171,14 @@ bool sig_pqc_has_identity(const char *fingerprint);
 void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_ip, const char *local_fg,
                          const char *peer_fg, const char *wan_ifname,
+                         const char *key_id,
                          const char *local_priv, const char *local_pub,
-                         const char *peer_pub);
+                         const char *peer_pub, bool is_tunnel);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);
 char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);
+void sig_pqc_perpare_reload(void);
+void sig_pqc_finalize_reload(void);
 
 /**
  * Feed a received PQC handshake packet (UDP payload only) into the handshake module.
@@ -187,6 +195,7 @@ int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], boo
 void sig_pqc_promote_responder_key(int policy_id);
 void sig_pqc_discard_prev_key(int policy_id);
 void sig_pqc_trigger_retry(int policy_id);
+int sig_pqc_trigger_retry_with_info(int policy_id, char *out_info, size_t out_max);
 
 void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id);
 

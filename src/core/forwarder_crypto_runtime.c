@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 199309L
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/crypto_route.h"
 

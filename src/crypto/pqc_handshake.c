@@ -2,7 +2,7 @@
 #include "../../inc/crypto/traffic_crypto.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
 #include "../../inc/crypto/pqc_logger.h"
-#include "packet_crypto.h"
+#include "../../inc/crypto/packet_crypto.h"
 #include <sys/stat.h>
 #include <postgresql/libpq-fe.h>
 #include <stdio.h>
@@ -36,6 +36,7 @@ static policy_key_binding_t g_policy_bindings[MAX_POLICY_BINDINGS];
 static int g_policy_bindings_count = 0;
 static volatile int g_policy_key_version[MAX_POLICY_BINDINGS] = {0};
 static volatile int g_datapath_key_version[MAX_POLICY_BINDINGS] = {0};
+static bool g_policy_bindings_active[MAX_POLICY_BINDINGS] = {false};
 
 static bool g_dispatcher_running = false;
 
@@ -59,9 +60,9 @@ static uint64_t get_time_ms_hs(void) {
 
 static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *derived_master, const char *role) {
     if (b->key_ready) {
-        sig_pqc_write_log(b->policy_id, PQC_LOG_LEVEL_INFO, PQC_LOG_STATUS_SUCCESS, "Session key updated.");        
-    } else {    
-        sig_pqc_write_log(b->policy_id, PQC_LOG_LEVEL_INFO, PQC_LOG_STATUS_SUCCESS, "Secure session established.");   
+        sig_pqc_write_log(b->policy_id, b->key_id, PQC_LOG_LEVEL_INFO, PQC_LOG_STATUS_SUCCESS, "Session key updated.");
+    } else {
+        sig_pqc_write_log(b->policy_id, b->key_id, PQC_LOG_LEVEL_INFO, PQC_LOG_STATUS_SUCCESS, "Secure session established.");
     }
 
     memcpy(b->keys[KEY_SLOT_PREV], b->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
@@ -349,7 +350,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
     bool is_bridge_mode = (strlen(wan_ifname) > 0 && 
                           (strlen(peer_ip) == 0 || strcmp(peer_ip, "0.0.0.0") == 0));
-
+    if (b->is_tunnel) {
+        is_bridge_mode = false;
+    }
     const char *initial_role = (b->role_mode == PQC_ROLE_INITIATOR) ? "INITIATOR" :
                                (b->role_mode == PQC_ROLE_RESPONDER) ? "RESPONDER" : "DYNAMIC (resolving...)";
     fprintf(stderr, "[PQC-WORKER] Policy %d keys loaded. Starting state machine (role: %s, mode: %s)\n",
@@ -432,7 +435,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                                 fprintf(stderr, "[PQC-HS-L2] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
                                         PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
-                                sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Peer connection timeout.");
+                                sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Peer connection timeout.");
                                 b->handshake_give_up = true;
                                 break;
                             }
@@ -541,6 +544,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                                         forwarder_pre_diversify_pqc_keys(profile_id);
                                     }
+                                } else {
+                                    fprintf(stderr, "[PQC-HS-L2] Handshake signature verification failed for policy %d. Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                    sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Hanshake signature verification failed. Mismatched authentication keys.");
                                 }
                             }
                         }
@@ -564,7 +570,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             }
                             if (now - b->rotation_start_time > 300000) {
                                 fprintf(stderr, "[PQC-HS-L2] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
-                                sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
+                                sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
                                 b->rotation_give_up = true;
                             } else {
                                 initiate_key_rotation(b, &peer, -1, NULL, my_priv, peer_pub, profile_id, true);
@@ -620,6 +626,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                                     forwarder_pre_diversify_pqc_keys(profile_id);
                                 }
+                            } else {
+                                fprintf(stderr, "[PQC-HS-L2] Handshake signature verification failed for policy %d(Online state). Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Hanshake signature verification failed. Mismatched authentication keys.");
                             }
                         } else if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_KEEPALIVE) {
                             fprintf(stderr, "[PQC-HS-L2] Responder received KEEPALIVE for Policy %d. Verifying signature...\n", policy_id);
@@ -678,8 +687,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         if (strlen(b->wan_ifname) > 0) {
                             struct ifreq ifr;
                             memset(&ifr, 0, sizeof(ifr));
-                            // strncpy(ifr.ifr_name, b->wan_ifname, IFNAMSIZ - 1);
-                            snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%.15s", b->wan_ifname);
+                            strncpy(ifr.ifr_name, b->wan_ifname, IFNAMSIZ - 1);
                             ifr.ifr_addr.sa_family = AF_INET;
                             if (ioctl(temp_sock, SIOCGIFADDR, &ifr) == 0) {
                                 struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
@@ -732,7 +740,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                             fprintf(stderr, "[PQC-HS-L3] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
                                     PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
-                            sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Peer connection timeout.");
+                            sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Peer connection timeout.");
                             b->handshake_give_up = true;
                             break;
                         }
@@ -837,6 +845,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                                         forwarder_pre_diversify_pqc_keys(profile_id);
                                     }
+                                } else {
+                                    fprintf(stderr, "[PQC-HS-L3] Handshake signature verification failed for policy %d. Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                    sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Hanshake signature verification failed. Mismatched authentication keys.");
                                 }
                             }
                         }
@@ -858,9 +869,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             if (b->rotation_start_time == 0) {
                                 b->rotation_start_time = now;
                             }
-                            if (now - b->rotation_start_time > 300000) {
+                            if (now - b->rotation_start_time > (KEY_ROTATION_INTERVAL_MS / 2)) {
                                 fprintf(stderr, "[PQC-HS-L3] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
-                                sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
+                                sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
                                 b->rotation_give_up = true;
                             } else {
                                 initiate_key_rotation(b, NULL, sockfd, &peeraddr, my_priv, peer_pub, profile_id, false);
@@ -869,6 +880,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     }
                     usleep(500000);
                 } else {
+                    uint64_t now = get_time_ms_hs();
+                    if (!b->rotation_give_up && (now - b->last_rotation_time > KEY_ROTATION_INTERVAL_MS + 15000)) {
+                        fprintf(stderr, "[PQC-HS-L3] Key rotation timed out on Responder side (Policy %d). No HELLO received from Peer.\n", policy_id);
+                        sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
+                        pthread_mutex_lock(&g_key_mutex);
+                        b->rotation_give_up = true;
+                        pthread_mutex_unlock(&g_key_mutex);
+                    }
                     uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                     pqc_rx_pkt_info_t info;
                     int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -914,6 +933,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                                     forwarder_pre_diversify_pqc_keys(profile_id);
                                 }
+                            } else {
+                                fprintf(stderr, "[PQC-HS-L3] Handshake signature verification failed for policy %d(Online state). Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Hanshake signature verification failed. Mismatched authentication keys.");
                             }
                         } else if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_KEEPALIVE) {
                             fprintf(stderr, "[PQC-HS-L3] Responder received KEEPALIVE for Policy %d. Verifying signature...\n", policy_id);
@@ -1192,15 +1214,18 @@ bool sig_pqc_has_identity(const char *fingerprint) {
 void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_ip, const char *local_fg,
                          const char *peer_fg, const char *wan_ifname,
+                         const char *key_id,
                          const char *local_priv, const char *local_pub,
-                         const char *peer_pub) {
+                         const char *peer_pub, bool is_tunnel) {
     char *deobf_peer = peer_pub ? strdup(peer_pub) : NULL;
 
     pthread_mutex_lock(&g_key_mutex);
     policy_key_binding_t *b = NULL;
+    bool is_existing = false;
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings[i].policy_id == policy_id) {
             b = &g_policy_bindings[i];
+            is_existing = true;
             break;
         }
     }
@@ -1238,6 +1263,32 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         }
     }
     if (b) {
+        if (is_existing) {
+            bool changed = false;
+            if (b->local_priv && local_priv && strcmp(b->local_priv, local_priv) != 0) changed = true; 
+            if (b->local_pub && local_pub && strcmp(b->local_pub, local_pub) != 0) changed = true; 
+            if (b->peer_pub && deobf_peer && strcmp(b->peer_pub, deobf_peer) != 0) changed = true; 
+
+            if ((b->local_priv == NULL) != (local_priv == NULL)) changed = true;
+            if ((b->local_pub == NULL) != (local_pub == NULL)) changed = true;
+            if ((b->peer_pub == NULL) != (deobf_peer == NULL)) changed = true;
+
+            if (strcmp(b->peer_ip, peer_ip ? peer_ip : "") != 0) changed = true;
+            if (strcmp(b->wan_ifname, wan_ifname ? wan_ifname : "") != 0) changed = true;
+            if (strcmp(b->key_id, key_id ? key_id : "") != 0) changed = true;
+            if (b->is_tunnel != is_tunnel) changed = true;
+            if (b->role_mode != role_mode) changed = true;
+
+            if (changed) {
+                fprintf(stderr, "[PQC-BIND] Configuration change detectd for policy %d. Resetting handshake states.\n", policy_id);
+                b->key_ready = false;
+                b->handshake_give_up = false;
+                b->handshake_start_time = 0;
+                b->rotation_give_up = false;
+                b->rotation_start_time = 0;
+                b->send_poke = true;
+            }
+        }
         b->policy_id = policy_id;
         b->profile_id = profile_id;
         b->role_mode = role_mode;
@@ -1251,12 +1302,21 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         }
         strncpy(b->peer_ip, peer_ip ? peer_ip : "", sizeof(b->peer_ip) - 1);
         b->peer_ip[sizeof(b->peer_ip) - 1] = '\0';
-        strncpy(b->local_fingerprint, local_fg ? local_fg : "", sizeof(b->local_fingerprint) - 1);
+        // strncpy(b->local_fingerprint, local_fg ? local_fg : "", sizeof(b->local_fingerprint) - 1);
+        char clean_local_fg[16] = ""; 
+        if (local_fg) {
+            strncpy(clean_local_fg, local_fg, 8);
+            clean_local_fg[8] = '\0';
+        }
+        strncpy(b->local_fingerprint, clean_local_fg, sizeof(b->local_fingerprint) - 1);
         b->local_fingerprint[sizeof(b->local_fingerprint) - 1] = '\0';
         strncpy(b->peer_fingerprint, peer_fg ? peer_fg : "", sizeof(b->peer_fingerprint) - 1);
         b->peer_fingerprint[sizeof(b->peer_fingerprint) - 1] = '\0';
         strncpy(b->wan_ifname, wan_ifname ? wan_ifname : "", sizeof(b->wan_ifname) - 1);
         b->wan_ifname[sizeof(b->wan_ifname) - 1] = '\0';
+        strncpy(b->key_id, key_id ? key_id : "", sizeof(b->key_id) - 1);
+        b->key_id[sizeof(b->key_id) - 1] = '\0';
+        b->is_tunnel = is_tunnel;
 
         if (b->local_priv) free(b->local_priv);
         if (b->local_pub) free(b->local_pub);
@@ -1274,15 +1334,22 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         int idx = b - g_policy_bindings;
         if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
             g_policy_key_version[idx]++;
+            g_policy_bindings_active[idx] = true;
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
 }
 
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub) {
+    if (!fingerprint) {
+        return -1;
+    }
+    char clean_fg[16] = "";
+    strncpy(clean_fg, fingerprint, 8);
+    clean_fg[8] = '\0';
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_registry_count; i++) {
-        if (strcmp(g_identity_registry[i].fingerprint, fingerprint) == 0) {
+        if (strcmp(g_identity_registry[i].fingerprint, clean_fg) == 0) {
             if (out_priv) *out_priv = g_identity_registry[i].priv_key;
             if (out_pub) *out_pub = g_identity_registry[i].pub_key;
             pthread_mutex_unlock(&g_key_mutex);
@@ -1367,6 +1434,35 @@ void sig_pqc_load_keys_from_disk(void) {
         }
     }
     closedir(dir);
+}
+
+void sig_pqc_perpare_reload(void) {
+    pthread_mutex_lock(&g_key_mutex);
+    memset(g_policy_bindings_active, 0, sizeof(g_policy_bindings_active));
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+void sig_pqc_finalize_reload(void) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (!g_policy_bindings_active[i]) {
+            policy_key_binding_t *b = &g_policy_bindings[i];
+            if (b->local_priv || b->local_pub || b->peer_pub || b->key_ready) {
+                fprintf(stderr, "[PQC-RECONCILE] Policy %d PQC binding is no longer active. Deactivatin and clearing keys.\n", b->policy_id);
+                b->key_ready = false;
+                if (b->local_priv) { free(b->local_priv); b->local_priv = NULL; }
+                if (b->local_pub) { free(b->local_pub); b->local_pub = NULL; }
+                if (b->peer_pub) { free(b->peer_pub); b->peer_pub = NULL; }
+                memset(b->encrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
+                memset(b->decrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
+                for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
+                    memset(b->keys[i], 0, PQC_TRAFFIC_KEY_SZ);
+                    b->key_slots_valid[slot] = false;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
 }
 
 void sig_pqc_record_sent(int policy_id) {
@@ -1479,47 +1575,160 @@ void sig_pqc_trigger_retry(int policy_id) {
     pthread_mutex_unlock(&g_key_mutex);
 }
 
+int sig_pqc_trigger_retry_with_info(int policy_id, char *out_info, size_t out_max) {
+    bool found = false;
+    policy_key_binding_t target_binding;
+    memset(&target_binding, 0, sizeof(target_binding));
+
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id == policy_id) {
+            policy_key_binding_t *b = &g_policy_bindings[i];
+            b->handshake_give_up = false;
+            b->handshake_start_time = 0;
+            b->rotation_give_up = false;
+            b->rotation_start_time = 0;
+            b->key_ready = false;
+            b->send_poke = true;
+            
+            target_binding = *b;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+
+    if (found) {
+        snprintf(out_info, out_max,
+            "[MANUAL-RETRY] Policy=%d, Profile=%d, KeyID=%s, Iface=%s, Peer=%s, Role=%s, Status=RESETTING\n",
+            policy_id,
+            target_binding.profile_id,
+            (strlen(target_binding.key_id) > 0) ? target_binding.key_id : "N/A",
+            target_binding.wan_ifname,
+            target_binding.peer_ip,
+            target_binding.is_initiator ? "Initiator" : "Responder"
+        );
+        fprintf(stderr, "[PQC-HS] Manual retry triggered for Policy %d. All retry states reset.\n", policy_id);
+        return 0;
+    } else {
+        snprintf(out_info, out_max,
+            "[FAILED] Policy ID %d is not active or has no PQC binding configured in RAM.\n",
+            policy_id
+        );
+        return -1;
+    }
+}
+
 void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id) {
     PGconn *conn = (PGconn *)conn_ptr;
     const struct app_config *cfg = (const struct app_config *)cfg_ptr;
+    (void)profile_idx;
+    (void)cfg;
 
     char peer_ip[64] = "0.0.0.0";
+    char wan_ifname_buf[64] = "";
     const char *wan_ifname = "";
-    pqc_get_profile_handshake_params(cfg, profile_idx, peer_ip, &wan_ifname);
+    bool is_tunnel = false;
 
     char policy_id_str[32];
     snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
     const char *pqc_params[1] = { policy_id_str };
+
+    // Query to get the tunnel parameters from pqc_exchange_tunnels
+    PGresult *tunnel_res = PQexecParams(conn,
+        "SELECT t.tunnel_name, t.tunnel_ip::text, t.peer_tunnel_ip::text "
+        "FROM pqc_exchange_tunnels t "
+        "JOIN profile_tunnel_ref r ON t.id = r.tunnel_id "
+        "JOIN ne_policies p ON r.profile_id = p.profile_id "
+        "WHERE p.id = $1",
+        1, NULL, pqc_params, NULL, NULL, 0);
+
+    if (PQresultStatus(tunnel_res) == PGRES_TUPLES_OK && PQntuples(tunnel_res) > 0) {
+        is_tunnel = true;
+        const char *t_name = PQgetvalue(tunnel_res, 0, 0);
+        const char *client_ip = PQgetvalue(tunnel_res, 0, 1);
+        const char *peer_ip_db = PQgetvalue(tunnel_res, 0, 2);
+
+        if (t_name) {
+            strncpy(wan_ifname_buf, t_name, sizeof(wan_ifname_buf) - 1);
+            wan_ifname = wan_ifname_buf;
+
+            // Resolve local IP on the tunnel interface
+            char local_ip[64] = "0.0.0.0";
+            int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (temp_sock >= 0) {
+                struct ifreq ifr;
+                memset(&ifr, 0, sizeof(ifr));
+                strncpy(ifr.ifr_name, t_name, IFNAMSIZ - 1);
+                ifr.ifr_addr.sa_family = AF_INET;
+                if (ioctl(temp_sock, SIOCGIFADDR, &ifr) == 0) {
+                    struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+                    strncpy(local_ip, inet_ntoa(ipaddr->sin_addr), sizeof(local_ip) - 1);
+                }
+                close(temp_sock);
+            }
+
+            // Compare local IP with client_tunnel_ip and peer_tunnel_ip
+            if (client_ip && peer_ip_db) {
+                if (strcmp(local_ip, client_ip) == 0) {
+                    strncpy(peer_ip, peer_ip_db, sizeof(peer_ip) - 1);
+                } else if (strcmp(local_ip, peer_ip_db) == 0) {
+                    strncpy(peer_ip, client_ip, sizeof(peer_ip) - 1);
+                } else {
+                    strncpy(peer_ip, peer_ip_db, sizeof(peer_ip) - 1);
+                }
+            }
+            fprintf(stderr, "[DB-PQC] Tunnel resolved: Name=%s, LocalIP=%s, PeerIP=%s\n",
+                    t_name, local_ip, peer_ip);
+        }
+    } else {
+        fprintf(stderr, "[DB-PQC] Warning: No tunnel configuration found for policy %d\n", db_policy_id);
+    }
+    PQclear(tunnel_res);
+
     PGresult *peer_res = PQexecParams(conn,
-        "SELECT local_identity_fingerprint, peer_pub FROM pqc_identities WHERE policy_id = $1",
+        "SELECT k.local, k.remote, k.key_id "
+        "FROM pqc_keys k "
+        "JOIN policy_pqc_ref r ON k.key_id = r.key_id "
+        "WHERE r.policy_id = $1",
         1, NULL, pqc_params, NULL, NULL, 0);
 
     if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
         const char *local_fg = PQgetvalue(peer_res, 0, 0);
         const char *peer_pub_path = PQgetvalue(peer_res, 0, 1);
+        const char *key_id = PQgetvalue(peer_res, 0, 2);
+
+        char resolved_peer_pub_path[512] = "";
+        if (peer_pub_path && strlen(peer_pub_path) > 0) {
+            if (peer_pub_path[0] == '/') {
+                strncpy(resolved_peer_pub_path, peer_pub_path, sizeof(resolved_peer_pub_path) - 1);
+            } else {
+                snprintf(resolved_peer_pub_path, sizeof(resolved_peer_pub_path), "/etc/.dec_config/%s", peer_pub_path);
+            }
+        }
 
         char peer_fg_buf[16] = "";
         char *deobf_pub = NULL;
         bool valid = true;
 
-        if (!peer_pub_path || strlen(peer_pub_path) == 0) {
+        if (strlen(resolved_peer_pub_path) == 0) {
             fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing peer_pub key file path in DB!\n", db_policy_id);
             valid = false;
         } else {
-            FILE *fp_pub = fopen(peer_pub_path, "r");
+            FILE *fp_pub = fopen(resolved_peer_pub_path, "r");
             if (!fp_pub) {
-                fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] could not be opened!\n", db_policy_id, peer_pub_path);
+                fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] could not be opened!\n", db_policy_id, resolved_peer_pub_path);
                 valid = false;
             } else {
                 char file_content[8192];
                 memset(file_content, 0, sizeof(file_content));
                 if (fgets(file_content, sizeof(file_content) - 1, fp_pub) == NULL) {
-                    fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] is empty!\n", db_policy_id, peer_pub_path);
+                    fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] is empty!\n", db_policy_id, resolved_peer_pub_path);
                     valid = false;
                 } else {
                     file_content[strcspn(file_content, "\r\n")] = '\0';
                     if (strlen(file_content) < 8) {
-                        fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] has invalid format (too short)!\n", db_policy_id, peer_pub_path);
+                        fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] has invalid format (too short)!\n", db_policy_id, resolved_peer_pub_path);
                         valid = false;
                     } else {
                         strncpy(peer_fg_buf, file_content, 8);
@@ -1527,7 +1736,7 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
                         const char *obf_pub = file_content + 8;
                         deobf_pub = sig_pqc_deobfuscate_peer_pub(obf_pub, peer_fg_buf);
                         if (!deobf_pub) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] deobfuscation failed!\n", db_policy_id, peer_pub_path);
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] deobfuscation failed!\n", db_policy_id, resolved_peer_pub_path);
                             valid = false;
                         }
                     }
@@ -1542,6 +1751,7 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         char *found_pub = NULL;
         if (valid) {
             sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
+            fprintf(stderr, "[DEBUG-PQC] ", found_priv, found_pub);
             if (!found_priv || !found_pub) {
                 fprintf(stderr, "[DB-PQC] ERROR: Local keys for fingerprint [%s] (Policy %d) are not loaded in memory registry! (Please run key generator command first)\n", local_fg, db_policy_id);
                 valid = false;
@@ -1549,15 +1759,15 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         }
 
         if (valid) {
-            sig_pqc_bind_policy(db_policy_id, profile_id, role_mode, peer_ip, local_fg, peer_fg_buf, wan_ifname, found_priv, found_pub, deobf_pub);
+            sig_pqc_bind_policy(db_policy_id, profile_id, role_mode, peer_ip, local_fg, peer_fg_buf, wan_ifname, key_id, found_priv, found_pub, deobf_pub, is_tunnel);
         } else {
             fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
-            sig_pqc_write_log(db_policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
+            sig_pqc_write_log(db_policy_id, key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
         }
         if (deobf_pub) free(deobf_pub);
     } else {
         fprintf(stderr, "[DB-PQC] ERROR: No policy identity configuration found in pqc_identities for PQC policy %d. PQC Handshake will NOT start.\n", db_policy_id);
-        sig_pqc_write_log(db_policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
+        sig_pqc_write_log(db_policy_id, "", PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
     }
     PQclear(peer_res);
 }

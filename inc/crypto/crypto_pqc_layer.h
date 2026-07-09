@@ -5,6 +5,7 @@
 #include "traffic_crypto.h"
 #include "pqc_handshake.h"
 #include "scrypt.h"
+#include <stdio.h>
 
 static inline int crypto_mode_is_pqc(void) {
     return packet_crypto_get_mode() == CRYPTO_MODE_PQC;
@@ -25,6 +26,16 @@ static const byte HARDCODED_AAD[] = {
     0x54, 0x45, 0x53, 0x54, 0x5f, 0x41, 0x41, 0x44
 };
 
+static inline int crypto_pqc_key_is_all_zero(const byte *key, size_t len) {
+    if (!key || len == 0)
+        return 1;
+    for (size_t i = 0; i < len; i++) {
+        if (key[i] != 0)
+            return 0;
+    }
+    return 1;
+}
+
 static inline int crypto_pqc_sess_load(struct packet_crypto_ctx *ctx, crypto_pqc_sess_t *sess) {
     if (!ctx || !sess)
         return -1;
@@ -32,6 +43,12 @@ static inline int crypto_pqc_sess_load(struct packet_crypto_ctx *ctx, crypto_pqc
     const byte *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     if (!key)
         return -1;
+    if (crypto_pqc_key_is_all_zero(key, PQC_TRAFFIC_KEY_SZ)) {
+        fprintf(stderr,
+                "[PQC-KEY] invalid CURRENT key (all-zero) for profile=%d policy=%d; blocking PQC crypto path\n",
+                ctx->profile_id, ctx->policy_id);
+        return -1;
+    }
     sess->key = key;
     sess->aad = HARDCODED_AAD;
     sess->aad_len = 12;

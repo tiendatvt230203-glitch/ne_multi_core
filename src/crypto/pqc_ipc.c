@@ -7,9 +7,9 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 
-#include "pqc_ipc.h"
-#include "pqc_handshake.h"
-#include "traffic_crypto.h"
+#include "../../inc/crypto/pqc_ipc.h"
+#include "../../inc/crypto/pqc_handshake.h"
+#include "../../inc/crypto/traffic_crypto.h"
 
 #define IPC_SOCKET_PATH "/var/run/test_network-encryptor.sock"
 
@@ -57,8 +57,10 @@ static void *ipc_listener_thread_main(void *arg) {
         if (n > 0) {
             int policy_id = -1;
             if (sscanf(buf, "RETRY %d", &policy_id) == 1) {
-                sig_pqc_trigger_retry(policy_id);
-                if (write(client_fd, "SUCCESS\n", 8) < 0) {
+                char resp_buf[1024];
+                memset(resp_buf, 0, sizeof(resp_buf));
+                sig_pqc_trigger_retry_with_info(policy_id, resp_buf, sizeof(resp_buf) - 1);
+                if (write(client_fd, resp_buf, strlen(resp_buf)) < 0) {
                     perror("write");
                 }
             } else {
@@ -143,7 +145,7 @@ void sig_pqc_handle_gen_identity(void) {
     mkdir("/dev/shm/.enc_config", 0755);
     mkdir("/etc/.dec_config", 0755);
 
-    printf("[PQC-GI] Generating Manual Identity (RAM-ONLY)...\n");
+    printf("[PQC-GI] Generating Manual Identity...\n");
     if (trf_dsa_generate_keys(dsa_pub, &pub_sz, dsa_priv, &priv_sz) == TRF_PQC_OK) {
         char *b64_priv = malloc(priv_sz * 2);
         char *b64_pub = malloc(pub_sz * 2);
@@ -166,7 +168,7 @@ void sig_pqc_handle_gen_identity(void) {
         sprintf(file_pub_content, "%s%s", fingerprint, b64_pub);
 
         if (trf_save_key_to_file(pub_path, file_pub_content, 0644) == 0) {
-            printf("[PQC-GI] Success! Fingerprint: %s\n", fingerprint);
+            // printf("[PQC-GI] Success! Fingerprint: %s\n", fingerprint);
             printf("[PQC-GI] Public Key Exported: %s\n", pub_path);
         } else {
             fprintf(stderr, "[PQC-GI] ERROR: Failed to save key to %s\n", pub_path);
@@ -183,7 +185,7 @@ void sig_pqc_handle_gen_identity(void) {
         sprintf(file_priv_content, "%s%s", fingerprint, obf_priv);
 
         if (trf_save_key_to_file(priv_path, file_priv_content, 0600) == 0) {
-            printf("[PQC-GI] Secure Private Key Exported locally: %s\n", priv_path);
+            // printf("[PQC-GI] Secure Private Key Exported locally: %s\n", priv_path);
         } else {
             fprintf(stderr, "[PQC-GI] ERROR: Failed to save private key securely to %s\n", priv_path);
         }

@@ -89,13 +89,15 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
     uint8_t ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
     if (ip_hdr_len < 20)
         return -1;
-    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 8))
+    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 4))
         return -1;
 
-    if (pkt[l3_off + 9] != 6 && pkt[l3_off + 9] != 17 && pkt[l3_off + 9] != 1)
+    uint8_t ip_proto = pkt[l3_off + 9];
+    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
         return -1;
-
     int transport_off = l3_off + ip_hdr_len;
+    if (transport_off >= (int)pkt_len)
+        return -1;
     int wire_port_len = crypto_layer4_wire_port_len();
 
     int tunnel_off = transport_off + wire_port_len;
@@ -184,10 +186,15 @@ int crypto_decrypt_packet_auto_by_action(
         uint8_t ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
         if (ip_hdr_len < 20)
             return 0;
-        if (*pkt_len < (uint32_t)(l3_off + ip_hdr_len + 8))
+        if (*pkt_len < (uint32_t)(l3_off + ip_hdr_len + 4))
             return 0;
 
+        uint8_t ip_proto = pkt[l3_off + 9];
+        if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
+            return 0;
         int transport_off = l3_off + ip_hdr_len;
+        if (transport_off >= (int)*pkt_len)
+            return 0;
         if (*pkt_len < (uint32_t)(transport_off + 4))
             return 0;
 

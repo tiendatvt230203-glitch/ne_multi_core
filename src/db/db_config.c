@@ -65,46 +65,7 @@ static uint8_t parse_protocol_name(const char *v) {
     return (uint8_t)atoi(v);
 }
 
-#define NE_KEY_WIRE_MAP_MAX 64
-
-struct ne_key_wire_entry {
-    uint8_t key[AES_KEY_LEN];
-    int key_len;
-    int wire_id;
-    int valid;
-};
-
 static int alloc_wire_policy_id(int db_row_id, uint8_t *used);
-
-static int ne_wire_id_for_encrypt_key(struct ne_key_wire_entry *map, int map_sz,
-                                      uint8_t *wire_used,
-                                      const uint8_t *key, int key_len,
-                                      int db_policy_id) {
-    if (!key || key_len <= 0)
-        return alloc_wire_policy_id(db_policy_id, wire_used);
-
-    for (int i = 0; i < map_sz; i++) {
-        if (!map[i].valid)
-            continue;
-        if (map[i].key_len == key_len && memcmp(map[i].key, key, (size_t)key_len) == 0)
-            return map[i].wire_id;
-    }
-
-    int wire_id = alloc_wire_policy_id(db_policy_id, wire_used);
-    if (wire_id < 0)
-        return -1;
-
-    for (int i = 0; i < map_sz; i++) {
-        if (!map[i].valid) {
-            map[i].valid = 1;
-            map[i].wire_id = wire_id;
-            map[i].key_len = key_len;
-            memcpy(map[i].key, key, (size_t)key_len);
-            return wire_id;
-        }
-    }
-    return wire_id;
-}
 
 static int alloc_wire_policy_id(int db_row_id, uint8_t *used) {
     if (db_row_id >= 1 && db_row_id <= 255 && !used[(size_t)db_row_id]) {
@@ -374,7 +335,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%d", profile_id);
     const char *params[1] = { id_str };
-
+    sig_pqc_perpare_reload();
     PGresult *res = PQexecParams(conn,
         "SELECT id, name, 1 AS enabled FROM ne_profiles WHERE id = $1",
         1, NULL, params, NULL, NULL, 0);
@@ -433,9 +394,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     }
 
     uint8_t wire_id_used[256];
-    struct ne_key_wire_entry key_wire_map[NE_KEY_WIRE_MAP_MAX];
     memset(wire_id_used, 0, sizeof(wire_id_used));
-    memset(key_wire_map, 0, sizeof(key_wire_map));
     wire_id_used[0] = 1;
 
     int rows = PQntuples(res);
@@ -450,6 +409,12 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
         int proto_null = PQgetisnull(res, r, 3);
         cp_base.protocol = parse_protocol_name(proto_null ? NULL : PQgetvalue(res, r, 3));
+        if (cp_base.action == POLICY_ACTION_ENCRYPT_L4 && cp_base.protocol == 89) {
+            fprintf(stderr,
+                    "[DB CRYPTO] skip policy id=%d: protocol OSPF(89) is not supported with action L4\n",
+                    db_policy_id);
+            continue;
+        }
 
         const char *src_joined = PQgetvalue(res, r, 4);
         int invert_src = (strcmp(PQgetvalue(res, r, 5), "t") == 0);
@@ -489,10 +454,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
                 ne_fill_policy_key(enc_key, enc_null, key_len, cp_base.key);
                 {
-                    int wire_id = ne_wire_id_for_encrypt_key(key_wire_map, NE_KEY_WIRE_MAP_MAX,
-                                                            wire_id_used,
-                                                            cp_base.key, key_len,
-                                                            db_policy_id);
+                    int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
                     if (wire_id < 0) {
                         fprintf(stderr, "[DB CRYPTO] no free wire policy id (max 255 policies)\n");
                         PQclear(res);
@@ -575,7 +537,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         }
     }
     PQclear(res);
-
+    sig_pqc_finalize_reload();
     return 0;
 }
 

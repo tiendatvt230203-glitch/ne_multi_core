@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* 12 cores (0–11): 6 crypto for peak Gbps; 1 RX WAN (fiber 12q via FQ scale) */
+
 static const uint8_t NE_CPU_RX_LAN[]  = { 0u };
 static const uint8_t NE_CPU_TX_LAN[]  = { 1u, 2u };
 static const uint8_t NE_CPU_CRYPTO[]  = { 3u, 4u, 5u, 6u, 7u, 8u };

@@ -9,8 +9,24 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-// 
+
 static atomic_uint_fast32_t g_pkt_id_counter = 0;
+static atomic_uint_fast32_t g_frag_mtu = FRAG_MTU;
+
+void frag_set_mtu(uint32_t mtu) {
+    if (mtu < 512)
+        mtu = 512;
+    if (mtu > NE_FRAME)
+        mtu = NE_FRAME;
+    atomic_store(&g_frag_mtu, mtu);
+}
+
+uint32_t frag_get_mtu(void) {
+    uint32_t mtu = (uint32_t)atomic_load(&g_frag_mtu);
+    if (mtu < 512 || mtu > NE_FRAME)
+        return FRAG_MTU;
+    return mtu;
+}
 
 uint16_t frag_next_pkt_id(void) {
     return (uint16_t)(atomic_fetch_add(&g_pkt_id_counter, 1) & 0xFFFF);
@@ -90,6 +106,45 @@ static int frag_store_second(struct frag_entry *entry, uint16_t pkt_id,
     return 0;
 }
 
+static int frag_pick_slot(struct frag_table *ft, uint16_t pkt_id, uint64_t now)
+{
+    const int probe = 8;
+    int base = (int)(pkt_id % FRAG_TABLE_SIZE);
+    int empty_idx = -1;
+    int oldest_idx = -1;
+    uint64_t oldest_age = 0;
+
+    for (int i = 0; i < probe; i++) {
+        int idx = (base + i) % FRAG_TABLE_SIZE;
+        struct frag_entry *e = &ft->entries[idx];
+        int occupied = (e->got_first || e->got_second);
+
+        if (occupied && (now - e->timestamp_ns) > FRAG_TIMEOUT_NS) {
+            memset(e, 0, sizeof(*e));
+            occupied = 0;
+        }
+        if (!occupied) {
+            if (empty_idx < 0)
+                empty_idx = idx;
+            continue;
+        }
+        if (e->pkt_id == pkt_id)
+            return idx;
+
+        uint64_t age = now - e->timestamp_ns;
+        if (oldest_idx < 0 || age > oldest_age) {
+            oldest_idx = idx;
+            oldest_age = age;
+        }
+    }
+
+    if (empty_idx >= 0)
+        return empty_idx;
+    if (oldest_idx >= 0)
+        return oldest_idx;
+    return base;
+}
+
 static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len) {
     if (!entry->got_first || !entry->got_second)
         return 0;
@@ -154,6 +209,7 @@ int frag_split_and_encrypt(struct packet_crypto_ctx *ctx,
                            size_t frag0_max, uint32_t *frag0_len,
                            uint8_t *frag1, size_t frag1_max,
                            uint32_t *frag1_len) {
+    uint32_t frag_mtu = frag_get_mtu();
     if (pkt_len < 14 + 20 + 8)
         return -1;
 
@@ -182,9 +238,9 @@ int frag_split_and_encrypt(struct packet_crypto_ctx *ctx,
 
     uint32_t frag_overhead = 14u + (uint32_t)ip_hdr_len +
                              (uint32_t)crypto_layer3_frag_meta_len();
-    if (frag_overhead >= FRAG_MTU)
+    if (frag_overhead >= frag_mtu)
         return -1;
-    uint32_t max_plain0 = FRAG_MTU - frag_overhead;
+    uint32_t max_plain0 = frag_mtu - frag_overhead;
     if (max_plain0 <= (uint32_t)ip_hdr_len + app_off)
         return -1;
     uint32_t half1 = max_plain0 - (uint32_t)ip_hdr_len - app_off;
@@ -216,9 +272,9 @@ int frag_try_reassemble(struct frag_table *ft,
     const uint8_t *payload = pkt_data + 14 + ip_hdr_len;
     uint32_t payload_len = pkt_len - 14 - (uint32_t)ip_hdr_len;
 
-    int idx = pkt_id % FRAG_TABLE_SIZE;
-    struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
+    int idx = frag_pick_slot(ft, pkt_id, now);
+    struct frag_entry *entry = &ft->entries[idx];
 
     if (frag_index == 0) {
         if (payload_len < 20 || (payload[0] >> 4) != 4)
@@ -251,6 +307,7 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
                               size_t frag0_max, uint32_t *frag0_len,
                               uint8_t *frag1, size_t frag1_max,
                               uint32_t *frag1_len) {
+    uint32_t frag_mtu = frag_get_mtu();
     int l3_off = crypto_eth_ipv4_offset(pkt_data, pkt_len);
     if (l3_off < 0)
         return -1;
@@ -285,9 +342,9 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
         return -1;
 
     uint32_t frag_overhead = (uint32_t)l3_off + (uint32_t)crypto_layer2_frag_meta_len();
-    if (frag_overhead >= FRAG_MTU)
+    if (frag_overhead >= frag_mtu)
         return -1;
-    uint32_t max_plain0 = FRAG_MTU - frag_overhead;
+    uint32_t max_plain0 = frag_mtu - frag_overhead;
     uint32_t fixed_plain0 = (uint32_t)ip_hdr_len + app_off;
     if (max_plain0 <= fixed_plain0)
         return -1;
@@ -371,9 +428,9 @@ int frag_try_reassemble_l2(struct frag_table *ft,
     const uint8_t *inner = pkt_data + wire_eth;
     uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
 
-    int idx = pkt_id % FRAG_TABLE_SIZE;
-    struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
+    int idx = frag_pick_slot(ft, pkt_id, now);
+    struct frag_entry *entry = &ft->entries[idx];
 
     if (frag_index == 0) {
         if (inner_len < 20 || (inner[0] >> 4) != 4)
@@ -416,12 +473,14 @@ int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
                               size_t frag0_max, uint32_t *frag0_len,
                               uint8_t *frag1, size_t frag1_max,
                               uint32_t *frag1_len) {
-    if (pkt_len < 14 + 20 + 4) return -1;
+    uint32_t frag_mtu = frag_get_mtu();
+    if (pkt_len < 14 + 20 + 8) return -1;
 
     uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
     if (ether_type != 0x0800) return -1;
 
     uint8_t ip_proto = pkt_data[14 + 9];
+    if (ip_proto != 6 && ip_proto != 17) return -1;
 
     int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
     if (ip_hdr_len < 20) return -1;
@@ -438,9 +497,9 @@ int frag_split_and_encrypt_l4(struct packet_crypto_ctx *ctx,
     if (app_len == 0) return -1;
 
     uint32_t frag_overhead = 14u + (uint32_t)ip_hdr_len + (uint32_t)crypto_layer4_frag_meta_len();
-    if (frag_overhead >= FRAG_MTU)
+    if (frag_overhead >= frag_mtu)
         return -1;
-    uint32_t max_plain0 = FRAG_MTU - frag_overhead;
+    uint32_t max_plain0 = frag_mtu - frag_overhead;
     uint32_t fixed_plain0 = (uint32_t)ip_hdr_len + (uint32_t)transport_hdr_len;
     if (max_plain0 <= fixed_plain0)
         return -1;
@@ -473,21 +532,18 @@ int frag_is_fragment_l4(const struct app_config *cfg,
                         uint16_t *pkt_id, uint8_t *frag_index) {
     if (!cfg)
         return 0;
-    if (pkt_len < 14 + 20 + 4) return 0;
+    if (pkt_len < 14 + 20 + 8) return 0;
 
     uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
     if (ether_type != 0x0800) return 0;
 
     uint8_t ip_proto = pkt_data[14 + 9];
+    if (ip_proto != 6 && ip_proto != 17) return 0;
 
     int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
     if (ip_hdr_len < 20) return 0;
 
     int transport_off = 14 + ip_hdr_len;
-    if (pkt_len < (uint32_t)transport_off) return 0;
-    if (crypto_layer4_get_transport_hdr_size(pkt_data + transport_off, ip_proto,
-                                             pkt_len - (size_t)transport_off) < 0)
-        return 0;
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
     int tunnel_off = transport_off + crypto_layer4_wire_port_len();
     int ns = PACKET_CRYPTO_NONCE_BYTES;
@@ -534,14 +590,13 @@ int frag_try_reassemble_l4(struct frag_table *ft,
                                  ? payload_len - (uint32_t)wire_ports
                                  : 0;
         const uint8_t *plain = payload + wire_ports;
-        if (plain_len < 24 || (plain[0] >> 4) != 4)
+        if (plain_len < 28 || (plain[0] >> 4) != 4)
             return -1;
         int inner_ip_hdr_len = (plain[0] & 0x0F) * 4;
-        if (inner_ip_hdr_len < 20 || plain_len < (uint32_t)(inner_ip_hdr_len + 4))
+        if (inner_ip_hdr_len < 20 || plain_len < (uint32_t)(inner_ip_hdr_len + 8))
             return -1;
         uint8_t inner_proto = plain[9];
-        if (crypto_layer4_get_transport_hdr_size(plain + inner_ip_hdr_len, inner_proto,
-                                                 plain_len - (uint32_t)inner_ip_hdr_len) < 0)
+        if (inner_proto != 6 && inner_proto != 17)
             return -1;
 
         if (frag_store_first(entry, pkt_id, pkt_data, ETH_HEADER_SIZE, plain, plain_len, now) != 0)

@@ -237,7 +237,7 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     int transport_off = l3_off + ip_hdr_len;
     if (pkt_len < (size_t)transport_off)
         return -1;
-    if (get_transport_hdr_size(packet + transport_off, ip_proto, pkt_len - (size_t)transport_off) < 0)
+    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
         return (int)pkt_len;
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
@@ -465,7 +465,7 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
     int transport_off = l3_off + ip_hdr_len;
     if (pkt_len < (size_t)transport_off)
         return -1;
-    if (get_transport_hdr_size(packet + transport_off, ip_proto, pkt_len - (size_t)transport_off) < 0)
+    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
         return -1;
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();

@@ -14,6 +14,7 @@ static int eth_match_et(uint16_t et, uint16_t target, uint16_t fake)
     return et == target || (fake != 0 && et == fake);
 }
 
+
 int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len)
 {
     uint16_t fake;
