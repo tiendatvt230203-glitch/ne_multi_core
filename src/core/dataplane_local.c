@@ -40,12 +40,10 @@
         job->len = l1;
         job->dir = NE_DIR_WAN;
         job->wan_idx = (uint8_t)wan_dp;
-        if (ne_ring_try_push(tx, job) != 0) {
+        if (ne_ring_try_push2(tx, job, tail) != 0) {
             ne_frame_free(&fwd->pair, tail->addr);
             return -1;
         }
-        if (ne_ring_try_push(tx, tail) != 0)
-            ne_frame_free(&fwd->pair, tail->addr);
         return 0;
     }
 

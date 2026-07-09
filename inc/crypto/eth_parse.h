@@ -4,13 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ETH_L2_HDR_MAX  18
+#define ETH_L2_HDR_MAX  14
 
-/** Vị trí byte bắt đầu của IPv4 (0x45): Trả về vị trí (ví dụ: 14, 18), -1 = Lỗi */
+/** Vị trí byte bắt đầu của IPv4 (0x45): 14 = untagged Ethernet, -1 = Lỗi */
 int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len);
-/** Trả về độ dài tiền tố L2: 12 = Thường, 16 = VLAN, -1=Lỗi */
+/** Trả về vị trí EtherType: 12 = untagged Ethernet, -1 = Lỗi */
 int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len);
-/** Độ dài của tiền tố trước EthenetType nếu là gói bình thường sẽ là 14B gói Vlan là 16B */
+/** Độ dài tiền tố trước payload L3: 12 = untagged Ethernet EtherType offset */
 int crypto_eth_l2_prefix_len(const uint8_t *pkt, size_t pkt_len);
 /** Check xem gói tin có phải IPv4 không: 1 = Đúng (True), 0 = Sai (False) */
 int crypto_pkt_is_ipv4(const uint8_t *pkt, size_t pkt_len);

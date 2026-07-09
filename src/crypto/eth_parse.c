@@ -1,7 +1,6 @@
 #include "../../inc/crypto/eth_parse.h"
 #include "../../inc/crypto/packet_crypto.h"
 
-#define ETH_P_8021Q  0x8100u
 #define ETH_P_IP     0x0800u
 
 static uint16_t eth_read_et(const uint8_t *pkt, int off)
@@ -26,14 +25,6 @@ int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len)
 
     if (eth_match_et(eth_read_et(pkt, 12), ETH_P_IP, fake))
         return 12;
-
-    if (eth_read_et(pkt, 12) != ETH_P_8021Q)
-        return -1;
-    if (pkt_len < 18)
-        return -1;
-
-    if (eth_match_et(eth_read_et(pkt, 16), ETH_P_IP, fake))
-        return 16;
 
     return -1;
 }

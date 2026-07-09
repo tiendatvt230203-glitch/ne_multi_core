@@ -103,6 +103,8 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot);
 int ne_ring_init(struct ne_ring *r, uint32_t cap, int mpsc_pop);
 void ne_ring_destroy(struct ne_ring *r);
 int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt);
+int ne_ring_try_push2(struct ne_ring *r, const struct ne_packet *pkt1,
+                      const struct ne_packet *pkt2);
 int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt);
 uint32_t ne_ring_count(const struct ne_ring *r);
 
