@@ -145,6 +145,45 @@ static int frag_pick_slot(struct frag_table *ft, uint16_t pkt_id, uint64_t now)
     return base;
 }
 
+static int frag_pick_slot_l2(struct frag_table *ft, uint16_t pkt_id, uint32_t frag_sig, uint64_t now)
+{
+    const int probe = 8;
+    int base = (int)(pkt_id % FRAG_TABLE_SIZE);
+    int empty_idx = -1;
+    int oldest_idx = -1;
+    uint64_t oldest_age = 0;
+
+    for (int i = 0; i < probe; i++) {
+        int idx = (base + i) % FRAG_TABLE_SIZE;
+        struct frag_entry *e = &ft->entries[idx];
+        int occupied = (e->got_first || e->got_second);
+
+        if (occupied && (now - e->timestamp_ns) > FRAG_TIMEOUT_NS) {
+            memset(e, 0, sizeof(*e));
+            occupied = 0;
+        }
+        if (!occupied) {
+            if (empty_idx < 0)
+                empty_idx = idx;
+            continue;
+        }
+        if (e->pkt_id == pkt_id && e->has_sig && e->frag_sig == frag_sig)
+            return idx;
+
+        uint64_t age = now - e->timestamp_ns;
+        if (oldest_idx < 0 || age > oldest_age) {
+            oldest_idx = idx;
+            oldest_age = age;
+        }
+    }
+
+    if (empty_idx >= 0)
+        return empty_idx;
+    if (oldest_idx >= 0)
+        return oldest_idx;
+    return base;
+}
+
 static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len) {
     if (!entry->got_first || !entry->got_second)
         return 0;
@@ -416,7 +455,7 @@ int frag_is_fragment_l2(const struct app_config *cfg,
 
 int frag_try_reassemble_l2(struct frag_table *ft,
                            const uint8_t *pkt_data, uint32_t pkt_len,
-                           uint16_t pkt_id, uint8_t frag_index,
+                           uint16_t pkt_id, uint8_t frag_index, uint32_t frag_sig,
                            uint8_t *out_buf, uint32_t *out_len) {
     /* Wire prefix = MAC + optional VLAN tags + inner ethertype (fake). */
     int wire_eth = crypto_layer2_wire_prefix_len(pkt_data, pkt_len);
@@ -429,8 +468,10 @@ int frag_try_reassemble_l2(struct frag_table *ft,
     uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
 
     uint64_t now = get_time_ns();
-    int idx = frag_pick_slot(ft, pkt_id, now);
+    int idx = frag_pick_slot_l2(ft, pkt_id, frag_sig, now);
     struct frag_entry *entry = &ft->entries[idx];
+    entry->frag_sig = frag_sig;
+    entry->has_sig = 1;
 
     if (frag_index == 0) {
         if (inner_len < 20 || (inner[0] >> 4) != 4)

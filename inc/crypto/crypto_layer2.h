@@ -44,6 +44,6 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
 int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     uint8_t *packet, size_t pkt_len,
-    uint16_t *out_pkt_id, uint8_t *out_frag_index);
+    uint16_t *out_pkt_id, uint8_t *out_frag_index, uint32_t *out_frag_sig);
 
 #endif

@@ -350,6 +350,21 @@ static void l2_read_frag_tag(const uint8_t *buf, uint16_t *pkt_id, uint8_t *frag
     *frag_index = buf[2];
 }
 
+static uint32_t l2_frag_sig(const uint8_t *nonce, int nonce_len, uint8_t policy_id)
+{
+    uint32_t h = 2166136261u;
+
+    if (!nonce || nonce_len <= 0)
+        return (uint32_t)policy_id;
+    for (int i = 0; i < nonce_len; i++) {
+        h ^= nonce[i];
+        h *= 16777619u;
+    }
+    h ^= policy_id;
+    h *= 16777619u;
+    return h ? h : 1u;
+}
+
 int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     const uint8_t *eth_hdr,
     const uint8_t *enc_plain, uint32_t enc_plain_len,
@@ -453,13 +468,13 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
 int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     uint8_t *packet, size_t pkt_len,
-    uint16_t *out_pkt_id, uint8_t *out_frag_index)
+    uint16_t *out_pkt_id, uint8_t *out_frag_index, uint32_t *out_frag_sig)
 {
     int enc_off;
     int frag_magic_off;
     int l3_off;
 
-    if (!ctx || !ctx->initialized || !packet || !out_pkt_id || !out_frag_index)
+    if (!ctx || !ctx->initialized || !packet || !out_pkt_id || !out_frag_index || !out_frag_sig)
         return -1;
     if (!crypto_layer2_has_fake_ethertype(packet, pkt_len))
         return -1;
@@ -482,6 +497,12 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
         if (crypto_pqc_sess_load(ctx, &pqc) != 0)
             return -1;
         memcpy(nonce, packet + crypto_layer2_nonce_off(packet, pkt_len), (size_t)nonce_size);
+        {
+            uint8_t wire_policy = 0;
+            if (crypto_layer2_read_policy_id(packet, pkt_len, &wire_policy) != 0)
+                return -1;
+            *out_frag_sig = l2_frag_sig(nonce, nonce_size, wire_policy);
+        }
 
         if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
                                        (int)(pkt_len - (size_t)enc_off), &dec_len) != 0)
@@ -519,6 +540,12 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
         nonce_off = crypto_layer2_nonce_off(packet, pkt_len);
         if (nonce_off < 0)
             return -1;
+        {
+            uint8_t wire_policy = 0;
+            if (crypto_layer2_read_policy_id(packet, pkt_len, &wire_policy) != 0)
+                return -1;
+            *out_frag_sig = l2_frag_sig(packet + nonce_off, wire_ns, wire_policy);
+        }
 
         total_after = pkt_len - (size_t)enc_off;
         if (is_gcm) {

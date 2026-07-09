@@ -103,6 +103,7 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
+    uint32_t fsig = 0;
     uint8_t buf[4096];
     uint32_t blen = 0;
 
@@ -113,11 +114,11 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
         fwd_crypto_profile_id_for_wire_id(policy_id));
     if (slot < 0)
         return -1;
-    nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
+    nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx, &fsig);
     if (nd < 0)
         return -1;
     rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
-                                pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
+                                pkt, (uint32_t)nd, opid, ofidx, fsig, buf, &blen);
     if (rr == 0) {
         *pending = 1;
         return 0;

@@ -20,6 +20,8 @@
 
 struct frag_entry {
     uint16_t pkt_id;
+    uint32_t frag_sig;
+    uint8_t has_sig;
     uint8_t  first[1600];            /** Buffer chứa frist */
     uint8_t  second[1600];           /** Buffer chứa second */
     uint32_t first_len;              /** Kích thước của mảnh frist mảnh lớn*/
@@ -106,7 +108,7 @@ int frag_is_fragment_l2(const struct app_config *cfg,
 
 int frag_try_reassemble_l2(struct frag_table *ft,
                            const uint8_t *pkt_data, uint32_t pkt_len,
-                           uint16_t pkt_id, uint8_t frag_index,
+                           uint16_t pkt_id, uint8_t frag_index, uint32_t frag_sig,
                            uint8_t *out_buf, uint32_t *out_len);
 
 #endif
