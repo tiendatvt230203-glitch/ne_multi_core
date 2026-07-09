@@ -7,6 +7,7 @@
 #include "../../inc/crypto/traffic_crypto.h"
 #include "../../inc/crypto/scrypt.h"
 #include <string.h>
+#include <stdlib.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -348,6 +349,22 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t i
 int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len, uint8_t tag_out[AES_GCM_TAG_SIZE])
 {
+    if (g_aes_bits == 256) {
+        SCryptCipherCtx *sctx;
+        int new_len = 0;
+        int rc;
+
+        sctx = scrypt_CipherCtxNew();
+        if (!sctx)
+            return -1;
+        rc = trf_encrypt_payload_gcm(sctx, key, nonce, nonce_len, NULL, 0, data, len, &new_len);
+        scrypt_CipherCtxFree(sctx);
+        if (rc != TRF_PQC_OK || new_len < len + AES_GCM_TAG_SIZE)
+            return -1;
+        memcpy(tag_out, data + len, AES_GCM_TAG_SIZE);
+        return 0;
+    }
+
     EVP_CIPHER_CTX *evp;
     int out_len;
 
@@ -389,6 +406,38 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
 int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len, const uint8_t tag[AES_GCM_TAG_SIZE])
 {  
+    if (g_aes_bits == 256) {
+        SCryptCipherCtx *sctx;
+        uint8_t *buf;
+        int total_len;
+        int orig_len = 0;
+        int rc;
+
+        if (!data || len < 0 || !tag)
+            return -1;
+        total_len = len + AES_GCM_TAG_SIZE;
+        buf = malloc((size_t)total_len);
+        if (!buf)
+            return -1;
+        memcpy(buf, data, (size_t)len);
+        memcpy(buf + len, tag, AES_GCM_TAG_SIZE);
+
+        sctx = scrypt_CipherCtxNew();
+        if (!sctx) {
+            free(buf);
+            return -1;
+        }
+        rc = trf_decrypt_payload_gcm(sctx, key, nonce, nonce_len, NULL, 0, buf, total_len, &orig_len);
+        scrypt_CipherCtxFree(sctx);
+        if (rc != TRF_PQC_OK || orig_len < 0 || orig_len > len) {
+            free(buf);
+            return -1;
+        }
+        memcpy(data, buf, (size_t)orig_len);
+        free(buf);
+        return 0;
+    }
+
     EVP_CIPHER_CTX *evp;
     int out_len;
 
