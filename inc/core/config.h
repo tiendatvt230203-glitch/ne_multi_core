@@ -75,11 +75,17 @@ struct profile_config {
 
 struct local_config {
     char ifname[IF_NAMESIZE];
+    uint32_t ip;
+    uint32_t netmask;
+    uint32_t network;
+    uint8_t src_mac[MAC_LEN];
 };
 
 struct wan_config {
     char ifname[IF_NAMESIZE];
-    uint32_t dst_ip;
+    uint32_t dst_ip;      
+    uint8_t src_mac[MAC_LEN];
+    uint8_t dst_mac[MAC_LEN];
     uint32_t window_size;
     int dataplane;
 };
@@ -107,15 +113,49 @@ struct app_config {
     int policy_count;
 };
 
-int config_wan_profile_weight(const struct app_config *cfg, int wan_idx);
-int config_wan_live(const struct app_config *cfg, int wan_idx);
-int config_wan_live_in_cfg(const struct app_config *cfg, const char *ifname);
-int config_count_dataplane_wans(const struct app_config *cfg);
-int config_wan_cfg_to_dp(const struct app_config *cfg, int cfg_idx);
-int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx);
+static inline int config_count_dataplane_wans(const struct app_config *cfg)
+{
+    int n = 0;
+    if (!cfg)
+        return 0;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (cfg->wans[i].dataplane)
+            n++;
+    }
+    return n;
+}
 
+static inline int config_wan_cfg_to_dp(const struct app_config *cfg, int cfg_idx)
+{
+    if (!cfg || cfg_idx < 0 || cfg_idx >= cfg->wan_count || !cfg->wans[cfg_idx].dataplane)
+        return -1;
+    int dp = 0;
+    for (int i = 0; i < cfg_idx; i++) {
+        if (cfg->wans[i].dataplane)
+            dp++;
+    }
+    return dp;
+}
+
+static inline int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx)
+{
+    if (!cfg || dp_idx < 0)
+        return -1;
+    int seen = 0;
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (!cfg->wans[i].dataplane)
+            continue;
+        if (seen == dp_idx)
+            return i;
+        seen++;
+    }
+    return -1;
+}
+
+int parse_mac(const char *str, uint8_t *mac);
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network);
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
+int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip);
 int config_validate(struct app_config *cfg);
 int config_local_ifname_in_cfg(const struct app_config *cfg, const char *ifname);
 int config_local_owner_profile(const struct app_config *cfg, int local_idx, int skip_profile_id);
@@ -128,4 +168,5 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
                                                         uint8_t protocol);
+
 #endif

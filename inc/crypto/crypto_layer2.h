@@ -2,7 +2,6 @@
 #define CRYPTO_LAYER2_H
 
 #include "packet_crypto.h"
-#include "eth_parse.h"
 
 #define NE_L2_FAKE_ETHERTYPE     0x88B5u
 
@@ -21,18 +20,6 @@ uint8_t crypto_layer2_worker_idx(void);
 
 int crypto_layer2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8_t *worker_idx_out);
 
-int crypto_layer2_policy_off(const uint8_t *packet, size_t pkt_len);
-int crypto_layer2_core_id_off(const uint8_t *packet, size_t pkt_len);
-int crypto_layer2_nonce_off(const uint8_t *packet, size_t pkt_len);
-int crypto_layer2_enc_start_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
-int crypto_layer2_frag_magic_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
-int crypto_layer2_has_fake_ethertype(const uint8_t *packet, size_t pkt_len);
-int crypto_layer2_has_fragment_marker(const uint8_t *packet, size_t pkt_len);
-int crypto_layer2_read_policy_id(const uint8_t *packet, size_t pkt_len, uint8_t *policy_id_out);
-uint32_t crypto_layer2_frag_flow_sig(const uint8_t *packet, size_t pkt_len,
-                                     uint16_t pkt_id, uint8_t policy_id);
-int crypto_layer2_wire_prefix_len(const uint8_t *packet, size_t pkt_len);
-
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);
 
@@ -47,6 +34,6 @@ int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
 
 int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     uint8_t *packet, size_t pkt_len,
-    uint16_t *out_pkt_id, uint8_t *out_frag_index, uint32_t *out_frag_sig);
+    uint16_t *out_pkt_id, uint8_t *out_frag_index);
 
 #endif

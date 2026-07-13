@@ -18,7 +18,7 @@ fi
 
 echo "=== ne_init_db ==="
 echo "postgres://${POSTGRES_USER}@${POSTGRES_SERVER}:${POSTGRES_PORT}/${POSTGRES_DB}"
-echo "scope: apply schema.sql (11 BE tables) — run once before sql_options seeds"
+echo "scope: DROP/CREATE ne_* tables and enums only (no PostgreSQL users)"
 echo
 
 ne_psql -c "SELECT version();" >/dev/null
@@ -30,13 +30,9 @@ echo "[OK] schema.sql applied"
 n=$(ne_psql -t -A -c "
 SELECT COUNT(*) FROM information_schema.tables
 WHERE table_schema = 'public'
-  AND table_name IN (
-    'ne_profiles','ne_policies','ne_lan','ne_wan',
-    'bridges','bridge_interfaces','pqc_keys','pqc_exchange_tunnels',
-    'policy_pqc_ref','profile_tunnel_ref','profile_bridge_ref'
-  );")
-if [ "${n:-0}" != "11" ]; then
-  echo "[FATAL] expected 11 schema tables, found ${n:-?}" >&2
+  AND table_name IN ('ne_profiles','ne_policies','ne_lan','ne_wan');")
+if [ "${n:-0}" != "4" ]; then
+  echo "[FATAL] expected 4 ne_* tables, found ${n:-?}" >&2
   exit 1
 fi
-echo "[OK] ne_profiles, ne_policies, ne_lan, ne_wan, bridges, pqc_keys, ..."
+echo "[OK] ne_profiles, ne_policies, ne_lan, ne_wan"

@@ -41,11 +41,6 @@ static int get_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
             return -1;
         return 8;
     }
-    if (ip_proto == 1) {
-        if (remaining < 4)
-            return -1;
-        return 4;
-    }
     return -1;
 }
 
@@ -63,6 +58,27 @@ int crypto_layer4_frag_meta_len(void) {
     if (crypto_mode_uses_gcm_tag())
         meta += AES_GCM_TAG_SIZE;
     return meta;
+}
+
+int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len) {
+    if (!pkt || pkt_len < 14)
+        return -1;
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et == 0x0800)
+        return 14;
+    if (et == 0x8100) {
+        if (pkt_len < 18)
+            return -1;
+        et = ((uint16_t)pkt[16] << 8) | pkt[17];
+        if (et == 0x0800)
+            return 18;
+        if (et == 0x8100 && pkt_len >= 22) {
+            et = ((uint16_t)pkt[20] << 8) | pkt[21];
+            if (et == 0x0800)
+                return 22;
+        }
+    }
+    return -1;
 }
 
 static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr_len,
@@ -136,14 +152,14 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         return -1;
 
     uint8_t ip_proto = packet[l3_off + 9];
+    if (ip_proto != 6 && ip_proto != 17)
+        return (int)pkt_len;
 
     int ip_hdr_len = (packet[l3_off] & 0x0F) * 4;
     if (ip_hdr_len < 20)
         return -1;
 
     int transport_off = l3_off + ip_hdr_len;
-    if (pkt_len < (size_t)transport_off)
-        return -1;
     size_t remaining = pkt_len - (size_t)transport_off;
     int transport_hdr_size = get_transport_hdr_size(packet + transport_off, ip_proto, remaining);
     if (transport_hdr_size < 0)
@@ -229,16 +245,14 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         return -1;
 
     uint8_t ip_proto = packet[l3_off + 9];
+    if (ip_proto != 6 && ip_proto != 17)
+        return (int)pkt_len;
 
     int ip_hdr_len = (packet[l3_off] & 0x0F) * 4;
     if (ip_hdr_len < 20)
         return -1;
 
     int transport_off = l3_off + ip_hdr_len;
-    if (pkt_len < (size_t)transport_off)
-        return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
-        return (int)pkt_len;
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
     int tunnel_off = transport_off + L4_WIRE_PORT_LEN;
@@ -457,16 +471,14 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
         return -1;
 
     uint8_t ip_proto = packet[l3_off + 9];
+    if (ip_proto != 6 && ip_proto != 17)
+        return -1;
 
     int ip_hdr_len = (packet[l3_off] & 0x0F) * 4;
     if (ip_hdr_len < 20)
         return -1;
 
     int transport_off = l3_off + ip_hdr_len;
-    if (pkt_len < (size_t)transport_off)
-        return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
-        return -1;
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
     int tunnel_off = transport_off + L4_WIRE_PORT_LEN;

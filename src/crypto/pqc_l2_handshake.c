@@ -1,6 +1,6 @@
-#include "../../inc/crypto/pqc_l2_handshake.h"
+#include "../inc/pqc_l2_handshake.h"
 #include "pqc_handshake.h"
-#include "config.h"
+#include "../../inc/config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,10 +15,8 @@
 #include <poll.h>
 #include <pthread.h>
 
-
 static struct pqc_l2_reassemble *g_reassemble_list = NULL;
 static pthread_mutex_t g_reassemble_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 
 static uint64_t get_time_ms(void) {
     struct timespec ts;
@@ -81,7 +79,7 @@ int pqc_l2_init_peer(struct pqc_l2_peer *peer, const char *ifname) {
         return -1;
     }
 
-    printf("[PQC-L2] Bound to %s. Local MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+    fprintf(stderr, "[PQC-L2] Bound to %s. Local MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
            ifname,
            peer->local_mac[0], peer->local_mac[1], peer->local_mac[2],
            peer->local_mac[3], peer->local_mac[4], peer->local_mac[5]);
@@ -119,7 +117,7 @@ int pqc_l2_discover_peer_mac(struct pqc_l2_peer *peer, int timeout_sec) {
     sll.sll_halen = 6;
     memset(sll.sll_addr, 0xFF, 6);
 
-    printf("[PQC-L2] Sending broadcast discovery probe on %s...\n", peer->ifname);
+    fprintf(stderr, "[PQC-L2] Sending broadcast discovery probe on %s...\n", peer->ifname);
     if (sendto(peer->raw_sock_fd, pkt, 14 + sizeof(struct pqc_l2_hdr), 0, 
                (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         perror("[PQC-L2] Broadcast probe send failed");
@@ -153,7 +151,7 @@ int pqc_l2_discover_peer_mac(struct pqc_l2_peer *peer, int timeout_sec) {
             // Extracted learned MAC from incoming Ethernet header source
             memcpy(peer->peer_mac, rx_buf + 6, 6);
             peer->discovered = 1;
-            printf("[PQC-L2] DISCOVERED PEER MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+            fprintf(stderr, "[PQC-L2] DISCOVERED PEER MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                    peer->peer_mac[0], peer->peer_mac[1], peer->peer_mac[2],
                    peer->peer_mac[3], peer->peer_mac[4], peer->peer_mac[5]);
             return 0;
@@ -232,7 +230,7 @@ int pqc_l2_send_payload_fragmented(struct pqc_l2_peer *peer, uint32_t msg_id,
         usleep(50); // Minor pacing delay to protect against RX queue drop in standard kernels
     }
 
-    printf("[PQC-L2] Transmitted msg_id %u: %u bytes split in %u fragments.\n", msg_id, payload_len, frag_count);
+    fprintf(stderr, "[PQC-L2] Transmitted msg_id %u: %u bytes split in %u fragments.\n", msg_id, payload_len, frag_count);
     return 0;
 }
 
@@ -256,7 +254,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
 
     while (curr) {
         if (now - curr->start_time_ms > PQC_L2_TIMEOUT_MS) {
-            printf("[PQC-L2-TIMEOUT] Handshake assembly MsgID %u timed out. Dropping.\n", curr->msg_id);
+            fprintf(stderr, "[PQC-L2-TIMEOUT] Handshake assembly MsgID %u timed out. Dropping.\n", curr->msg_id);
             struct pqc_l2_reassemble *temp = curr->next;
             if (prev) prev->next = temp;
             else g_reassemble_list = temp;
@@ -285,7 +283,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             // Learn MAC instantly from incoming frame source
             memcpy(peer->peer_mac, rx_buf + 6, 6);
             peer->discovered = 1;
-            printf("[PQC-L2] Discovery probe received from %02X:%02X:%02X:%02X:%02X:%02X. Learning peer MAC.\n",
+            fprintf(stderr, "[PQC-L2] Discovery probe received from %02X:%02X:%02X:%02X:%02X:%02X. Learning peer MAC.\n",
                    peer->peer_mac[0], peer->peer_mac[1], peer->peer_mac[2],
                    peer->peer_mac[3], peer->peer_mac[4], peer->peer_mac[5]);
 
@@ -313,7 +311,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             sll.sll_halen = 6;
             memcpy(sll.sll_addr, peer->peer_mac, 6);
 
-            printf("[PQC-L2] Replying with unicast discovery ACK to learned MAC...\n");
+            fprintf(stderr, "[PQC-L2] Replying with unicast discovery ACK to learned MAC...\n");
             sendto(peer->raw_sock_fd, reply_pkt, 14 + sizeof(struct pqc_l2_hdr), 0,
                    (struct sockaddr *)&sll, sizeof(sll));
         }
@@ -387,7 +385,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
 
         // Check if all fragments are received
         if (r->frag_received == r->frag_count) {
-            printf("[PQC-L2] Reassembled complete payload for msg_id %u: total_len=%u\n", msg_id, r->total_len);
+            fprintf(stderr, "[PQC-L2] Reassembled complete payload for msg_id %u: total_len=%u\n", msg_id, r->total_len);
             
             // Remove node from reassembly list
             curr = g_reassemble_list;
@@ -432,29 +430,37 @@ void pqc_l2_cleanup_peer(struct pqc_l2_peer *peer) {
 
 int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
     if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
-        fprintf(stderr, "[PQC-DEBUG] pqc_select_handshake_wan: invalid cfg or profile_idx=%d (profile_count=%d)\n", profile_idx, cfg ? cfg->profile_count : -1);
         return -1;
     }
     const struct profile_config *p = &cfg->profiles[profile_idx];
-    fprintf(stderr, "[PQC-DEBUG] profile_idx=%d (id=%d, name=%s), wan_count=%d\n", profile_idx, p->id, p->name, p->wan_count);
     if (p->wan_count <= 0) {
         return -1;
     }
+
+    fprintf(stderr,"p->wan_count=%d\n", p->wan_count);
     int chosen_w_idx = p->wan_indices[0];
     for (int w = 0; w < p->wan_count; w++) {
         int w_idx = p->wan_indices[w];
+        // if (w_idx >= 0 && w_idx < cfg->wan_count) {
+        //     if (cfg->wans[w_idx].dst_ip != 0) {
+        //         chosen_w_idx = w_idx;
+        //         break;
+        //     }
+        // }
         if (w_idx >= 0 && w_idx < cfg->wan_count) {
-            char ip_str[32] = "0.0.0.0";
-            struct in_addr addr = { .s_addr = cfg->wans[w_idx].dst_ip };
-            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-            fprintf(stderr, "[PQC-DEBUG]   checking wan %d: index=%d, name=%s, dst_ip=%s (0x%08X)\n",
-                    w, w_idx, cfg->wans[w_idx].ifname, ip_str, cfg->wans[w_idx].dst_ip);
-            if (cfg->wans[w_idx].dst_ip != 0) {
+            unsigned int ip = cfg->wans[w_idx].dst_ip;
+            fprintf(stderr, "[PQC]   -> WAN %d valid. Current dst_ip=0x%08X\n", w_idx, ip);
+
+            if (ip != 0) {
                 chosen_w_idx = w_idx;
+                // Log vị trí nhảy vào phần gán WAN chứa IP thành công
+                fprintf(stderr, "[PQC]   ==> SUCCESS: Found active IP! Selected wan_index=%d\n", chosen_w_idx);
                 break;
+            } else {
+                fprintf(stderr, "[PQC]   -> WAN %d skipped (dst_ip is 0)\n", w_idx);
             }
         } else {
-            fprintf(stderr, "[PQC-DEBUG]   invalid wan index %d in profile (cfg->wan_count=%d)\n", w_idx, cfg->wan_count);
+            fprintf(stderr, "[PQC]   -> WARNING: wan_index %d out of bounds (max %d)\n", w_idx, cfg->wan_count);
         }
     }
     return chosen_w_idx;
@@ -462,19 +468,18 @@ int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
 
 void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_idx, char *out_peer_ip, const char **out_wan_ifname) {
     if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
-        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: invalid cfg or profile_idx=%d\n", profile_idx);
         return;
     }
     int chosen_idx = pqc_select_handshake_wan(cfg, profile_idx);
-    fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: chosen_idx=%d\n", chosen_idx);
     if (chosen_idx >= 0 && chosen_idx < cfg->wan_count) {
         struct in_addr addr;
         addr.s_addr = cfg->wans[chosen_idx].dst_ip;
         inet_ntop(AF_INET, &addr, out_peer_ip, 64);
         *out_wan_ifname = cfg->wans[chosen_idx].ifname;
-        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: resolved to wan_ifname=%s, peer_ip=%s\n", *out_wan_ifname, out_peer_ip);
-    } else {
-        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: failed to choose wan\n");
+
+        fprintf(stderr, "[PQC-Params] ==> Result for Profile %d:\n", profile_idx);
+        fprintf(stderr, "[PQC-Params]     out_wan_ifname = %s\n", *out_wan_ifname ? *out_wan_ifname : "NULL");
+        fprintf(stderr, "[PQC-Params]     out_peer_ip    = %s\n", out_peer_ip ? out_peer_ip : "NULL");
     }
 }
 
@@ -482,8 +487,6 @@ void pqc_handshake_start_all_profiles(struct app_config *cfg) {
     if (!cfg) return;
     for (int p_idx = 0; p_idx < cfg->profile_count; p_idx++) {
         const struct profile_config *p = &cfg->profiles[p_idx];
-
-        // Check if there is at least one policy in this profile configured with PQC
         bool has_pqc_policy = false;
         for (int i = 0; i < p->policy_count; i++) {
             int pol_idx = p->policy_indices[i];
@@ -496,8 +499,15 @@ void pqc_handshake_start_all_profiles(struct app_config *cfg) {
         }
 
         if (has_pqc_policy) {
-            fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d using tunnel configuration\n", p->id);
-            sig_pqc_handshake_start(p->id, "", "");
+            char peer_ip_str[64] = "0.0.0.0";
+            const char *wan_ifname = "";
+            pqc_get_profile_handshake_params(cfg, p_idx, peer_ip_str, &wan_ifname);
+            if (wan_ifname && wan_ifname[0] != '\0') {
+                fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
+                    p->id, wan_ifname, peer_ip_str);
+                sig_pqc_handshake_start(p->id, wan_ifname, peer_ip_str);
+            }
         }
     }
 }
+

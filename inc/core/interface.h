@@ -8,12 +8,10 @@
 
 #define NE_RING        16384u
 #define NE_FRAME       2048u
-#define NE_N_FRAMES    1048576u
+#define NE_N_FRAMES    131072u
 #define NE_BATCH_SIZE   64u
 
 #define NE_QUEUE_OVERRIDE 0
-
-#define NE_FQ_PREFILL   16384u
 
 #include "cpu_map.h"
 
@@ -103,8 +101,6 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot);
 int ne_ring_init(struct ne_ring *r, uint32_t cap, int mpsc_pop);
 void ne_ring_destroy(struct ne_ring *r);
 int ne_ring_try_push(struct ne_ring *r, const struct ne_packet *pkt);
-int ne_ring_try_push2(struct ne_ring *r, const struct ne_packet *pkt1,
-                      const struct ne_packet *pkt2);
 int ne_ring_try_pop(struct ne_ring *r, struct ne_packet *pkt);
 uint32_t ne_ring_count(const struct ne_ring *r);
 
@@ -138,16 +134,13 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
 
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
-uint32_t ne_frame_alloc_batch(struct ne_pair *p, uint64_t *addrs_out, uint32_t max_n);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 
 void interface_reset_redirect_maps(void);
+void interface_ip_xdp_off(const char *ifname);
+void interface_ip_xdp_off_config(const struct app_config *cfg);
 void interface_promisc_off_config(const struct app_config *cfg);
 int interface_set_queue_count(const char *ifname, int desired_count);
 int interface_get_queue_count(const char *ifname);
-
-int ne_rx_lan_slots_for(int local_queue_total);
-int ne_rx_wan_slots_for(int wan_queue_total);
-void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total);
 
 #endif

@@ -5,6 +5,7 @@
 #include "../../inc/core/config.h"
 
 #define DIAG_TBL_N     12
+/* "!" + "255.255.255.255/32" + NUL */
 #define DIAG_CIDR_LEN  24
 
 static void tbl_hline(const int *w, int n) {
@@ -110,25 +111,44 @@ static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_
              (unsigned)cp->aes_bits);
 }
 
+static void fmt_subnet(char *out, size_t outsz, const struct local_config *loc) {
+    struct in_addr net;
+    int prefix = 0;
+    uint32_t mask = ntohl(loc->netmask);
+
+    if (!out || outsz == 0 || loc->netmask == 0) {
+        if (out && outsz > 0)
+            out[0] = '\0';
+        return;
+    }
+    while (prefix < 32 && (mask & (1u << (31 - prefix))))
+        prefix++;
+    net.s_addr = loc->network;
+    snprintf(out, outsz, "%s/%d", inet_ntoa(net), prefix);
+}
+
 static void print_iface_table(const struct app_config *cfg) {
-    static const int w[DIAG_TBL_N] = { 14, 12, 0, 0, 0, 0, 0, 0 };
+    static const int w[DIAG_TBL_N] = { 14, 12, 20, 20, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "", "", "", "", "", ""
+        "role", "interface", "subnet", "note", "", "", "", ""
     };
 
     fprintf(stderr, "\n  [interfaces]\n");
-    tbl_hline(w, 2);
-    tbl_row(w, 2, hdr);
-    tbl_hline(w, 2);
+    tbl_hline(w, 4);
+    tbl_row(w, 4, hdr);
+    tbl_hline(w, 4);
 
     for (int i = 0; i < cfg->local_count; i++) {
-        char c0[32], c1[32];
+        char subnet[32], c0[32], c1[32], c2[32], c3[32];
+        fmt_subnet(subnet, sizeof(subnet), &cfg->locals[i]);
         snprintf(c0, sizeof(c0), "lan");
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        const char *row[DIAG_TBL_N] = { c0, c1, "", "", "", "", "", "" };
-        tbl_row(w, 2, row);
+        snprintf(c2, sizeof(c2), "%s", subnet);
+        snprintf(c3, sizeof(c3), "remote subnet");
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, c3, "", "", "", "" };
+        tbl_row(w, 4, row);
     }
-    tbl_hline(w, 2);
+    tbl_hline(w, 4);
 }
 
 static void print_policy_table(const struct app_config *cfg) {

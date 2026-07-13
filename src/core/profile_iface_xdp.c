@@ -4,92 +4,16 @@
 #include "../../inc/core/forwarder_reload.h"
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/interface.h"
+#include "../../inc/core/local_hwaddr.h"
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-#include <ctype.h>
 #include <errno.h>
-#include <limits.h>
 #include <net/if.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-static int profile_iface_ifname_safe(const char *ifname)
-{
-    if (!ifname || !ifname[0])
-        return 0;
-    for (const char *p = ifname; *p; p++) {
-        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-' && *p != '.')
-            return 0;
-    }
-    return 1;
-}
-
-static void profile_iface_xdp_link_off(const char *ifname)
-{
-    char cmd[128];
-
-    if (!profile_iface_ifname_safe(ifname))
-        return;
-    snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
-    if (system(cmd) != 0)
-        fprintf(stderr, "[PROFILE-XDP] warning: failed to run: %s\n", cmd);
-}
-
-void profile_iface_xdp_detach_ifname(const char *ifname)
-{
-    if (!ifname || !ifname[0])
-        return;
-    profile_iface_xdp_link_off(ifname);
-}
-
-void profile_iface_xdp_detach_config(const struct app_config *cfg)
-{
-    if (!cfg)
-        return;
-    for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++)
-        profile_iface_xdp_detach_ifname(cfg->locals[i].ifname);
-    for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++)
-        profile_iface_xdp_detach_ifname(cfg->wans[i].ifname);
-}
-
-void profile_iface_xdp_detach_local(struct ne_pair *p, int pair_li)
-{
-    if (!p || pair_li < 0 || pair_li >= MAX_INTERFACES)
-        return;
-    if (!p->xdp_local_on[pair_li] && !p->bpf_locals[pair_li])
-        return;
-
-    fprintf(stderr, "[PROFILE-XDP] DETACH LAN %s (slot %d)\n",
-            p->locals[pair_li].ifname, pair_li);
-    fflush(stderr);
-    profile_iface_xdp_link_off(p->locals[pair_li].ifname);
-    if (p->bpf_locals[pair_li]) {
-        bpf_object__close(p->bpf_locals[pair_li]);
-        p->bpf_locals[pair_li] = NULL;
-    }
-    p->xdp_local_on[pair_li] = 0;
-}
-
-void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot)
-{
-    if (!p || dp_slot < 0 || dp_slot >= MAX_INTERFACES)
-        return;
-    if (!p->xdp_wan_on[dp_slot] && !p->bpf_wans[dp_slot])
-        return;
-
-    fprintf(stderr, "[PROFILE-XDP] DETACH WAN %s (dp slot %d)\n",
-            p->wans[dp_slot].ifname, dp_slot);
-    fflush(stderr);
-    profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
-    if (p->bpf_wans[dp_slot]) {
-        bpf_object__close(p->bpf_wans[dp_slot]);
-        p->bpf_wans[dp_slot] = NULL;
-    }
-    p->xdp_wan_on[dp_slot] = 0;
-}
+/* --- config ifname helpers --- */
 
 void profile_iface_xdp_prepare_init(const struct app_config *cfg)
 {
@@ -97,9 +21,11 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
         return;
     fprintf(stderr, "[PROFILE-XDP] prepare: detach xdp on configured LAN/WAN\n");
     fflush(stderr);
-    profile_iface_xdp_detach_config(cfg);
+    interface_ip_xdp_off_config(cfg);
     interface_reset_redirect_maps();
 }
+
+/* --- ifname / profile helpers --- */
 
 static int cfg_has_wan_ifname(const struct app_config *cfg, const char *ifname)
 {
@@ -340,8 +266,7 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
 
 static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
                            const char *ifname, const char *role)
-{   
-
+{
     int rc = bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
 
     if (rc) {
@@ -355,55 +280,25 @@ static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
     return 0;
 }
 
-static const char *resolve_bpf_object_path(const char *path, char resolved[PATH_MAX])
-{
-    char exe_path[PATH_MAX];
-    ssize_t n;
-    char *slash;
-
-    if (!path || path[0] == '/' || access(path, R_OK) == 0)
-        return path;
-
-    n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (n <= 0)
-        return path;
-    exe_path[n] = '\0';
-
-    slash = strrchr(exe_path, '/');
-    if (!slash)
-        return path;
-    *slash = '\0';
-
-    if (snprintf(resolved, PATH_MAX, "%s/%s", exe_path, path) >= PATH_MAX)
-        return path;
-    return resolved;
-}
-
 static int open_bpf_object(const char *path, struct bpf_object **obj_out,
                            const char *prog_name, struct bpf_program **prog_out,
                            const char *map_name, struct bpf_map **map_out)
 {
-    char resolved_path[PATH_MAX];
-    const char *open_path;
-    struct bpf_object *obj;
-
-    open_path = resolve_bpf_object_path(path, resolved_path);
-
-    obj = bpf_object__open_file(open_path, NULL);
+    struct bpf_object *obj = bpf_object__open_file(path, NULL);
 
     if (libbpf_get_error(obj)) {
-        fprintf(stderr, "[PROFILE-XDP] bpf open failed: %s\n", open_path);
+        fprintf(stderr, "[PROFILE-XDP] bpf open failed: %s\n", path);
         return -1;
     }
     if (bpf_object__load(obj) != 0) {
-        fprintf(stderr, "[PROFILE-XDP] bpf load failed: %s\n", open_path);
+        fprintf(stderr, "[PROFILE-XDP] bpf load failed: %s\n", path);
         bpf_object__close(obj);
         return -1;
     }
     struct bpf_program *prog = bpf_object__find_program_by_name(obj, prog_name);
     struct bpf_map *map = bpf_object__find_map_by_name(obj, map_name);
     if (!prog || !map) {
-        fprintf(stderr, "[PROFILE-XDP] bpf object %s missing prog/map\n", open_path);
+        fprintf(stderr, "[PROFILE-XDP] bpf object %s missing prog/map\n", path);
         bpf_object__close(obj);
         return -1;
     }
@@ -467,7 +362,7 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
     if (open_bpf_object(cfg->bpf_file, &p->bpf_locals[pair_li],
                         "xdp_redirect_prog", &prog, "xsks_map", &map) != 0)
         return -1;
-    profile_iface_xdp_link_off(ifname);
+    interface_ip_xdp_off(ifname);
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, ifname, "LAN") != 0) {
         bpf_object__close(p->bpf_locals[pair_li]);
@@ -492,7 +387,7 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
                         "xdp_wan_redirect_prog", &prog, "wan_xsks_map", &map) != 0)
         return -1;
     update_wan_fake_ethertype(p->bpf_wans[dp_slot], fake_ethertype_ipv4);
-    profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
+    interface_ip_xdp_off(p->wans[dp_slot].ifname);
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
                         p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0) {
         bpf_object__close(p->bpf_wans[dp_slot]);
@@ -536,10 +431,14 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
 static void init_fwd_local_meta(struct forwarder *fwd, int li,
                                 const struct app_config *cfg, int cfg_local_idx)
 {
+    static const uint8_t zero_mac[MAC_LEN];
+
     memset(&fwd->locals[li], 0, sizeof(fwd->locals[li]));
     fwd->locals[li].ifindex = (int)if_nametoindex(cfg->locals[cfg_local_idx].ifname);
     strncpy(fwd->locals[li].ifname, cfg->locals[cfg_local_idx].ifname,
             sizeof(fwd->locals[li].ifname) - 1);
+    memcpy(fwd->locals[li].src_mac, cfg->locals[cfg_local_idx].src_mac, MAC_LEN);
+    memcpy(fwd->locals[li].dst_mac, zero_mac, MAC_LEN);
 }
 
 static void init_fwd_wan_meta(struct forwarder *fwd, int di,
@@ -548,6 +447,8 @@ static void init_fwd_wan_meta(struct forwarder *fwd, int di,
     memset(&fwd->wans[di], 0, sizeof(fwd->wans[di]));
     fwd->wans[di].ifindex = (int)if_nametoindex(cfg->wans[cfg_wan_idx].ifname);
     strncpy(fwd->wans[di].ifname, cfg->wans[cfg_wan_idx].ifname, sizeof(fwd->wans[di].ifname) - 1);
+    memcpy(fwd->wans[di].src_mac, cfg->wans[cfg_wan_idx].src_mac, MAC_LEN);
+    memcpy(fwd->wans[di].dst_mac, cfg->wans[cfg_wan_idx].dst_mac, MAC_LEN);
 }
 
 struct profile_attach_sess {
@@ -613,8 +514,7 @@ static int detach_profile_wan_rows(struct forwarder *fwd, const struct app_confi
         if (!old_cfg->wans[oci].dataplane)
             continue;
         ifname = old_cfg->wans[oci].ifname;
-        if (new_prof && profile_config_has_wan_ci(new_prof, oci) &&
-            config_wan_live(new_cfg, oci))
+        if (new_prof && profile_config_has_wan_ci(new_prof, oci))
             continue;
         if (fwd_wan_ifname_dataplane_in_cfg(new_cfg, ifname))
             continue;
@@ -737,7 +637,7 @@ static void attach_profile_wan_rows(struct forwarder *fwd, const struct app_conf
             break;
         if (ci < 0 || ci >= new_cfg->wan_count)
             continue;
-        if (!config_wan_live(new_cfg, ci))
+        if (!new_cfg->wans[ci].dataplane)
             continue;
         ifname = new_cfg->wans[ci].ifname;
         if (if_nametoindex(ifname) == 0) {
@@ -813,6 +713,23 @@ static int attach_profile_iface_rows(struct forwarder *fwd, const struct app_con
 static int crypto_finish_reload(struct forwarder *fwd, struct app_config *cfg,
                                 const struct app_config *old)
 {
+    if (local_hwaddr_prepare(cfg) != 0) {
+        fprintf(stderr, "[PROFILE-XDP] crypto reload failed: local_hwaddr_prepare\n");
+        return -1;
+    }
+    for (int li = 0; li < MAX_INTERFACES; li++) {
+        const char *ifn;
+
+        if (!fwd || !ne_pair_local_live(&fwd->pair, li))
+            continue;
+        ifn = fwd->pair.locals[li].ifname;
+        for (int ci = 0; ci < cfg->local_count; ci++) {
+            if (strcmp(cfg->locals[ci].ifname, ifn) != 0)
+                continue;
+            memcpy(fwd->locals[li].src_mac, cfg->locals[ci].src_mac, MAC_LEN);
+            break;
+        }
+    }
     fwd_wan_weight_blend_begin(old, cfg, fwd_crypto_profile_slot_for_id);
     if (fwd_crypto_ensure_profile_slots(cfg) != 0) {
         fprintf(stderr, "[PROFILE-XDP] crypto reload failed: ensure_profile_slots\n");
@@ -847,47 +764,6 @@ static void fwd_reconcile_iface_counts(struct forwarder *fwd)
     fwd->pair.local_count = max_li;
     fwd->wan_count = max_di;
     fwd->pair.wan_count = max_di;
-}
-
-int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_config *new_cfg,
-                                    const struct app_config *old_cfg)
-{
-    if (!fwd || !new_cfg || !old_cfg || forwarder_should_stop())
-        return -1;
-
-    for (int pi = 0; pi < new_cfg->profile_count; pi++) {
-        const struct profile_config *prof = &new_cfg->profiles[pi];
-        struct profile_attach_sess sess;
-        int need_attach = 0;
-
-        for (int wi = 0; wi < prof->wan_count; wi++) {
-            int ci = prof->wan_indices[wi];
-
-            if (ci < 0 || ci >= new_cfg->wan_count)
-                continue;
-            if (!config_wan_live(new_cfg, ci))
-                continue;
-            if (pair_wan_dp_slot_live(fwd, new_cfg->wans[ci].ifname) >= 0)
-                continue;
-            need_attach = 1;
-            break;
-        }
-        if (!need_attach)
-            continue;
-
-        memset(&sess, 0, sizeof(sess));
-        attach_profile_wan_rows(fwd, new_cfg, prof->id, &sess);
-        if (sess.validate_failed) {
-            profile_attach_sess_rollback(fwd, &sess);
-            fprintf(stderr,
-                    "[PROFILE-XDP] profile %d: WAN live attach failed (weight>0)\n",
-                    prof->id);
-            return -1;
-        }
-        if (sess.wan_n > 0)
-            fwd_reconcile_iface_counts(fwd);
-    }
-    return 0;
 }
 
 int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,

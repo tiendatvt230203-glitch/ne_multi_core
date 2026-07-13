@@ -1,5 +1,5 @@
-#include "../../inc/crypto/traffic_crypto.h"
-#include "../../inc/crypto/scrypt.h"
+#include "../inc/traffic_crypto.h"
+#include "../inc/scrypt.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -17,30 +17,28 @@ static int g_pqc_initialized = 0;
 
 static __thread uint8_t tls_pqc_salt[8];
 static __thread uint32_t tls_pqc_counter = 0;
-static __thread int tls_salt_initialized = 0;
+static __thread int tls_salt_initalized = 0;
 
 static void* get_aligned_library_obj(void* (*new_func)(), void (*free_func)(void*));
 
 int trf_pqc_generate_nonce(byte* out_nonce) {
     if (!out_nonce) return TRF_PQC_ERR_INIT;
     
-    // Generate random 8-byte salt ONCE per thread/session
-    if (__builtin_expect(!tls_salt_initialized, 0)) {
+    if (__builtin_expect(!tls_salt_initalized, 0)) {
         int ret = scrypt_RandomBytes(tls_pqc_salt, 8);
-        if (__builtin_expect(ret != 0, 0)) {
+        if (ret != 0) {
+            fprintf(stderr, "[PQC-GENNONCE] Failed when generate nonce for packet!\n");
             return TRF_PQC_ERR_CRYPTO;
         }
-        tls_salt_initialized = 1;
+        tls_salt_initalized = 1;
     }
-    
-    // Increment local packet counter
+
     uint32_t cnt = ++tls_pqc_counter;
-    
-    // Nonce (12 bytes) = 8-byte Salt + 4-byte Counter
+
     memcpy(out_nonce, tls_pqc_salt, 8);
     memcpy(out_nonce + 8, &cnt, 4);
-    
-    return 0; // Success
+
+    return 0;
 }
 
 const char* trf_pqc_error_string(int err) {
@@ -164,10 +162,7 @@ int trf_save_key_to_file(const char *filename, const char *data, int mode) {
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0) return -1;
     ssize_t written = write(fd, data, strlen(data));
-    ssize_t bytes_write = write(fd, "\n", 1);
-    if (bytes_write < 0) {
-        perror("Canot write to file: ");
-    }
+    write(fd, "\n", 1);
     close(fd);
     return (written > 0) ? 0 : -1;
 }
@@ -534,15 +529,15 @@ int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz,
     
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    // fprintf(stderr, "[DEBUG-VERIFY] Entering trf_dsa_verify_payload...\n");
-    // fprintf(stderr, "[DEBUG-VERIFY] pub_sz = %d, len = %d, sig_sz = %d\n", pub_sz, len, sig_sz);
+    fprintf(stderr, "[DEBUG-VERIFY] Entering trf_dsa_verify_payload...\n");
+    fprintf(stderr, "[DEBUG-VERIFY] pub_sz = %d, len = %d, sig_sz = %d\n", pub_sz, len, sig_sz);
 
     // Calculate fingerprint of incoming public key to verify
     uint8_t hash[64];
     trf_calculate_digest(DIGEST_TYPE_SHA256, pub_key_in, pub_sz, hash);
     char fingerprint[16];
     for(int i=0; i<4; i++) sprintf(fingerprint + i*2, "%02x", hash[i]);
-    // fprintf(stderr, "[DEBUG-VERIFY] Key fingerprint to verify: %s\n", fingerprint);
+    fprintf(stderr, "[DEBUG-VERIFY] Key fingerprint to verify: %s\n", fingerprint);
 
     int import_ret = scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5);
     if (import_ret != 0) {
@@ -552,11 +547,11 @@ int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz,
     }
 
     int ret = scrypt_MlDsaVerify(key_obj, data, len, sig_in, sig_sz);
-    // if (ret != 0) {
-    //     fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify failed: %d\n", ret);
-    // } else {
-    //     fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify SUCCESS\n");
-    // }
+    if (ret != 0) {
+        fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify failed: %d\n", ret);
+    } else {
+        fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify SUCCESS\n");
+    }
     scrypt_MlDsaKeyFree(key_obj);
     return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;
 }

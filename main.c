@@ -64,13 +64,9 @@ struct runtime_state {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s               # daemon mode (LISTEN %s)\n"
-            "  %s -gi            # generate new identity key and load into RAM\n"
-            "  %s -check-identity # check PQC DB identity integrity and link to RAM cache\n"
-            "  %s -id <ID>       # notify daemon to apply config already stored in DB\n"
-            "  %s -check [ID]    # check database config consistency\n"
-            "  %s -r <policy_id> # trigger manual handshake retry for policy\n",
-            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog);
+            "  %s                    daemon, wait NOTIFY xdp_start\n"
+            "  %s -id <profile_id>   notify daemon (load / unload / reload)\n",
+            prog, prog);
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {
@@ -194,12 +190,10 @@ static void *forwarder_thread_main(void *arg) {
     struct runtime_state *rt = (struct runtime_state *)arg;
     if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot]) != 0) {
         forwarder_cleanup(&rt->fwd);
-        if (forwarder_should_stop()) {
+        if (forwarder_should_stop())
             fprintf(stderr, "[STOP] forwarder init aborted\n");
-        } 
-        else {
+        else
             fprintf(stderr, "[FATAL] forwarder_init failed\n");
-        }
         rt->running = 0;
         return NULL;
     }
@@ -311,7 +305,7 @@ static const struct local_config *local_by_ifname(const struct app_config *cfg,
 
 static int local_db_equal(const struct local_config *a, const struct local_config *b)
 {
-    return strcmp(a->ifname, b->ifname) == 0;
+    return strcmp(a->ifname, b->ifname);
 }
 
 static const struct wan_config *wan_by_ifname(const struct app_config *cfg,
@@ -735,9 +729,9 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
         return 0;
 
     const struct app_config *cfg = runtime_active_cfg(rt);
-    fprintf(stderr, "[STOP] profile-xdp detach (all LAN/WAN)...\n");
+    fprintf(stderr, "[STOP] ip link xdp off (all LAN/WAN)...\n");
     fflush(stderr);
-    profile_iface_xdp_detach_config(cfg);
+    interface_ip_xdp_off_config(cfg);
 
     fprintf(stderr, "[STOP] stopping dataplane...\n");
     fflush(stderr);
@@ -745,7 +739,7 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
     forwarder_shutdown_resources();
     pthread_join(rt->thread, NULL);
     forwarder_cleanup(&rt->fwd);
-    profile_iface_xdp_detach_config(cfg);
+    interface_ip_xdp_off_config(cfg);
     interface_promisc_off_config(cfg);
     fprintf(stderr, "[STOP] done\n");
     fflush(stderr);
@@ -806,23 +800,8 @@ static int handle_profile_notify(struct runtime_state *rt,
     }
     return 0;
 }
-static void handle_shutdown_signal(int sig) {
-    (void)sig;
-    sig_pqc_cleanup_ipc();
-    exit(0);
-}
 
 int main(int argc, char **argv) {
-    int ipc_rc = sig_pqc_handle_ipc_cli(argc, argv);
-    if (ipc_rc >= 0) {
-        return ipc_rc;
-    }
-
-    if (argc > 1 && strcmp(argv[1], "-gi") == 0) {
-        sig_pqc_handle_gen_identity();
-        return 0;
-    }
-
     setbuf(stderr, NULL);
     if (trf_pqc_init_global() != TRF_PQC_OK) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
@@ -884,10 +863,7 @@ int main(int argc, char **argv) {
                 "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD in " NE_ENV_FILE "\n");
         return 1;
     }
-    signal(SIGTERM, handle_shutdown_signal);
-    signal(SIGINT, handle_shutdown_signal);
 
-    sig_pqc_start_ipc_server();
     libbpf_set_print(libbpf_print_silent);
 
     struct sigaction sa = { .sa_handler = on_stop_signal };
@@ -909,6 +885,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "[DAEMON] listening %s — use %s -id <id>\n", NOTIFY_CHANNEL, argv[0]);
 
+    /* forwarder is ~585 KiB; keep runtime off the main-thread stack (avoids segfault on small stacks). */
     struct runtime_state *rt = calloc(1, sizeof(*rt));
     if (!rt) {
         fprintf(stderr, "[FATAL] out of memory for runtime state\n");

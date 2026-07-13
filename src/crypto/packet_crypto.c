@@ -4,9 +4,9 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/types.h"
+#include "../../inc/crypto/traffic_crypto.h"
+#include "../../inc/scrypt.h"
 #include <string.h>
-#include <stdlib.h>
-#include <time.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -40,20 +40,6 @@ static __thread int tls_ctr_key_len;
 
 static __thread uint8_t tls_nonce_salt[16];
 static __thread int tls_salt_initialized;
-
-/* #region agent log */
-static void gcm_perf_sample(const char *op, int len, uint64_t elapsed_ns)
-{
-    static atomic_uint sample_n;
-
-    if ((atomic_fetch_add(&sample_n, 1) % 8192u) != 0)
-        return;
-
-    fprintf(stderr, "[NE-GCM] %s aes_bits=%d len=%d ns=%llu path=openssl\n",
-            op, g_aes_bits, len, (unsigned long long)elapsed_ns);
-    fflush(stderr);
-}
-/* #endregion */
 
 static EVP_CIPHER_CTX *tls_ctx_get(EVP_CIPHER_CTX **slot)
 {
@@ -364,17 +350,12 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
 {
     EVP_CIPHER_CTX *evp;
     int out_len;
-    uint64_t t0;
-    struct timespec ts;
 
     if (len <= 0)
         return 0;
     if (!key || !nonce || !data || !tag_out)
-        return -1;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    t0 = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-
+        return -1;  
+    
     evp = tls_ctx_get(&tls_gcm_enc_ctx);
     if (!evp) {
         printf("Het ram gcm\n");
@@ -402,28 +383,19 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
         tls_gcm_invalidate_enc();
         return -1;
     }
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    gcm_perf_sample("gcm_encrypt", len,
-                    (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - t0);
     return 0;
 }
 
 int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len, const uint8_t tag[AES_GCM_TAG_SIZE])
-{
+{  
     EVP_CIPHER_CTX *evp;
     int out_len;
-    uint64_t t0;
-    struct timespec ts;
 
     if (len <= 0)
         return 0;
     if (!key || !nonce || !data || !tag)
         return -1;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    t0 = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
     evp = tls_ctx_get(&tls_gcm_dec_ctx);
     if (!evp)
@@ -451,10 +423,6 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
         tls_gcm_invalidate_dec();
         return -1;
     }
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    gcm_perf_sample("gcm_decrypt", len,
-                    (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - t0);
     return 0;
 }
 

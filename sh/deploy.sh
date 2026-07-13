@@ -1,10 +1,10 @@
 #!/bin/bash
-REMOTE="/home/clover/NE_TEST_MAC_FW"
+REMOTE="/home/sep/NE"
 KEY="/root/.ssh/id_ed25519"
 
 DEPLOY_LIST="bin"
 
-for IP in "10.5.15.54" "10.5.15.55"
+for IP in "10.5.15.61" "10.5.15.62"
 do
     echo "Deploying to $IP..."
     for ITEM in $DEPLOY_LIST

@@ -1,6 +1,7 @@
 #include "../../inc/core/dataplane.h"
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/core/config.h"
 
 #include "../../inc/crypto/crypto_dispatch.h"
 #include "../../inc/crypto/crypto_layer2.h"
@@ -11,12 +12,8 @@
 
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
-#include "../../inc/core/interface.h"
-#include "../../inc/core/mac_learn.h"
 
 #include <string.h>
-#include <stdio.h>
-#include <stdatomic.h>
 
 static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fwd, uint8_t wire_id)
 {
@@ -30,25 +27,18 @@ static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fw
     return NULL;
 }
 
-static void wan_apply_l2_policy(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
+static void wan_apply_l2_policy(struct forwarder *fwd, const uint8_t *pkt)
 {
-    uint8_t wire_id = 0;
-
-    if (crypto_layer2_read_policy_id(pkt, len, &wire_id) != 0)
-        return;
-    const struct crypto_policy *cp = fwd_l2_policy_by_wire_id(fwd, wire_id);
+    const struct crypto_policy *cp = fwd_l2_policy_by_wire_id(fwd, pkt[CRYPTO_L2_POLICY_OFF]);
     if (cp)
         crypto_apply_from_policy(cp);
 }
 
 static int wan_l2_plain_ipv4(const uint8_t *pkt, uint32_t len)
 {
-    return crypto_pkt_is_ipv4(pkt, len);
-}
-
-static int wan_is_bypass_plain(const uint8_t *pkt, uint32_t len)
-{
-    return wan_l2_plain_ipv4(pkt, len);
+    if (len < ETH_HEADER_SIZE)
+        return 0;
+    return (((uint16_t)pkt[12] << 8) | pkt[13]) == 0x0800;
 }
 
 static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
@@ -57,11 +47,7 @@ static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
     uint8_t fidx = 0;
     uint8_t pol = 0;
 
-    if (!pkt)
-        return 0;
-    if (wan_is_bypass_plain(pkt, len))
-        return 1;
-    if (!fwd->cfg || !fwd->cfg->crypto_enabled)
+    if (!fwd->cfg->crypto_enabled || !pkt)
         return 0;
     if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx) ||
         frag_is_fragment(fwd->cfg, pkt, len, &pid, &fidx) ||
@@ -76,38 +62,17 @@ static int wan_has_crypto(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
     return 0;
 }
 
-static void wan_trace_reject(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
-{
-    char det[256];
-    uint16_t et = 0;
-
-    if (len >= 14)
-        et = ((uint16_t)pkt[12] << 8) | pkt[13];
-
-    if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled) {
-        snprintf(det, sizeof(det), "crypto_enabled=0 ethertype=0x%04x", et);
-        ne_agent_policy_trace_plain("WAN", "DROP_CRYPTO_DISABLED", len, det, 1);
-        return;
-    }
-    snprintf(det, sizeof(det),
-             "no L2 fake_et no L2/L3/L4 frag marker ethertype=0x%04x plain_ipv4=%d",
-             et, wan_is_bypass_plain(pkt, len));
-    ne_agent_policy_trace_plain("WAN", "DROP_NO_CRYPTO_MARKER", len, det, 1);
-}
-
 static int decrypt_l2(uint8_t *pkt, uint32_t *len)
 {
+    uint16_t fake = packet_crypto_get_fake_ethertype_ipv4();
     struct packet_crypto_ctx *ctx;
-    uint8_t wire_id = 0;
     int n;
 
-    if (!pkt || !len)
+    if (!fake || *len < ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN)
         return 0;
-    if (!crypto_layer2_has_fake_ethertype(pkt, *len))
+    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != fake)
         return 0;
-    if (crypto_layer2_read_policy_id(pkt, *len, &wire_id) != 0)
-        return 0;
-    ctx = fwd_crypto_ctx_for_wire_id(wire_id);
+    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, pkt[CRYPTO_L2_POLICY_OFF]);
     if (!ctx)
         return -1;
     n = crypto_layer2_decrypt(ctx, pkt, *len);
@@ -124,76 +89,29 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     int slot, nd, rr;
     uint16_t opid;
     uint8_t ofidx;
-    uint32_t fsig = 0;
     uint8_t buf[4096];
     uint32_t blen = 0;
 
-    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
+    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id);
     if (!ctx)
         return -1;
     slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_wire_id(policy_id));
+        fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L2, policy_id));
     if (slot < 0)
         return -1;
-    nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx, &fsig);
-    if (nd < 0) {
-        char dj[128];
-        snprintf(dj, sizeof(dj),
-                 "{\"wire_len\":%u,\"policy\":%u,\"frag_idx\":%u}",
-                 *len, policy_id, ofidx);
-        ne_agent_stat_inc(NE_STAT_REASM_FAIL);
-        ne_agent_drop_log("L2", "dataplane_wan.c:reassemble_l2",
-                          "l2_decrypt_frag_failed", dj);
+    nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
+    if (nd < 0)
         return -1;
-    }
-    rr = frag_try_reassemble_l2(
-        fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
-        pkt, (uint32_t)nd, opid, ofidx, fsig, buf, &blen);
+    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
+                                pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
-        /* #region agent log */
-        {
-            static atomic_uint pend_n;
-            uint32_t pn = atomic_fetch_add(&pend_n, 1);
-            if (pn < 20 || (pn % 512 == 0)) {
-                char dj[128];
-                snprintf(dj, sizeof(dj),
-                         "{\"pkt_id\":%u,\"frag_idx\":%u,\"sig\":%u,\"wi\":%d,\"n\":%u}",
-                         opid, ofidx, fsig, dp_crypto_current_worker_idx(), pn);
-                ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
-                                   "l2_reassemble_pending", dj);
-            }
-        }
-        /* #endregion */
         *pending = 1;
         return 0;
     }
-    if (rr != 1) {
-        char dj[128];
-        snprintf(dj, sizeof(dj),
-                 "{\"pkt_id\":%u,\"frag_idx\":%u,\"rr\":%d,\"nd\":%d}",
-                 opid, ofidx, rr, nd);
-        ne_agent_stat_inc(NE_STAT_REASM_FAIL);
-        ne_agent_drop_log("L2", "dataplane_wan.c:reassemble_l2",
-                          "l2_reassemble_failed", dj);
+    if (rr != 1)
         return -1;
-    }
     memcpy(pkt, buf, blen);
     *len = blen;
-    ne_agent_stat_inc(NE_STAT_REASM_OK);
-    /* #region agent log */
-    {
-        static atomic_uint join_ok_n;
-        uint32_t jn = atomic_fetch_add(&join_ok_n, 1);
-        if (jn < 40 || (jn % 256 == 0)) {
-            char dj[160];
-            snprintf(dj, sizeof(dj),
-                     "{\"pkt_id\":%u,\"frag_idx\":%u,\"out_len\":%u,\"n\":%u}",
-                     opid, ofidx, blen, jn);
-            ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
-                               "l2_reassemble_join_ok", dj);
-        }
-    }
-    /* #endregion */
     return 0;
 }
 
@@ -207,56 +125,23 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t buf[4096];
     uint32_t blen = 0;
 
-    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
+    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L3, policy_id);
     if (!ctx)
         return -1;
     slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_wire_id(policy_id));
+        fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L3, policy_id));
     if (slot < 0)
         return -1;
     nd = crypto_layer3_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
-    if (nd < 0) {
-        /* #region agent log */
-        {
-            char dj[128];
-            snprintf(dj, sizeof(dj),
-                     "{\"wire_len\":%u,\"mode\":%d,\"policy\":%u}",
-                     *len, packet_crypto_get_mode(), policy_id);
-            ne_agent_debug_log("D", "dataplane_wan.c:reassemble_l3",
-                               "decrypt_frag_failed", dj);
-        }
-        /* #endregion */
+    if (nd < 0)
         return -1;
-    }
     rr = frag_try_reassemble(fwd_crypto_frag_l3(slot), pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
-        static atomic_uint pend_n;
-        uint32_t pn = atomic_fetch_add(&pend_n, 1);
-        /* #region agent log */
-        if (pn < 30 || (pn % 128 == 0)) {
-            char dj[96];
-            snprintf(dj, sizeof(dj), "{\"pkt_id\":%u,\"frag_idx\":%u,\"n\":%u}",
-                     opid, ofidx, pn);
-            ne_agent_debug_log("C", "dataplane_wan.c:reassemble_l3",
-                               "frag_pending", dj);
-        }
-        /* #endregion */
         *pending = 1;
         return 0;
     }
-    if (rr != 1) {
-        /* #region agent log */
-        {
-            char dj[128];
-            snprintf(dj, sizeof(dj),
-                     "{\"pkt_id\":%u,\"frag_idx\":%u,\"rr\":%d,\"nd\":%d}",
-                     opid, ofidx, rr, nd);
-            ne_agent_debug_log("C", "dataplane_wan.c:reassemble_l3",
-                               "reassemble_failed", dj);
-        }
-        /* #endregion */
+    if (rr != 1)
         return -1;
-    }
     memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
@@ -272,11 +157,11 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     uint8_t buf[4096];
     uint32_t blen = 0;
 
-    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
+    ctx = fwd_crypto_ctx_for_policy_action_id(POLICY_ACTION_ENCRYPT_L4, policy_id);
     if (!ctx)
         return -1;
     slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_wire_id(policy_id));
+        fwd_crypto_profile_id_for_policy_action_id(POLICY_ACTION_ENCRYPT_L4, policy_id));
     if (slot < 0)
         return -1;
     nd = crypto_layer4_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
@@ -307,70 +192,26 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 
     {
         int frag_mark = 0;
-        int is_frag = 0;
+        int ns = PACKET_CRYPTO_NONCE_BYTES;
+        int mark_off = ETH_HEADER_SIZE + CRYPTO_L2_POLICY_LEN + CRYPTO_L2_CORE_ID_LEN + ns;
         uint32_t orig_len = len;
-        uint8_t wire_pol = 0;
 
-        wan_apply_l2_policy(fwd, pkt, len);
-        frag_mark = crypto_layer2_has_fragment_marker(pkt, len);
-        is_frag = frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
+        wan_apply_l2_policy(fwd, pkt);
+        if (len > (uint32_t)mark_off)
+            frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
 
-        int need_backup = frag_mark || is_frag;
+        int need_backup = frag_mark ||
+            frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
         if (need_backup && orig_len <= sizeof(scratch))
             memcpy(scratch, pkt, orig_len);
-        int l2_rc = decrypt_l2(pkt, &len);
-        int l2_plain = wan_l2_plain_ipv4(pkt, len);
-        if (l2_rc == 0 && l2_plain) {
-            char det[128];
-            snprintf(det, sizeof(det),
-                     "wire=%u plain=%u fake_et=%d frag_mark=%d is_frag=%d",
-                     orig_len, len,
-                     crypto_layer2_has_fake_ethertype(pkt, orig_len),
-                     frag_mark, is_frag);
-            if (crypto_layer2_has_fake_ethertype(pkt, orig_len))
-                ne_agent_policy_trace_plain("WAN", "DECRYPT_L2_FULL_OK", orig_len, det, 0);
-            else
-                ne_agent_policy_trace_plain("WAN", "PLAIN_IPV4_SKIP_DECRYPT", orig_len, det, 1);
-        } else if (l2_rc != 0 || !l2_plain) {
+        if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
             if (need_backup)
                 memcpy(pkt, scratch, orig_len);
             len = orig_len;
             if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (crypto_layer2_read_policy_id(pkt, len, &wire_pol) != 0) {
-                    /* #region agent log */
-                    ne_agent_debug_log("L2", "dataplane_wan.c:decrypt_wan",
-                                       "l2_frag_policy_read_failed", "{}");
-                    /* #endregion */
+                if (reassemble_l2(fwd, pkt, &len, pkt[CRYPTO_L2_POLICY_OFF], &pending) != 0)
                     return -1;
-                }
-                if (reassemble_l2(fwd, pkt, &len, wire_pol, &pending) != 0) {
-                    /* #region agent log */
-                    {
-                        char dj[160];
-                        snprintf(dj, sizeof(dj),
-                                 "{\"wire_len\":%u,\"policy\":%u,\"pkt_id\":%u,\"frag_idx\":%u}",
-                                 orig_len, wire_pol, pid, fidx);
-                        ne_agent_debug_log("L2", "dataplane_wan.c:decrypt_wan",
-                                           "l2_frag_reassemble_failed", dj);
-                    }
-                    /* #endregion */
-                    return -1;
-                }
-                if (!pending) {
-                    char det[128];
-                    snprintf(det, sizeof(det),
-                             "wire=%u plain=%u policy_wire=%u pkt_id=%u frag_idx=%u",
-                             orig_len, len, wire_pol, pid, fidx);
-                    ne_agent_policy_trace_plain("WAN", "DECRYPT_L2_REASM_OK", orig_len, det, 0);
-                }
             } else {
-                char det[220];
-                snprintf(det, sizeof(det),
-                         "wire=%u l2_rc=%d plain_ipv4=%d frag_mark=%d is_frag=%d "
-                         "pkt_id=%u frag_idx=%u fake_et=%d",
-                         orig_len, l2_rc, l2_plain, frag_mark, is_frag, pid, fidx,
-                         crypto_layer2_has_fake_ethertype(pkt, len));
-                ne_agent_policy_trace_plain("WAN", "DROP_L2_REJECT", orig_len, det, 1);
                 return -1;
             }
         }
@@ -385,74 +226,28 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 
     dctx = fwd_crypto_make_dispatch_ctx();
     if (frag_is_fragment(fwd->cfg, pkt, len, &pid, &fidx)) {
-        if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) != 0) {
-            /* #region agent log */
-            ne_agent_debug_log("H", "dataplane_wan.c:decrypt_wan",
-                               "stage_l3_frag_policy_failed", "{}");
-            /* #endregion */
+        if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) != 0)
             return -1;
-        }
-        if (reassemble_l3(fwd, pkt, &len, pol, &pending) != 0) {
-            /* #region agent log */
-            {
-                char dj[128];
-                snprintf(dj, sizeof(dj),
-                         "{\"wire_len\":%u,\"policy\":%u,\"frag_idx\":%u}",
-                         job->len, pol, fidx);
-                ne_agent_debug_log("H", "dataplane_wan.c:decrypt_wan",
-                                   "stage_l3_frag_reassemble_failed", dj);
-            }
-            /* #endregion */
+        if (reassemble_l3(fwd, pkt, &len, pol, &pending) != 0)
             return -1;
-        }
     } else if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) == 0 &&
                crypto_decrypt_packet_auto_by_action(1, fwd->cfg, &dctx,
                                                     POLICY_ACTION_ENCRYPT_L3,
                                                     pkt, &len, scratch, sizeof(scratch)) != 0) {
-        /* #region agent log */
-        {
-            char dj[128];
-            snprintf(dj, sizeof(dj),
-                     "{\"wire_len\":%u,\"policy\":%u,\"policy_count\":%d}",
-                     job->len, pol, fwd->cfg->policy_count);
-            ne_agent_debug_log("G", "dataplane_wan.c:decrypt_wan",
-                               "stage_l3_nonfrag_decrypt_failed", dj);
-        }
-        /* #endregion */
         return -1;
     }
     if (pending)
         return 1;
 
     if (frag_is_fragment_l4(fwd->cfg, pkt, len, &pid, &fidx)) {
-        if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, len, &pol) != 0) {
-            /* #region agent log */
-            ne_agent_debug_log("I", "dataplane_wan.c:decrypt_wan",
-                               "stage_l4_frag_policy_failed", "{}");
-            /* #endregion */
+        if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, len, &pol) != 0)
             return -1;
-        }
-        if (reassemble_l4(fwd, pkt, &len, pol, &pending) != 0) {
-            /* #region agent log */
-            ne_agent_debug_log("I", "dataplane_wan.c:decrypt_wan",
-                               "stage_l4_frag_reassemble_failed", "{}");
-            /* #endregion */
+        if (reassemble_l4(fwd, pkt, &len, pol, &pending) != 0)
             return -1;
-        }
     } else if (crypto_decrypt_packet_auto_by_action(1, fwd->cfg, &dctx,
                                                       POLICY_ACTION_ENCRYPT_L4,
                                                       pkt, &len, scratch,
                                                       sizeof(scratch)) != 0) {
-        /* #region agent log */
-        {
-            char dj[128];
-            snprintf(dj, sizeof(dj),
-                     "{\"wire_len\":%u,\"current_len\":%u,\"ip_proto\":%u}",
-                     job->len, len, len >= 24 ? pkt[23] : 0);
-            ne_agent_debug_log("I", "dataplane_wan.c:decrypt_wan",
-                               "stage_l4_auto_decrypt_failed", dj);
-        }
-        /* #endregion */
         return -1;
     }
     if (pending)
@@ -462,246 +257,40 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     return 0;
 }
 
-static int eth_dmac_is_unicast(const uint8_t *pkt)
+static int pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
 {
-    return (pkt[0] & 0x01u) == 0;
-}
-
-static int profile_owns_local(const struct app_config *cfg, int profile_pi, int local_idx)
-{
-    const struct profile_config *prof;
-
-    if (!cfg || profile_pi < 0 || profile_pi >= cfg->profile_count)
-        return 0;
-    prof = &cfg->profiles[profile_pi];
-    if (!prof->enabled)
-        return 0;
-    for (int i = 0; i < prof->local_count; i++) {
-        if (prof->local_indices[i] == local_idx)
-            return 1;
-    }
-    return 0;
-}
-
-static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
-{
-    int profile_id;
-
-    if (!fwd || !fwd->cfg)
+    uint32_t dest_ip = dp_dest_ipv4(pkt, len);
+    if (dest_ip == 0)
         return -1;
-    profile_id = fwd_crypto_profile_id_for_wire_id(wire_id);
-    if (profile_id < 0)
-        return -1;
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        if (fwd->cfg->profiles[pi].id == profile_id)
-            return pi;
-    }
-    return -1;
-}
-
-static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
-                                   const uint8_t *pkt, int profile_pi)
-{
-    const struct profile_config *prof;
-    int wi;
-    int sent = 0;
-    uint16_t sent_mask = 0;
-
-    if (!fwd || !job || !pkt || !fwd->cfg || profile_pi < 0 ||
-        profile_pi >= fwd->cfg->profile_count)
-        return -1;
-
-    prof = &fwd->cfg->profiles[profile_pi];
-    if (!prof->enabled || prof->local_count <= 0)
-        return -1;
-
-    wi = dp_crypto_current_worker_idx();
-
-    for (int i = 0; i < prof->local_count; i++) {
-        int li = prof->local_indices[i];
-        struct ne_ring *ring;
-
-        if (li < 0 || li >= fwd->local_count)
-            continue;
-        if (li < (int)(sizeof(sent_mask) * 8) && (sent_mask & (1u << li)) != 0)
-            continue;
-
-        ring = &fwd->mid_to_local[li][wi];
-
-        if (sent == 0) {
-            job->dir = NE_DIR_LOCAL;
-            job->local_idx = (uint8_t)li;
-            if (ne_ring_try_push(ring, job) != 0)
-                return -1;
-            sent = 1;
-        } else {
-            struct ne_packet clone = {
-                .len = job->len,
-                .dir = NE_DIR_LOCAL,
-                .local_idx = (uint8_t)li,
-            };
-            if (ne_frame_alloc(&fwd->pair, &clone.addr) != 0)
-                return -1;
-            memcpy(ne_packet_data(&fwd->pair, clone.addr), pkt, job->len);
-            if (ne_ring_try_push(ring, &clone) != 0) {
-                ne_frame_free(&fwd->pair, clone.addr);
-                return -1;
-            }
-        }
-        if (li < (int)(sizeof(sent_mask) * 8))
-            sent_mask |= (1u << li);
-    }
-    return sent > 0 ? 0 : -1;
-}
-
-static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
-{
-    uint32_t src_ip = 0, dst_ip = 0;
-    uint16_t src_port = 0, dst_port = 0;
-    uint8_t proto = 0;
-    int best_pi = -1;
-    int best_pri = 0x7fffffff;
-    int best_id = 0x7fffffff;
-
-    if (!fwd || !pkt || !fwd->cfg)
-        return -1;
-    if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
-                      &src_port, &dst_port, &proto) != 0)
-        return -1;
-
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *prof = &fwd->cfg->profiles[pi];
-        const struct crypto_policy *cp;
-
-        if (!prof->enabled)
-            continue;
-        cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
-                                         src_port, dst_port, proto);
-        if (!cp || cp->action != POLICY_ACTION_BYPASS)
-            continue;
-        if (best_pi < 0 || cp->priority < best_pri ||
-            (cp->priority == best_pri && cp->id < best_id)) {
-            best_pi = pi;
-            best_pri = cp->priority;
-            best_id = cp->id;
-        }
-    }
-    return best_pi;
-}
-
-static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
-{
-    uint8_t pol = 0;
-
-    if (!fwd || !pkt || !fwd->cfg)
-        return -1;
-    if (fwd_crypto_has_l2_marker(pkt, len)) {
-        uint8_t wire_pol = 0;
-
-        if (crypto_layer2_read_policy_id(pkt, len, &wire_pol) != 0)
-            return -1;
-        return profile_pi_for_wire_policy(fwd, wire_pol);
-    }
-    if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return profile_pi_for_wire_policy(fwd, pol);
-    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return profile_pi_for_wire_policy(fwd, pol);
-    return wan_profile_pi_bypass(fwd, pkt, len);
-}
-
-static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
-                                const uint8_t *wire_pkt, uint32_t wire_len)
-{
-    uint8_t *pkt;
-    int profile_pi;
-    int li;
-
-    if (!fwd || !job || !wire_pkt || wire_len < 14u)
-        return -1;
-    pkt = ne_packet_data(&fwd->pair, job->addr);
-    if (!pkt || job->len < 14u)
-        return -1;
-    if (!eth_dmac_is_unicast(pkt))
-        return -1;
-
-    profile_pi = wan_profile_pi(fwd, wire_pkt, wire_len);
-    if (profile_pi < 0)
-        return -1;
-
-    li = mac_lookup(fwd, pkt);
-    if (li >= 0 && profile_owns_local(fwd->cfg, profile_pi, li)) {
-        job->dir = NE_DIR_LOCAL;
-        job->local_idx = (uint8_t)li;
-        return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
-    }
-
-    return flood_to_profile_locals(fwd, job, pkt, profile_pi);
+    return config_find_local_for_ip(fwd->cfg, dest_ip);
 }
 
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
-    uint8_t wire_buf[NE_FRAME];
-    uint32_t wire_len;
+    int li;
     int dec;
 
-    if (!fwd || !pkt)
-        goto drop;
-
-    wire_len = job.len;
-    if (wire_len < 14u || wire_len > NE_FRAME)
-        goto drop;
-    memcpy(wire_buf, pkt, wire_len);
-
-    if (!wan_has_crypto(fwd, pkt, job.len)) {
-        wan_trace_reject(fwd, pkt, job.len);
-        goto drop;
-    }
-
-    dec = decrypt_wan(fwd, &job);
-    if (dec == 1) {
-        /* #region agent log */
-        {
-            static atomic_uint l2_pend_n;
-            uint32_t pn = atomic_fetch_add(&l2_pend_n, 1);
-            if (pn < 40 || (pn % 256 == 0)) {
-                char dj[96];
-                snprintf(dj, sizeof(dj), "{\"wire_len\":%u,\"n\":%u}", wire_len, pn);
-                ne_agent_debug_log("L2", "dataplane_wan.c:dataplane_process_wan",
-                                   "l2_frag_pending_hold", dj);
-            }
+    if (wan_has_crypto(fwd, pkt, job.len)) {
+        dec = decrypt_wan(fwd, &job);
+        if (dec == 1) {
+            ne_frame_free(&fwd->pair, job.addr);
+            return;
         }
-        /* #endregion */
-        ne_frame_free(&fwd->pair, job.addr);
-        return;
-    }
-    if (dec != 0) {
-        char det[128];
-        snprintf(det, sizeof(det), "wire=%u dec_rc=%d mode=%d",
-                 wire_len, dec, packet_crypto_get_mode());
-        ne_agent_stat_inc(NE_STAT_WAN_DECRYPT_DROP);
-        ne_agent_policy_trace_plain("WAN", "DROP_DECRYPT_FAIL", wire_len, det, 1);
-        goto drop;
+        if (dec != 0)
+            goto drop;
+        pkt = ne_packet_data(&fwd->pair, job.addr);
     }
 
-    ne_agent_stat_maybe_dump();
-    /* #region agent log */
-    {
-        static atomic_uint l2_fwd_n;
-        uint32_t fn = atomic_fetch_add(&l2_fwd_n, 1);
-        if (fn < 40 || (fn % 512 == 0)) {
-            char dj[128];
-            snprintf(dj, sizeof(dj),
-                     "{\"wire_in\":%u,\"plain_len\":%u,\"n\":%u}",
-                     wire_len, job.len, fn);
-            ne_agent_debug_log("L2", "dataplane_wan.c:dataplane_process_wan",
-                               "wan_l2_forward_ok", dj);
-        }
-    }
-    /* #endregion */
-
-    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len) != 0)
+    li = pick_local(fwd, pkt, job.len);
+    if (li < 0 || li >= fwd->local_count)
         goto drop;
+    if (dp_write_l2_src_only(pkt, job.len, fwd->locals[li].src_mac) != 0)
+        goto drop;
+
+    job.dir = NE_DIR_LOCAL;
+    job.local_idx = (uint8_t)li;
+    (void)dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], &job);
     return;
 
 drop:

@@ -7,6 +7,18 @@
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <netinet/in.h>
+int parse_mac(const char *str, uint8_t *mac) {
+    int values[6];
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x",
+               &values[0], &values[1], &values[2],
+               &values[3], &values[4], &values[5]) != 6) {
+        return -1;
+    }
+    for (int i = 0; i < 6; i++) {
+        mac[i] = (uint8_t)values[i];
+    }
+    return 0;
+}
 
 static uint32_t ipv4_prefix_to_mask_be(int prefix_len) {
     if (prefix_len <= 0)
@@ -162,87 +174,6 @@ int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx
     return config_wan_owner_profile(cfg, wan_idx, skip_profile_id);
 }
 
-int config_wan_profile_weight(const struct app_config *cfg, int wan_idx)
-{
-    int best = 0;
-
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return 0;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-
-        for (int wi = 0; wi < p->wan_count; wi++) {
-            if (p->wan_indices[wi] != wan_idx)
-                continue;
-            if (p->wan_bandwidth_weight[wi] > best)
-                best = p->wan_bandwidth_weight[wi];
-        }
-    }
-    return best;
-}
-
-int config_wan_live(const struct app_config *cfg, int wan_idx)
-{
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return 0;
-    /* ne_wan.dst_ip set → handshake/PQC redirect, no dataplane XDP */
-    if (!cfg->wans[wan_idx].dataplane)
-        return 0;
-    /* weight 0 / unset → staged WAN row, no XDP until bandwidth assigned */
-    return config_wan_profile_weight(cfg, wan_idx) > 0;
-}
-
-int config_wan_live_in_cfg(const struct app_config *cfg, const char *ifname)
-{
-    if (!cfg || !ifname)
-        return 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (strcmp(cfg->wans[i].ifname, ifname) == 0)
-            return config_wan_live(cfg, i);
-    }
-    return 0;
-}
-
-int config_count_dataplane_wans(const struct app_config *cfg)
-{
-    int n = 0;
-
-    if (!cfg)
-        return 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (config_wan_live(cfg, i))
-            n++;
-    }
-    return n;
-}
-
-int config_wan_cfg_to_dp(const struct app_config *cfg, int cfg_idx)
-{
-    if (!config_wan_live(cfg, cfg_idx))
-        return -1;
-    int dp = 0;
-    for (int i = 0; i < cfg_idx; i++) {
-        if (config_wan_live(cfg, i))
-            dp++;
-    }
-    return dp;
-}
-
-int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx)
-{
-    if (!cfg || dp_idx < 0)
-        return -1;
-    int seen = 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (!config_wan_live(cfg, i))
-            continue;
-        if (seen == dp_idx)
-            return i;
-        seen++;
-    }
-    return -1;
-}
-
 int config_wan_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
 {
     if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
@@ -368,6 +299,23 @@ int config_validate(struct app_config *cfg) {
             fprintf(stderr, "LOCAL[%d]: interface not specified\n", i);
             return -1;
         }
+        if (local->netmask == 0) {
+            fprintf(stderr, "LOCAL %s: subnet not configured\n", local->ifname);
+            return -1;
+        }
+    }
+
+    for (int i = 0; i < cfg->local_count; i++) {
+        const struct local_config *a = &cfg->locals[i];
+        for (int j = i + 1; j < cfg->local_count; j++) {
+            const struct local_config *b = &cfg->locals[j];
+            if (a->network == b->network && a->netmask == b->netmask) {
+                fprintf(stderr,
+                        "LOCAL %s and %s: duplicate subnet (LAN subnets must differ)\n",
+                        a->ifname, b->ifname);
+                return -1;
+            }
+        }
     }
 
     for (int i = 0; i < cfg->wan_count; i++) {
@@ -387,6 +335,16 @@ int config_validate(struct app_config *cfg) {
     if (config_validate_profiles(cfg) != 0)
         return -1;
     return 0;
+}
+
+int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip) {
+    for (int i = 0; i < cfg->local_count; i++) {
+        struct local_config *local = &cfg->locals[i];
+        if ((dest_ip & local->netmask) == local->network) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static int cidr_match_with_negate(int any_flag, int negate,

@@ -4,12 +4,11 @@
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/dataplane.h"
 #include "../../inc/core/crypto_route.h"
-#include "../../inc/core/dataplane_util.h"
 
+#include "../../inc/core/local_hwaddr.h"
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/core/profile_iface_xdp.h"
-#include "../../inc/core/mac_learn.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
 
 #include <net/if.h>
@@ -17,10 +16,6 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
 static atomic_int running = 1;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static void pin_cpu(unsigned int cpu)
@@ -36,8 +31,8 @@ void forwarder_pin_cpu(void)
     pin_cpu(ne_cpu_rx_lan(0));
 }
 
-#define DP_BURST_ROUNDS   8
-#define DP_TX_BURST_MAX   8
+#define DP_BURST_ROUNDS   1
+#define DP_TX_BURST_MAX   1
 
 static void dp_burst_refill_local(struct forwarder *fwd, int rx_slot)
 {
@@ -111,41 +106,16 @@ struct dp_rx_slot_ctx {
     uint8_t cpu_id;
 };
 
-static void init_iface_meta(struct fwd_iface *iface, const char *ifname)
+static void init_iface_meta(struct fwd_iface *iface, const char *ifname,
+                            const uint8_t src_mac[MAC_LEN],
+                            const uint8_t dst_mac[MAC_LEN])
 {
     memset(iface, 0, sizeof(*iface));
     iface->ifindex = (int)if_nametoindex(ifname);
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
-}
-
-static uint32_t resolve_runtime_frag_mtu(const struct app_config *cfg)
-{
-    int sockfd;
-    uint32_t min_mtu = FRAG_MTU;
-
-    if (!cfg)
-        return min_mtu;
-
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0)
-        return min_mtu;
-
-    for (int wi = 0; wi < cfg->wan_count; wi++) {
-        struct ifreq ifr;
-        if (!cfg->wans[wi].dataplane)
-            continue;
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, cfg->wans[wi].ifname, IFNAMSIZ - 1);
-        ifr.ifr_name[IFNAMSIZ - 1] = '\0';
-        if (ioctl(sockfd, SIOCGIFMTU, &ifr) != 0)
-            continue;
-        if (ifr.ifr_mtu > 0 && (uint32_t)ifr.ifr_mtu < min_mtu)
-            min_mtu = (uint32_t)ifr.ifr_mtu;
-    }
-
-    close(sockfd);
-    return min_mtu;
+    memcpy(iface->src_mac, src_mac, MAC_LEN);
+    memcpy(iface->dst_mac, dst_mac, MAC_LEN);
 }
 
 static void *local_rx_thread(void *arg)
@@ -170,7 +140,6 @@ static void *local_rx_thread(void *arg)
             int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
                                                  batch[i].len);
             if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
-                ne_agent_stat_inc(NE_STAT_RING_DROP_LOCAL);
                 ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
                                    ne_ring_count(&fwd->local_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
@@ -232,15 +201,6 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
-                char dj[128];
-                static atomic_uint wan_ring_drop_n;
-                uint32_t dn = atomic_fetch_add(&wan_ring_drop_n, 1);
-                snprintf(dj, sizeof(dj),
-                         "{\"wi\":%d,\"ring_cnt\":%u,\"n\":%u}",
-                         wi, ne_ring_count(&fwd->wan_to_mid[wi]), dn);
-                ne_agent_stat_inc(NE_STAT_RING_DROP_WAN_RX);
-                ne_agent_drop_log("L2", "forwarder.c:wan_rx_thread",
-                                  "wan_crypto_ring_drop", dj);
                 ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
                                    ne_ring_count(&fwd->wan_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
@@ -286,7 +246,6 @@ static void crypto_worker_tick(struct forwarder *fwd, int is_primary)
     fwd_wan_drain_tick(fwd);
     fwd_wan_weight_blend_tick();
     fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
-    mac_learn_tick(fwd);
 }
 
 static void *crypto_worker_thread(void *arg)
@@ -361,15 +320,10 @@ static void *crypto_worker_thread(void *arg)
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
-    if (!fwd || !cfg || cfg->local_count <= 0)
+    if (!fwd || !cfg || cfg->local_count <= 0 || config_count_dataplane_wans(cfg) <= 0)
         return -1;
     if (forwarder_should_stop())
         return -1;
-    if (config_count_dataplane_wans(cfg) <= 0) {
-        fprintf(stderr,
-                "[FWD] no live WAN (weight>0) — LAN-only until bandwidth is assigned\n");
-        fflush(stderr);
-    }
 
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
@@ -380,21 +334,23 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
 
-    frag_set_mtu(resolve_runtime_frag_mtu(cfg));
-    fprintf(stderr, "[FRAG] runtime MTU set to %u\n", frag_get_mtu());
-
+    static const uint8_t zero_mac[MAC_LEN];
     for (int i = 0; i < fwd->local_count; i++)
-        init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname);
+        init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname,
+                        cfg->locals[i].src_mac, zero_mac);
     for (int di = 0; di < fwd->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
         if (ci < 0)
             return -1;
         fwd->wan_cfg_idx[di] = ci;
-        init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname);
+        init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname,
+                        cfg->wans[ci].src_mac, cfg->wans[ci].dst_mac);
     }
 
     profile_iface_xdp_prepare_init(cfg);
 
+    if (local_hwaddr_prepare(cfg) != 0)
+        return -1;
     if (forwarder_should_stop())
         return -1;
 
@@ -444,10 +400,9 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         }
     }
 
+    (void)local_hwaddr_install(fwd);
     fwd_wan_reset_on_init(fwd);
-    // MAC_LEARN
-    mac_learn_bootstrap(&fwd->mac_table);
-    // MAC_LEARN
+
     atomic_store_explicit(&running, 1, memory_order_release);
     return 0;
 }
@@ -456,9 +411,6 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
-    // MAC_LEARN
-    mac_learn_shutdown(&fwd->mac_table);
-    // MAC_LEARN
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
         ne_ring_destroy(&fwd->local_to_mid[w]);
         ne_ring_destroy(&fwd->wan_to_mid[w]);
@@ -507,19 +459,15 @@ void forwarder_run(struct forwarder *fwd)
     if (ne_cpu_map_validate() != 0)
         return;
 
-    {
-        int lan_rx_active = ne_rx_lan_slots_for(fwd->pair.local_queue_total);
-
-        for (int w = 0; w < lan_rx_active; w++) {
-            local_rx_ctx[w].fwd = fwd;
-            local_rx_ctx[w].rx_slot = w;
-            local_rx_ctx[w].cpu_id = ne_cpu_rx_lan((uint32_t)w);
-            if (pthread_create(&fwd->local_rx_threads[w], NULL, local_rx_thread, &local_rx_ctx[w]) != 0) {
-                forwarder_join_started(fwd, local_rx_started, 0, 0, 0, 0);
-                return;
-            }
-            local_rx_started++;
+    for (int w = 0; w < (int)NE_RX_LAN_SLOTS; w++) {
+        local_rx_ctx[w].fwd = fwd;
+        local_rx_ctx[w].rx_slot = w;
+        local_rx_ctx[w].cpu_id = ne_cpu_rx_lan((uint32_t)w);
+        if (pthread_create(&fwd->local_rx_threads[w], NULL, local_rx_thread, &local_rx_ctx[w]) != 0) {
+            forwarder_join_started(fwd, local_rx_started, 0, 0, 0, 0);
+            return;
         }
+        local_rx_started++;
     }
 
     for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
@@ -556,20 +504,16 @@ void forwarder_run(struct forwarder *fwd)
         wan_tx_started++;
     }
 
-    {
-        int wan_rx_active = ne_rx_wan_slots_for(fwd->pair.wan_queue_total);
-
-        for (int w = 0; w < wan_rx_active; w++) {
-            wan_rx_ctx[w].fwd = fwd;
-            wan_rx_ctx[w].rx_slot = w;
-            wan_rx_ctx[w].cpu_id = ne_cpu_rx_wan((uint32_t)w);
-            if (pthread_create(&fwd->wan_rx_threads[w], NULL, wan_rx_thread, &wan_rx_ctx[w]) != 0) {
-                forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started,
-                                       wan_tx_started, wan_rx_started);
-                return;
-            }
-            wan_rx_started++;
+    for (int w = 0; w < (int)NE_RX_WAN_SLOTS; w++) {
+        wan_rx_ctx[w].fwd = fwd;
+        wan_rx_ctx[w].rx_slot = w;
+        wan_rx_ctx[w].cpu_id = ne_cpu_rx_wan((uint32_t)w);
+        if (pthread_create(&fwd->wan_rx_threads[w], NULL, wan_rx_thread, &wan_rx_ctx[w]) != 0) {
+            forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started,
+                                   wan_tx_started, wan_rx_started);
+            return;
         }
+        wan_rx_started++;
     }
 
     fwd->threads_started = 1;

@@ -11,22 +11,24 @@
 static int lookup_policy_index(const struct crypto_dispatch_ctx *dctx,
                                const struct crypto_policy *policies,
                                int policy_count,
-                               int *index_by_wire_id,
-                               uint8_t wire_id) {
+                               int (*index_by_action_id)[256],
+                               int action_layer,
+                               uint8_t policy_id) {
     if (!policies || policy_count <= 0)
         return -1;
 
-    if (dctx && index_by_wire_id) {
-        int pi = index_by_wire_id[wire_id];
+    if (dctx && index_by_action_id &&
+        action_layer >= 0 && action_layer <= POLICY_ACTION_ENCRYPT_L4) {
+        int pi = index_by_action_id[action_layer][policy_id];
         if (pi >= 0 && pi < policy_count)
             return pi;
     }
 
     for (int pi = 0; pi < policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &policies[pi];
-        if (!cp)
+        if (!cp || cp->action != action_layer)
             continue;
-        if ((uint8_t)cp->id == wire_id)
+        if ((uint8_t)cp->id == policy_id)
             return pi;
     }
     return -1;
@@ -89,15 +91,13 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
     uint8_t ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
     if (ip_hdr_len < 20)
         return -1;
-    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 4))
+    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 8))
         return -1;
 
-    uint8_t ip_proto = pkt[l3_off + 9];
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
+    if (pkt[l3_off + 9] != 6 && pkt[l3_off + 9] != 17)
         return -1;
+
     int transport_off = l3_off + ip_hdr_len;
-    if (transport_off >= (int)pkt_len)
-        return -1;
     int wire_port_len = crypto_layer4_wire_port_len();
 
     int tunnel_off = transport_off + wire_port_len;
@@ -148,8 +148,8 @@ int crypto_decrypt_packet_auto_by_action(
             return 0;
         int pi = lookup_policy_index(dctx,
                                      dctx->policies, dctx->policy_count,
-                                     dctx->policy_index_by_wire_id,
-                                     policy_id);
+                                     dctx->policy_index_by_action_id,
+                                     POLICY_ACTION_ENCRYPT_L3, policy_id);
         if (pi >= 0 && dctx->per_policy_ready && dctx->per_policy_ready[pi]) {
             const struct crypto_policy *cp = &dctx->policies[pi];
             crypto_apply_from_policy(cp);
@@ -163,8 +163,8 @@ int crypto_decrypt_packet_auto_by_action(
         if (dctx->prev_grace_active && dctx->prev_policies && dctx->prev_policy_count > 0) {
             int ppi = lookup_policy_index(dctx,
                                           dctx->prev_policies, dctx->prev_policy_count,
-                                          dctx->prev_policy_index_by_wire_id,
-                                          policy_id);
+                                          dctx->prev_policy_index_by_action_id,
+                                          POLICY_ACTION_ENCRYPT_L3, policy_id);
             if (ppi >= 0 && dctx->prev_per_policy_ready && dctx->prev_per_policy_ready[ppi]) {
                 const struct crypto_policy *cp_prev = &dctx->prev_policies[ppi];
                 crypto_apply_from_policy(cp_prev);
@@ -186,15 +186,14 @@ int crypto_decrypt_packet_auto_by_action(
         uint8_t ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
         if (ip_hdr_len < 20)
             return 0;
-        if (*pkt_len < (uint32_t)(l3_off + ip_hdr_len + 4))
+        if (*pkt_len < (uint32_t)(l3_off + ip_hdr_len + 8))
             return 0;
 
         uint8_t ip_proto = pkt[l3_off + 9];
-        if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
+        if (ip_proto != 6 && ip_proto != 17)
             return 0;
+
         int transport_off = l3_off + ip_hdr_len;
-        if (transport_off >= (int)*pkt_len)
-            return 0;
         if (*pkt_len < (uint32_t)(transport_off + 4))
             return 0;
 
@@ -204,8 +203,8 @@ int crypto_decrypt_packet_auto_by_action(
             return 0;
         int pi = lookup_policy_index(dctx,
                                      dctx->policies, dctx->policy_count,
-                                     dctx->policy_index_by_wire_id,
-                                     policy_id);
+                                     dctx->policy_index_by_action_id,
+                                     POLICY_ACTION_ENCRYPT_L4, policy_id);
         if (pi >= 0 && dctx->per_policy_ready && dctx->per_policy_ready[pi]) {
             const struct crypto_policy *cp = &dctx->policies[pi];
             crypto_apply_from_policy(cp);
@@ -219,8 +218,8 @@ int crypto_decrypt_packet_auto_by_action(
         if (dctx->prev_grace_active && dctx->prev_policies && dctx->prev_policy_count > 0) {
             int ppi = lookup_policy_index(dctx,
                                           dctx->prev_policies, dctx->prev_policy_count,
-                                          dctx->prev_policy_index_by_wire_id,
-                                          policy_id);
+                                          dctx->prev_policy_index_by_action_id,
+                                          POLICY_ACTION_ENCRYPT_L4, policy_id);
             if (ppi >= 0 && dctx->prev_per_policy_ready && dctx->prev_per_policy_ready[ppi]) {
                 const struct crypto_policy *cp_prev = &dctx->prev_policies[ppi];
                 crypto_apply_from_policy(cp_prev);
