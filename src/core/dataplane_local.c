@@ -111,14 +111,46 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         uint32_t l1 = 0, l2 = 0;
 
         if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(len)) {
+            static atomic_uint split_l2_n;
+            uint32_t sn = atomic_fetch_add(&split_l2_n, 1);
+            /* #region agent log */
+            if (sn < 30 || (sn % 256 == 0)) {
+                char dj[200];
+                snprintf(dj, sizeof(dj),
+                         "{\"plain_len\":%u,\"mode\":%d,\"frag_meta\":%d,\"mtu\":%u,\"n\":%u}",
+                         len, packet_crypto_get_mode(), crypto_layer2_frag_meta_len(),
+                         frag_get_mtu(), sn);
+                ne_agent_debug_log("L2", "dataplane_local.c:encrypt_to_wan",
+                                   "split_l2_enter", dj);
+            }
+            /* #endregion */
         if (split_tail_take(fwd, worker_idx, &tail.addr) != 0)
                 return -1;
             tail_buf = ne_packet_data(&fwd->pair, tail.addr);
             if (frag_split_and_encrypt_l2(pctx, pkt, len, fwd->pair.frame_size, &l1,
                                         tail_buf, fwd->pair.frame_size, &l2) != 0) {
+                /* #region agent log */
+                {
+                    char dj[160];
+                    snprintf(dj, sizeof(dj),
+                             "{\"plain_len\":%u,\"mode\":%d,\"frame_max\":%u}",
+                             len, packet_crypto_get_mode(), fwd->pair.frame_size);
+                    ne_agent_debug_log("L2", "dataplane_local.c:encrypt_to_wan",
+                                       "split_l2_failed", dj);
+                }
+                /* #endregion */
                 ne_frame_free(&fwd->pair, tail.addr);
                 return -1;
             }
+            /* #region agent log */
+            if (sn < 30 || (sn % 256 == 0)) {
+                char dj[128];
+                snprintf(dj, sizeof(dj), "{\"frag0_wire\":%u,\"frag1_wire\":%u,\"n\":%u}",
+                         l1, l2, sn);
+                ne_agent_debug_log("L2", "dataplane_local.c:encrypt_to_wan",
+                                   "split_l2_ok", dj);
+            }
+            /* #endregion */
         } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(len)) {
             static atomic_uint split_l3_n;
             uint32_t sn = atomic_fetch_add(&split_l3_n, 1);
@@ -171,9 +203,23 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
             }
         } else {
             int n = -1;
-            if (cp->action == POLICY_ACTION_ENCRYPT_L2)
+            if (cp->action == POLICY_ACTION_ENCRYPT_L2) {
                 n = crypto_layer2_encrypt(pctx, pkt, len);
-            else if (cp->action == POLICY_ACTION_ENCRYPT_L3)
+                /* #region agent log */
+                if (n > 0) {
+                    static atomic_uint l2_full_n;
+                    uint32_t fn = atomic_fetch_add(&l2_full_n, 1);
+                    if (fn < 20 || (fn % 512 == 0)) {
+                        char dj[128];
+                        snprintf(dj, sizeof(dj),
+                                 "{\"plain_len\":%u,\"wire_len\":%d,\"mode\":%d,\"n\":%u}",
+                                 len, n, packet_crypto_get_mode(), fn);
+                        ne_agent_debug_log("L2", "dataplane_local.c:encrypt_to_wan",
+                                           "encrypt_l2_full_ok", dj);
+                    }
+                }
+                /* #endregion */
+            } else if (cp->action == POLICY_ACTION_ENCRYPT_L3)
                 n = crypto_layer3_encrypt(pctx, pkt, len);
             else if (cp->action == POLICY_ACTION_ENCRYPT_L4)
                 n = crypto_layer4_encrypt(pctx, pkt, len);

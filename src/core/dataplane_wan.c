@@ -117,18 +117,64 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     if (slot < 0)
         return -1;
     nd = crypto_layer2_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx, &fsig);
-    if (nd < 0)
+    if (nd < 0) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"wire_len\":%u,\"policy\":%u,\"frag_idx\":%u}",
+                     *len, policy_id, ofidx);
+            ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
+                               "l2_decrypt_frag_failed", dj);
+        }
+        /* #endregion */
         return -1;
-    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
+    }
+    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, 0),
                                 pkt, (uint32_t)nd, opid, ofidx, fsig, buf, &blen);
     if (rr == 0) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"pkt_id\":%u,\"frag_idx\":%u,\"nd\":%d}",
+                     opid, ofidx, nd);
+            ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
+                               "l2_reassemble_pending", dj);
+        }
+        /* #endregion */
         *pending = 1;
         return 0;
     }
-    if (rr != 1)
+    if (rr != 1) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"pkt_id\":%u,\"frag_idx\":%u,\"rr\":%d,\"nd\":%d}",
+                     opid, ofidx, rr, nd);
+            ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
+                               "l2_reassemble_failed", dj);
+        }
+        /* #endregion */
         return -1;
+    }
     memcpy(pkt, buf, blen);
     *len = blen;
+    /* #region agent log */
+    {
+        static atomic_uint join_ok_n;
+        uint32_t jn = atomic_fetch_add(&join_ok_n, 1);
+        if (jn < 40 || (jn % 256 == 0)) {
+            char dj[160];
+            snprintf(dj, sizeof(dj),
+                     "{\"pkt_id\":%u,\"frag_idx\":%u,\"out_len\":%u,\"n\":%u}",
+                     opid, ofidx, blen, jn);
+            ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
+                               "l2_reassemble_join_ok", dj);
+        }
+    }
+    /* #endregion */
     return 0;
 }
 
@@ -242,57 +288,83 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 
     {
         int frag_mark = 0;
-        int ns = PACKET_CRYPTO_NONCE_BYTES;
-        int mark_off;
+        int is_frag = 0;
         uint32_t orig_len = len;
         uint8_t wire_pol = 0;
 
         wan_apply_l2_policy(fwd, pkt, len);
-        mark_off = crypto_layer2_frag_magic_off(pkt, len, ns);
-        if (mark_off >= 0 && len > (uint32_t)mark_off)
-            frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
+        frag_mark = crypto_layer2_has_fragment_marker(pkt, len);
+        is_frag = frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
 
-        int need_backup = frag_mark ||
-            frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
+        int need_backup = frag_mark || is_frag;
         if (need_backup && orig_len <= sizeof(scratch))
             memcpy(scratch, pkt, orig_len);
         int l2_rc = decrypt_l2(pkt, &len);
         int l2_plain = wan_l2_plain_ipv4(pkt, len);
-        if (l2_rc != 0 || !l2_plain) {
+        if (l2_rc == 0 && l2_plain) {
+            /* #region agent log */
+            static atomic_uint l2_full_ok_n;
+            uint32_t okn = atomic_fetch_add(&l2_full_ok_n, 1);
+            if (okn < 30 || (okn % 512 == 0)) {
+                char dj[128];
+                snprintf(dj, sizeof(dj),
+                         "{\"wire_len\":%u,\"plain_len\":%u,\"n\":%u}",
+                         orig_len, len, okn);
+                ne_agent_debug_log("L2", "dataplane_wan.c:decrypt_wan",
+                                   "l2_full_decrypt_ok", dj);
+            }
+            /* #endregion */
+        } else if (l2_rc != 0 || !l2_plain) {
             if (need_backup)
                 memcpy(pkt, scratch, orig_len);
             len = orig_len;
             if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
                 if (crypto_layer2_read_policy_id(pkt, len, &wire_pol) != 0) {
                     /* #region agent log */
-                    ne_agent_debug_log("F", "dataplane_wan.c:decrypt_wan",
-                                       "stage_l2_frag_policy_failed", "{}");
+                    ne_agent_debug_log("L2", "dataplane_wan.c:decrypt_wan",
+                                       "l2_frag_policy_read_failed", "{}");
                     /* #endregion */
                     return -1;
                 }
                 if (reassemble_l2(fwd, pkt, &len, wire_pol, &pending) != 0) {
                     /* #region agent log */
                     {
-                        char dj[128];
+                        char dj[160];
                         snprintf(dj, sizeof(dj),
-                                 "{\"wire_len\":%u,\"policy\":%u,\"frag_idx\":%u}",
-                                 orig_len, wire_pol, fidx);
-                        ne_agent_debug_log("F", "dataplane_wan.c:decrypt_wan",
-                                           "stage_l2_frag_reassemble_failed", dj);
+                                 "{\"wire_len\":%u,\"policy\":%u,\"pkt_id\":%u,\"frag_idx\":%u}",
+                                 orig_len, wire_pol, pid, fidx);
+                        ne_agent_debug_log("L2", "dataplane_wan.c:decrypt_wan",
+                                           "l2_frag_reassemble_failed", dj);
                     }
                     /* #endregion */
                     return -1;
                 }
+                if (!pending) {
+                    /* #region agent log */
+                    static atomic_uint l2_frag_ok_n;
+                    uint32_t fon = atomic_fetch_add(&l2_frag_ok_n, 1);
+                    if (fon < 40 || (fon % 256 == 0)) {
+                        char dj[160];
+                        snprintf(dj, sizeof(dj),
+                                 "{\"wire_in\":%u,\"plain_len\":%u,\"pkt_id\":%u,\"n\":%u}",
+                                 orig_len, len, pid, fon);
+                        ne_agent_debug_log("L2", "dataplane_wan.c:decrypt_wan",
+                                           "l2_frag_reassemble_ok", dj);
+                    }
+                    /* #endregion */
+                }
             } else {
                 /* #region agent log */
                 {
-                    char dj[160];
+                    char dj[220];
                     snprintf(dj, sizeof(dj),
                              "{\"wire_len\":%u,\"l2_rc\":%d,\"plain_ipv4\":%d,"
-                             "\"frag_mark\":%d,\"need_backup\":%d}",
-                             orig_len, l2_rc, l2_plain, frag_mark, need_backup);
-                    ne_agent_debug_log("F", "dataplane_wan.c:decrypt_wan",
-                                       "stage_l2_rejected_nonfragment", dj);
+                             "\"frag_mark\":%d,\"is_frag\":%d,\"pkt_id\":%u,\"frag_idx\":%u,"
+                             "\"has_fake_et\":%d}",
+                             orig_len, l2_rc, l2_plain, frag_mark, is_frag, pid, fidx,
+                             crypto_layer2_has_fake_ethertype(pkt, len));
+                    ne_agent_debug_log("L2", "dataplane_wan.c:decrypt_wan",
+                                       "l2_rejected_nonfragment", dj);
                 }
                 /* #endregion */
                 return -1;
@@ -582,6 +654,18 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     dec = decrypt_wan(fwd, &job);
     if (dec == 1) {
+        /* #region agent log */
+        {
+            static atomic_uint l2_pend_n;
+            uint32_t pn = atomic_fetch_add(&l2_pend_n, 1);
+            if (pn < 40 || (pn % 256 == 0)) {
+                char dj[96];
+                snprintf(dj, sizeof(dj), "{\"wire_len\":%u,\"n\":%u}", wire_len, pn);
+                ne_agent_debug_log("L2", "dataplane_wan.c:dataplane_process_wan",
+                                   "l2_frag_pending_hold", dj);
+            }
+        }
+        /* #endregion */
         ne_frame_free(&fwd->pair, job.addr);
         return;
     }
@@ -591,12 +675,27 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             char dj[128];
             snprintf(dj, sizeof(dj), "{\"wire_len\":%u,\"dec\":%d,\"mode\":%d}",
                      wire_len, dec, packet_crypto_get_mode());
-            ne_agent_debug_log("C", "dataplane_wan.c:dataplane_process_wan",
+            ne_agent_debug_log("L2", "dataplane_wan.c:dataplane_process_wan",
                                "wan_decrypt_drop", dj);
         }
         /* #endregion */
         goto drop;
     }
+
+    /* #region agent log */
+    {
+        static atomic_uint l2_fwd_n;
+        uint32_t fn = atomic_fetch_add(&l2_fwd_n, 1);
+        if (fn < 40 || (fn % 512 == 0)) {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"wire_in\":%u,\"plain_len\":%u,\"n\":%u}",
+                     wire_len, job.len, fn);
+            ne_agent_debug_log("L2", "dataplane_wan.c:dataplane_process_wan",
+                               "wan_l2_forward_ok", dj);
+        }
+    }
+    /* #endregion */
 
     if (forward_wan_to_local(fwd, &job, wire_buf, wire_len) != 0)
         goto drop;

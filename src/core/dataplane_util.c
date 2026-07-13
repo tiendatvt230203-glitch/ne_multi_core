@@ -14,7 +14,8 @@
 
 /* #region agent log */
 #define NE_AGENT_DEBUG_LOG_PATH "/var/log/network-encryptor.log"
-#define NE_AGENT_DEBUG_MAX 800
+#define NE_AGENT_DEBUG_MAX      3000
+#define NE_AGENT_DEBUG_RUN_ID   "post-fix"
 
 void ne_agent_debug_log(const char *hypothesis_id, const char *location,
                         const char *message, const char *data_json)
@@ -34,9 +35,9 @@ void ne_agent_debug_log(const char *hypothesis_id, const char *location,
     clock_gettime(CLOCK_REALTIME, &ts);
     long long ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
     fprintf(f,
-            "{\"sessionId\":\"0173da\",\"timestamp\":%lld,\"hypothesisId\":\"%s\","
-            "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s}\n",
-            ms, hypothesis_id, location, message,
+            "{\"sessionId\":\"0173da\",\"runId\":\"%s\",\"timestamp\":%lld,"
+            "\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":%s}\n",
+            NE_AGENT_DEBUG_RUN_ID, ms, hypothesis_id, location, message,
             data_json ? data_json : "{}");
     fclose(f);
 }

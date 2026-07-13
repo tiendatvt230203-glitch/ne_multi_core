@@ -82,6 +82,26 @@ int crypto_layer2_has_fake_ethertype(const uint8_t *packet, size_t pkt_len)
     return et == fake;
 }
 
+int crypto_layer2_has_fragment_marker(const uint8_t *packet, size_t pkt_len)
+{
+    int magic_off;
+
+    if (!crypto_layer2_has_fake_ethertype(packet, pkt_len))
+        return 0;
+    magic_off = crypto_layer2_frag_magic_off(packet, pkt_len, PACKET_CRYPTO_NONCE_BYTES);
+    if (magic_off < 0)
+        return 0;
+    if (pkt_len < (size_t)(magic_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
+        return 0;
+    if (packet[magic_off] != L2_FRAG_MAGIC)
+        return 0;
+    if (packet[magic_off + 3] > 1)
+        return 0;
+    if (packet[magic_off + 4] != 0)
+        return 0;
+    return 1;
+}
+
 int crypto_layer2_read_policy_id(const uint8_t *packet, size_t pkt_len, uint8_t *policy_id_out)
 {
     int off = crypto_layer2_policy_off(packet, pkt_len);
@@ -260,7 +280,6 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
     int enc_start;
-    int frag_magic_off;
     int wire_ns = l2_wire_nonce_size();
 
     if (unlikely(!ctx || !ctx->initialized || !packet))
@@ -272,9 +291,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (enc_start < 0)
         return -1;
 
-    frag_magic_off = crypto_layer2_frag_magic_off(packet, pkt_len, wire_ns);
-    if (frag_magic_off >= 0 && pkt_len >= (size_t)(frag_magic_off + 1) &&
-        packet[frag_magic_off] == L2_FRAG_MAGIC)
+    if (crypto_layer2_has_fragment_marker(packet, pkt_len))
         return (int)pkt_len;
 
     if (crypto_mode_is_pqc()) {

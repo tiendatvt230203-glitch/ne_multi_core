@@ -167,7 +167,7 @@ static int frag_pick_slot_l2(struct frag_table *ft, uint16_t pkt_id, uint32_t fr
                 empty_idx = idx;
             continue;
         }
-        if (e->pkt_id == pkt_id && e->has_sig && e->frag_sig == frag_sig)
+        if (e->pkt_id == pkt_id)
             return idx;
 
         uint64_t age = now - e->timestamp_ns;
@@ -433,8 +433,7 @@ int frag_is_fragment_l2(const struct app_config *cfg,
     if (pkt_len < (uint32_t)(tag_off + 1 + CRYPTO_L2_FRAG_TAG_SIZE))
         return 0;
 
-    /* Non-frag L2 crypto hits this on every WAN packet — bail before policy scan. */
-    if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
+    if (!crypto_layer2_has_fragment_marker(pkt_data, pkt_len))
         return 0;
 
     if (crypto_layer2_read_policy_id(pkt_data, pkt_len, &wire_pol) != 0)
