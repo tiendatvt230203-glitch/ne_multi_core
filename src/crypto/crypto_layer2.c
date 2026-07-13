@@ -353,6 +353,24 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     }
 }
 
+uint32_t crypto_layer2_frag_flow_sig(const uint8_t *packet, size_t pkt_len,
+                                     uint16_t pkt_id, uint8_t policy_id)
+{
+    uint32_t h = 2166136261u;
+
+    h ^= (uint32_t)pkt_id;
+    h *= 16777619u;
+    h ^= policy_id;
+    h *= 16777619u;
+    if (packet && pkt_len >= 12) {
+        for (int i = 0; i < 12; i++) {
+            h ^= packet[i];
+            h *= 16777619u;
+        }
+    }
+    return h ? h : 1u;
+}
+
 static void l2_write_frag_tag(uint8_t *buf, uint16_t pkt_id, uint8_t frag_index)
 {
     buf[0] = (uint8_t)(pkt_id >> 8);
@@ -365,21 +383,6 @@ static void l2_read_frag_tag(const uint8_t *buf, uint16_t *pkt_id, uint8_t *frag
 {
     *pkt_id = ((uint16_t)buf[0] << 8) | buf[1];
     *frag_index = buf[2];
-}
-
-static uint32_t l2_frag_sig(const uint8_t *nonce, int nonce_len, uint8_t policy_id)
-{
-    uint32_t h = 2166136261u;
-
-    if (!nonce || nonce_len <= 0)
-        return (uint32_t)policy_id;
-    for (int i = 0; i < nonce_len; i++) {
-        h ^= nonce[i];
-        h *= 16777619u;
-    }
-    h ^= policy_id;
-    h *= 16777619u;
-    return h ? h : 1u;
 }
 
 int crypto_layer2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
@@ -518,7 +521,8 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
             uint8_t wire_policy = 0;
             if (crypto_layer2_read_policy_id(packet, pkt_len, &wire_policy) != 0)
                 return -1;
-            *out_frag_sig = l2_frag_sig(nonce, nonce_size, wire_policy);
+            *out_frag_sig = crypto_layer2_frag_flow_sig(packet, pkt_len,
+                                                        *out_pkt_id, wire_policy);
         }
 
         if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
@@ -561,7 +565,8 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
             uint8_t wire_policy = 0;
             if (crypto_layer2_read_policy_id(packet, pkt_len, &wire_policy) != 0)
                 return -1;
-            *out_frag_sig = l2_frag_sig(packet + nonce_off, wire_ns, wire_policy);
+            *out_frag_sig = crypto_layer2_frag_flow_sig(packet, pkt_len,
+                                                        *out_pkt_id, wire_policy);
         }
 
         total_after = pkt_len - (size_t)enc_off;

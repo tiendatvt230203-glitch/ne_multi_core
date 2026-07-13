@@ -130,17 +130,22 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
         /* #endregion */
         return -1;
     }
-    rr = frag_try_reassemble_l2(fwd_crypto_frag_l2(slot, 0),
-                                pkt, (uint32_t)nd, opid, ofidx, fsig, buf, &blen);
+    rr = frag_try_reassemble_l2(
+        fwd_crypto_frag_l2(slot, dp_crypto_current_worker_idx()),
+        pkt, (uint32_t)nd, opid, ofidx, fsig, buf, &blen);
     if (rr == 0) {
         /* #region agent log */
         {
-            char dj[128];
-            snprintf(dj, sizeof(dj),
-                     "{\"pkt_id\":%u,\"frag_idx\":%u,\"nd\":%d}",
-                     opid, ofidx, nd);
-            ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
-                               "l2_reassemble_pending", dj);
+            static atomic_uint pend_n;
+            uint32_t pn = atomic_fetch_add(&pend_n, 1);
+            if (pn < 20 || (pn % 512 == 0)) {
+                char dj[128];
+                snprintf(dj, sizeof(dj),
+                         "{\"pkt_id\":%u,\"frag_idx\":%u,\"sig\":%u,\"wi\":%d,\"n\":%u}",
+                         opid, ofidx, fsig, dp_crypto_current_worker_idx(), pn);
+                ne_agent_debug_log("L2", "dataplane_wan.c:reassemble_l2",
+                                   "l2_reassemble_pending", dj);
+            }
         }
         /* #endregion */
         *pending = 1;

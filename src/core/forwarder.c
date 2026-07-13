@@ -4,6 +4,7 @@
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/dataplane.h"
 #include "../../inc/core/crypto_route.h"
+#include "../../inc/core/dataplane_util.h"
 
 #include "../../inc/core/main_diag.h"
 #include "../../inc/core/interface.h"
@@ -230,6 +231,20 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
+                /* #region agent log */
+                {
+                    static atomic_uint wan_ring_drop_n;
+                    uint32_t dn = atomic_fetch_add(&wan_ring_drop_n, 1);
+                    if (dn < 20 || (dn % 256 == 0)) {
+                        char dj[128];
+                        snprintf(dj, sizeof(dj),
+                                 "{\"wi\":%d,\"ring_cnt\":%u,\"n\":%u}",
+                                 wi, ne_ring_count(&fwd->wan_to_mid[wi]), dn);
+                        ne_agent_debug_log("L2", "forwarder.c:wan_rx_thread",
+                                           "wan_crypto_ring_drop", dj);
+                    }
+                }
+                /* #endregion */
                 ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
                                    ne_ring_count(&fwd->wan_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);

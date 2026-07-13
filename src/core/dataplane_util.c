@@ -15,7 +15,7 @@
 /* #region agent log */
 #define NE_AGENT_DEBUG_LOG_PATH "/var/log/network-encryptor.log"
 #define NE_AGENT_DEBUG_MAX      3000
-#define NE_AGENT_DEBUG_RUN_ID   "post-fix"
+#define NE_AGENT_DEBUG_RUN_ID   "post-fix-gcm256"
 
 void ne_agent_debug_log(const char *hypothesis_id, const char *location,
                         const char *message, const char *data_json)

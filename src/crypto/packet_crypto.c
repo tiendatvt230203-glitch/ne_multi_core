@@ -4,10 +4,9 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/crypto/types.h"
-#include "../../inc/crypto/traffic_crypto.h"
-#include "../../inc/crypto/scrypt.h"
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -41,6 +40,30 @@ static __thread int tls_ctr_key_len;
 
 static __thread uint8_t tls_nonce_salt[16];
 static __thread int tls_salt_initialized;
+
+/* #region agent log */
+static void gcm_perf_sample(const char *op, int len, uint64_t elapsed_ns)
+{
+    static atomic_uint sample_n;
+
+    if ((atomic_fetch_add(&sample_n, 1) % 4096u) != 0)
+        return;
+
+    FILE *f = fopen("/var/log/network-encryptor.log", "a");
+    if (!f)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long long ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    fprintf(f,
+            "{\"sessionId\":\"0173da\",\"runId\":\"post-fix-gcm256\",\"timestamp\":%lld,"
+            "\"hypothesisId\":\"H-A\",\"location\":\"packet_crypto.c:gcm\",\"message\":\"%s\","
+            "\"data\":{\"aes_bits\":%d,\"path\":\"openssl\",\"len\":%d,\"ns\":%llu}}\n",
+            ms, op, g_aes_bits, len, (unsigned long long)elapsed_ns);
+    fclose(f);
+}
+/* #endregion */
 
 static EVP_CIPHER_CTX *tls_ctx_get(EVP_CIPHER_CTX **slot)
 {
@@ -349,30 +372,19 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t i
 int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len, uint8_t tag_out[AES_GCM_TAG_SIZE])
 {
-    if (g_aes_bits == 256) {
-        SCryptCipherCtx *sctx;
-        int new_len = 0;
-        int rc;
-
-        sctx = scrypt_CipherCtxNew();
-        if (!sctx)
-            return -1;
-        rc = trf_encrypt_payload_gcm(sctx, key, nonce, nonce_len, NULL, 0, data, len, &new_len);
-        scrypt_CipherCtxFree(sctx);
-        if (rc != TRF_PQC_OK || new_len < len + AES_GCM_TAG_SIZE)
-            return -1;
-        memcpy(tag_out, data + len, AES_GCM_TAG_SIZE);
-        return 0;
-    }
-
     EVP_CIPHER_CTX *evp;
     int out_len;
+    uint64_t t0;
+    struct timespec ts;
 
     if (len <= 0)
         return 0;
     if (!key || !nonce || !data || !tag_out)
-        return -1;  
-    
+        return -1;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    t0 = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
     evp = tls_ctx_get(&tls_gcm_enc_ctx);
     if (!evp) {
         printf("Het ram gcm\n");
@@ -400,51 +412,28 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
         tls_gcm_invalidate_enc();
         return -1;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    gcm_perf_sample("gcm_encrypt", len,
+                    (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - t0);
     return 0;
 }
 
 int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *nonce, int nonce_len,
                            uint8_t *data, int len, const uint8_t tag[AES_GCM_TAG_SIZE])
-{  
-    if (g_aes_bits == 256) {
-        SCryptCipherCtx *sctx;
-        uint8_t *buf;
-        int total_len;
-        int orig_len = 0;
-        int rc;
-
-        if (!data || len < 0 || !tag)
-            return -1;
-        total_len = len + AES_GCM_TAG_SIZE;
-        buf = malloc((size_t)total_len);
-        if (!buf)
-            return -1;
-        memcpy(buf, data, (size_t)len);
-        memcpy(buf + len, tag, AES_GCM_TAG_SIZE);
-
-        sctx = scrypt_CipherCtxNew();
-        if (!sctx) {
-            free(buf);
-            return -1;
-        }
-        rc = trf_decrypt_payload_gcm(sctx, key, nonce, nonce_len, NULL, 0, buf, total_len, &orig_len);
-        scrypt_CipherCtxFree(sctx);
-        if (rc != TRF_PQC_OK || orig_len < 0 || orig_len > len) {
-            free(buf);
-            return -1;
-        }
-        memcpy(data, buf, (size_t)orig_len);
-        free(buf);
-        return 0;
-    }
-
+{
     EVP_CIPHER_CTX *evp;
     int out_len;
+    uint64_t t0;
+    struct timespec ts;
 
     if (len <= 0)
         return 0;
     if (!key || !nonce || !data || !tag)
         return -1;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    t0 = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
     evp = tls_ctx_get(&tls_gcm_dec_ctx);
     if (!evp)
@@ -472,6 +461,10 @@ int crypto_aes_gcm_decrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
         tls_gcm_invalidate_dec();
         return -1;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    gcm_perf_sample("gcm_decrypt", len,
+                    (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - t0);
     return 0;
 }
 

@@ -29,6 +29,8 @@ int crypto_layer2_frag_magic_off(const uint8_t *packet, size_t pkt_len, int nonc
 int crypto_layer2_has_fake_ethertype(const uint8_t *packet, size_t pkt_len);
 int crypto_layer2_has_fragment_marker(const uint8_t *packet, size_t pkt_len);
 int crypto_layer2_read_policy_id(const uint8_t *packet, size_t pkt_len, uint8_t *policy_id_out);
+uint32_t crypto_layer2_frag_flow_sig(const uint8_t *packet, size_t pkt_len,
+                                     uint16_t pkt_id, uint8_t policy_id);
 int crypto_layer2_wire_prefix_len(const uint8_t *packet, size_t pkt_len);
 
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len);

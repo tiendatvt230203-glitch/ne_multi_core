@@ -6,6 +6,7 @@
 #include "../../inc/crypto/crypto_layer3.h"
 #include "../../inc/crypto/crypto_layer4.h"
 #include "../../inc/core/config.h"
+#include "../../inc/core/dataplane_util.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -167,7 +168,7 @@ static int frag_pick_slot_l2(struct frag_table *ft, uint16_t pkt_id, uint32_t fr
                 empty_idx = idx;
             continue;
         }
-        if (e->pkt_id == pkt_id)
+        if (e->pkt_id == pkt_id && e->has_sig && e->frag_sig == frag_sig)
             return idx;
 
         uint64_t age = now - e->timestamp_ns;
@@ -179,8 +180,24 @@ static int frag_pick_slot_l2(struct frag_table *ft, uint16_t pkt_id, uint32_t fr
 
     if (empty_idx >= 0)
         return empty_idx;
-    if (oldest_idx >= 0)
+    if (oldest_idx >= 0) {
+        struct frag_entry *oe = &ft->entries[oldest_idx];
+        if (oe->got_first || oe->got_second) {
+            /* #region agent log */
+            static atomic_uint evict_n;
+            uint32_t en = atomic_fetch_add(&evict_n, 1);
+            if (en < 30 || (en % 512 == 0)) {
+                char dj[160];
+                snprintf(dj, sizeof(dj),
+                         "{\"pkt_id\":%u,\"sig\":%u,\"got0\":%d,\"got1\":%d,\"n\":%u}",
+                         oe->pkt_id, oe->frag_sig, oe->got_first, oe->got_second, en);
+                ne_agent_debug_log("L2", "fragment.c:frag_pick_slot_l2",
+                                   "l2_slot_evicted", dj);
+            }
+            /* #endregion */
+        }
         return oldest_idx;
+    }
     return base;
 }
 
