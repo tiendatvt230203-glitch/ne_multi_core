@@ -401,6 +401,31 @@ static int crypto_policy_match_packet(const struct crypto_policy *cp,
     return 1;
 }
 
+static int crypto_policy_matches_flow(const struct crypto_policy *cp,
+                                      uint32_t src_ip, uint32_t dst_ip,
+                                      uint16_t src_port, uint16_t dst_port,
+                                      uint8_t protocol)
+{
+    if (crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol))
+        return 1;
+    return crypto_policy_match_packet(cp, dst_ip, src_ip, dst_port, src_port, protocol);
+}
+
+static void crypto_policy_consider(const struct crypto_policy *cp,
+                                   const struct crypto_policy **best,
+                                   int *best_priority, int *best_id)
+{
+    if (!cp || !best || !best_priority || !best_id)
+        return;
+    if (!*best ||
+        cp->priority < *best_priority ||
+        (cp->priority == *best_priority && cp->id < *best_id)) {
+        *best = cp;
+        *best_priority = cp->priority;
+        *best_id = cp->id;
+    }
+}
+
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
@@ -410,9 +435,10 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
         return NULL;
 
     const struct profile_config *p = &cfg->profiles[profile_idx];
-    const struct crypto_policy *best = NULL;
-    int best_priority = 0x7fffffff;
-    int best_id = 0x7fffffff;
+    const struct crypto_policy *best_encrypt = NULL;
+    const struct crypto_policy *best_bypass = NULL;
+    int enc_pri = 0x7fffffff, enc_id = 0x7fffffff;
+    int bypass_pri = 0x7fffffff, bypass_id = 0x7fffffff;
 
     for (int i = 0; i < p->policy_count; i++) {
         int pi = p->policy_indices[i];
@@ -420,22 +446,17 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
             continue;
 
         const struct crypto_policy *cp = &cfg->policies[pi];
-        int matched = crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol);
-        if (!matched)
-            matched = crypto_policy_match_packet(cp, dst_ip, src_ip, dst_port, src_port, protocol);
-        if (!matched)
+        if (!crypto_policy_matches_flow(cp, src_ip, dst_ip, src_port, dst_port, protocol))
             continue;
 
-        if (!best ||
-            cp->priority < best_priority ||
-            (cp->priority == best_priority && cp->id < best_id)) {
-            best = cp;
-            best_priority = cp->priority;
-            best_id = cp->id;
-        }
+        if (cp->action == POLICY_ACTION_BYPASS)
+            crypto_policy_consider(cp, &best_bypass, &bypass_pri, &bypass_id);
+        else
+            crypto_policy_consider(cp, &best_encrypt, &enc_pri, &enc_id);
     }
 
-    return best;
+    /* Encrypt/L2/L3/L4 always beat bypass; bypass is catch-all fallback only. */
+    return best_encrypt ? best_encrypt : best_bypass;
 }
 
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network) {

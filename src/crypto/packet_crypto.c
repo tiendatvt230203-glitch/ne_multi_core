@@ -311,10 +311,8 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t i
         return 0;
 
     evp = tls_ctx_get(&tls_ctr_ctx);
-    if (!evp){
-        printf("Het ram\n");
+    if (!evp)
         return -1;
-    }
 
     ks = key_size_bytes();
     if (tls_ctr_key_len != ks) {
@@ -357,10 +355,8 @@ int crypto_aes_gcm_encrypt(const uint8_t key[AES_MAX_KEY_SIZE], const uint8_t *n
         return -1;  
     
     evp = tls_ctx_get(&tls_gcm_enc_ctx);
-    if (!evp) {
-        printf("Het ram gcm\n");
+    if (!evp)
         return -1;
-    }
     if (gcm_bind_key(evp, 1, key, nonce_len, tls_gcm_enc_key, &tls_gcm_enc_key_len,
                      &tls_gcm_enc_nonce_len) != 0) {
         tls_gcm_invalidate_enc();

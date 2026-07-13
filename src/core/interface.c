@@ -74,39 +74,25 @@ void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
 
 void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth)
 {
-    int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
-
-    dp_warn_once(id, 1,
-                 "core=%d RX %s saturated worker=%d q_depth=%u (crypto queue full)",
-                 cpu, dir ? dir : "?", worker, q_depth);
+    (void)dir;
+    (void)cpu;
+    (void)worker;
+    (void)q_depth;
 }
 
 void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
 {
-    int id;
-    int active;
-
-    if (!tls_dp_tx_dir || tls_dp_tx_slot < 0 || tls_dp_tx_slot >= (int)NE_TX_SLOTS)
-        return;
-    if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
-        id = NE_DP_WARN_TX_LAN0 + tls_dp_tx_slot;
-    else
-        id = NE_DP_WARN_TX_WAN0 + tls_dp_tx_slot;
-    active = tx_full && pending > 0;
-    dp_warn_once(id, active,
-                 "core=%d TX %s slot=%d saturated pending=%u (TX ring full)",
-                 cpu, tls_dp_tx_dir, tls_dp_tx_slot, pending);
+    (void)cpu;
+    (void)tx_full;
+    (void)pending;
 }
 
 void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)
 {
-    uint32_t hi = (NE_RING * 7u) / 8u;
-
-    if (worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
-        return;
-    dp_warn_once(NE_DP_WARN_CRYPTO0 + worker, lan_q >= hi || wan_q >= hi,
-                 "core=%d crypto saturated worker=%d lan_q=%u wan_q=%u",
-                 cpu, worker, lan_q, wan_q);
+    (void)cpu;
+    (void)worker;
+    (void)lan_q;
+    (void)wan_q;
 }
 
 static uint32_t next_pow2_u32(uint32_t v)
