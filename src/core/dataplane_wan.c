@@ -256,16 +256,45 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
             frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);
         if (need_backup && orig_len <= sizeof(scratch))
             memcpy(scratch, pkt, orig_len);
-        if (decrypt_l2(pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
+        int l2_rc = decrypt_l2(pkt, &len);
+        int l2_plain = wan_l2_plain_ipv4(pkt, len);
+        if (l2_rc != 0 || !l2_plain) {
             if (need_backup)
                 memcpy(pkt, scratch, orig_len);
             len = orig_len;
             if (frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (crypto_layer2_read_policy_id(pkt, len, &wire_pol) != 0)
+                if (crypto_layer2_read_policy_id(pkt, len, &wire_pol) != 0) {
+                    /* #region agent log */
+                    ne_agent_debug_log("F", "dataplane_wan.c:decrypt_wan",
+                                       "stage_l2_frag_policy_failed", "{}");
+                    /* #endregion */
                     return -1;
-                if (reassemble_l2(fwd, pkt, &len, wire_pol, &pending) != 0)
+                }
+                if (reassemble_l2(fwd, pkt, &len, wire_pol, &pending) != 0) {
+                    /* #region agent log */
+                    {
+                        char dj[128];
+                        snprintf(dj, sizeof(dj),
+                                 "{\"wire_len\":%u,\"policy\":%u,\"frag_idx\":%u}",
+                                 orig_len, wire_pol, fidx);
+                        ne_agent_debug_log("F", "dataplane_wan.c:decrypt_wan",
+                                           "stage_l2_frag_reassemble_failed", dj);
+                    }
+                    /* #endregion */
                     return -1;
+                }
             } else {
+                /* #region agent log */
+                {
+                    char dj[160];
+                    snprintf(dj, sizeof(dj),
+                             "{\"wire_len\":%u,\"l2_rc\":%d,\"plain_ipv4\":%d,"
+                             "\"frag_mark\":%d,\"need_backup\":%d}",
+                             orig_len, l2_rc, l2_plain, frag_mark, need_backup);
+                    ne_agent_debug_log("F", "dataplane_wan.c:decrypt_wan",
+                                       "stage_l2_rejected_nonfragment", dj);
+                }
+                /* #endregion */
                 return -1;
             }
         }
@@ -280,28 +309,74 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 
     dctx = fwd_crypto_make_dispatch_ctx();
     if (frag_is_fragment(fwd->cfg, pkt, len, &pid, &fidx)) {
-        if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) != 0)
+        if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) != 0) {
+            /* #region agent log */
+            ne_agent_debug_log("H", "dataplane_wan.c:decrypt_wan",
+                               "stage_l3_frag_policy_failed", "{}");
+            /* #endregion */
             return -1;
-        if (reassemble_l3(fwd, pkt, &len, pol, &pending) != 0)
+        }
+        if (reassemble_l3(fwd, pkt, &len, pol, &pending) != 0) {
+            /* #region agent log */
+            {
+                char dj[128];
+                snprintf(dj, sizeof(dj),
+                         "{\"wire_len\":%u,\"policy\":%u,\"frag_idx\":%u}",
+                         job->len, pol, fidx);
+                ne_agent_debug_log("H", "dataplane_wan.c:decrypt_wan",
+                                   "stage_l3_frag_reassemble_failed", dj);
+            }
+            /* #endregion */
             return -1;
+        }
     } else if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) == 0 &&
                crypto_decrypt_packet_auto_by_action(1, fwd->cfg, &dctx,
                                                     POLICY_ACTION_ENCRYPT_L3,
                                                     pkt, &len, scratch, sizeof(scratch)) != 0) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"wire_len\":%u,\"policy\":%u,\"policy_count\":%d}",
+                     job->len, pol, fwd->cfg->policy_count);
+            ne_agent_debug_log("G", "dataplane_wan.c:decrypt_wan",
+                               "stage_l3_nonfrag_decrypt_failed", dj);
+        }
+        /* #endregion */
         return -1;
     }
     if (pending)
         return 1;
 
     if (frag_is_fragment_l4(fwd->cfg, pkt, len, &pid, &fidx)) {
-        if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, len, &pol) != 0)
+        if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, len, &pol) != 0) {
+            /* #region agent log */
+            ne_agent_debug_log("I", "dataplane_wan.c:decrypt_wan",
+                               "stage_l4_frag_policy_failed", "{}");
+            /* #endregion */
             return -1;
-        if (reassemble_l4(fwd, pkt, &len, pol, &pending) != 0)
+        }
+        if (reassemble_l4(fwd, pkt, &len, pol, &pending) != 0) {
+            /* #region agent log */
+            ne_agent_debug_log("I", "dataplane_wan.c:decrypt_wan",
+                               "stage_l4_frag_reassemble_failed", "{}");
+            /* #endregion */
             return -1;
+        }
     } else if (crypto_decrypt_packet_auto_by_action(1, fwd->cfg, &dctx,
                                                       POLICY_ACTION_ENCRYPT_L4,
                                                       pkt, &len, scratch,
                                                       sizeof(scratch)) != 0) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"wire_len\":%u,\"current_len\":%u,\"ip_proto\":%u}",
+                     job->len, len, len >= 24 ? pkt[23] : 0);
+            ne_agent_debug_log("I", "dataplane_wan.c:decrypt_wan",
+                               "stage_l4_auto_decrypt_failed", dj);
+        }
+        /* #endregion */
         return -1;
     }
     if (pending)
