@@ -46,22 +46,12 @@ static void gcm_perf_sample(const char *op, int len, uint64_t elapsed_ns)
 {
     static atomic_uint sample_n;
 
-    if ((atomic_fetch_add(&sample_n, 1) % 4096u) != 0)
+    if ((atomic_fetch_add(&sample_n, 1) % 8192u) != 0)
         return;
 
-    FILE *f = fopen("/var/log/network-encryptor.log", "a");
-    if (!f)
-        return;
-
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    long long ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-    fprintf(f,
-            "{\"sessionId\":\"0173da\",\"runId\":\"post-fix-gcm256\",\"timestamp\":%lld,"
-            "\"hypothesisId\":\"H-A\",\"location\":\"packet_crypto.c:gcm\",\"message\":\"%s\","
-            "\"data\":{\"aes_bits\":%d,\"path\":\"openssl\",\"len\":%d,\"ns\":%llu}}\n",
-            ms, op, g_aes_bits, len, (unsigned long long)elapsed_ns);
-    fclose(f);
+    fprintf(stderr, "[NE-GCM] %s aes_bits=%d len=%d ns=%llu path=openssl\n",
+            op, g_aes_bits, len, (unsigned long long)elapsed_ns);
+    fflush(stderr);
 }
 /* #endregion */
 

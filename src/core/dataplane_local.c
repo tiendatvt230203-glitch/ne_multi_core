@@ -32,16 +32,13 @@
     {
         struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
         if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap) {
-            /* #region agent log */
-            {
-                char dj[160];
-                snprintf(dj, sizeof(dj),
-                         "{\"wan_dp\":%d,\"ring_cnt\":%u,\"ring_cap\":%u,\"l1\":%u,\"l2\":%u}",
-                         wan_dp, ne_ring_count(tx), tx->cap, l1, l2);
-                ne_agent_debug_log("A", "dataplane_local.c:push_split_to_wan",
-                                   "ring_full_before_push2", dj);
-            }
-            /* #endregion */
+            char dj[160];
+            snprintf(dj, sizeof(dj),
+                     "{\"wan_dp\":%d,\"ring_cnt\":%u,\"ring_cap\":%u,\"l1\":%u,\"l2\":%u}",
+                     wan_dp, ne_ring_count(tx), tx->cap, l1, l2);
+            ne_agent_stat_inc(NE_STAT_RING_PUSH_FAIL);
+            ne_agent_drop_log("A", "dataplane_local.c:push_split_to_wan",
+                              "ring_full_before_push2", dj);
             return -1;
         }
         if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)
@@ -55,19 +52,18 @@
         job->dir = NE_DIR_WAN;
         job->wan_idx = (uint8_t)wan_dp;
         if (ne_ring_try_push2(tx, job, tail) != 0) {
+            char dj[128];
             ne_frame_free(&fwd->pair, tail->addr);
-            /* #region agent log */
-            {
-                char dj[128];
-                snprintf(dj, sizeof(dj),
-                         "{\"wan_dp\":%d,\"ring_cnt\":%u,\"ring_cap\":%u}",
-                         wan_dp, ne_ring_count(tx), tx->cap);
-                ne_agent_debug_log("A", "dataplane_local.c:push_split_to_wan",
-                                   "try_push2_failed", dj);
-            }
-            /* #endregion */
+            snprintf(dj, sizeof(dj),
+                     "{\"wan_dp\":%d,\"ring_cnt\":%u,\"ring_cap\":%u}",
+                     wan_dp, ne_ring_count(tx), tx->cap);
+            ne_agent_stat_inc(NE_STAT_RING_PUSH_FAIL);
+            ne_agent_drop_log("A", "dataplane_local.c:push_split_to_wan",
+                              "try_push2_failed", dj);
             return -1;
         }
+        ne_agent_stat_inc(NE_STAT_WIRE_FRAG_TX);
+        ne_agent_stat_inc(NE_STAT_WIRE_FRAG_TX);
         return 0;
     }
 
@@ -82,10 +78,9 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         got = ne_frame_alloc_batch(&fwd->pair, fwd->split_tail_cache[worker_idx],
                                    SPLIT_TAIL_REFILL_BATCH);
         if (got == 0) {
-            /* #region agent log */
-            ne_agent_debug_log("B", "dataplane_local.c:split_tail_take",
-                               "frame_pool_exhausted", "{\"worker\":0}");
-            /* #endregion */
+            ne_agent_stat_inc(NE_STAT_FRAME_POOL_FAIL);
+            ne_agent_drop_log("B", "dataplane_local.c:split_tail_take",
+                              "frame_pool_exhausted", "{\"worker\":0}");
             return -1;
         }
         fwd->split_tail_count[worker_idx] = (uint16_t)got;
@@ -97,7 +92,7 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
 }
 
     static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
-                            const struct crypto_policy *cp, int wan_dp,
+                            const struct crypto_policy *cp, int profile_idx, int wan_dp,
                             struct packet_crypto_ctx *pctx,
                             uint32_t src_ip, uint32_t dst_ip,
                             uint16_t src_port, uint16_t dst_port, uint8_t proto,
@@ -129,28 +124,26 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
             tail_buf = ne_packet_data(&fwd->pair, tail.addr);
             if (frag_split_and_encrypt_l2(pctx, pkt, len, fwd->pair.frame_size, &l1,
                                         tail_buf, fwd->pair.frame_size, &l2) != 0) {
-                /* #region agent log */
-                {
-                    char dj[160];
-                    snprintf(dj, sizeof(dj),
-                             "{\"plain_len\":%u,\"mode\":%d,\"frame_max\":%u}",
-                             len, packet_crypto_get_mode(), fwd->pair.frame_size);
-                    ne_agent_debug_log("L2", "dataplane_local.c:encrypt_to_wan",
-                                       "split_l2_failed", dj);
-                }
-                /* #endregion */
+                char dj[160];
+                snprintf(dj, sizeof(dj),
+                         "{\"plain_len\":%u,\"mode\":%d,\"frame_max\":%u}",
+                         len, packet_crypto_get_mode(), fwd->pair.frame_size);
+                ne_agent_stat_inc(NE_STAT_SPLIT_FAIL);
+                ne_agent_drop_log("L2", "dataplane_local.c:encrypt_to_wan",
+                                  "split_l2_failed", dj);
                 ne_frame_free(&fwd->pair, tail.addr);
                 return -1;
             }
-            /* #region agent log */
-            if (sn < 30 || (sn % 256 == 0)) {
-                char dj[128];
-                snprintf(dj, sizeof(dj), "{\"frag0_wire\":%u,\"frag1_wire\":%u,\"n\":%u}",
-                         l1, l2, sn);
-                ne_agent_debug_log("L2", "dataplane_local.c:encrypt_to_wan",
-                                   "split_l2_ok", dj);
+            ne_agent_stat_inc(NE_STAT_SPLIT_OK);
+            {
+                char det[160];
+                snprintf(det, sizeof(det),
+                         "path=SPLIT_L2 frag0_wire=%u frag1_wire=%u mtu=%u meta=%d",
+                         l1, l2, frag_get_mtu(), crypto_layer2_frag_meta_len());
+                ne_agent_policy_trace("LAN", "ENCRYPT_SPLIT", cp, profile_idx,
+                                      src_ip, dst_ip, src_port, dst_port, proto, len,
+                                      det, 0);
             }
-            /* #endregion */
         } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(len)) {
             static atomic_uint split_l3_n;
             uint32_t sn = atomic_fetch_add(&split_l3_n, 1);
@@ -226,6 +219,14 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
             if (n < 0)
                 return -1;
             job->len = (uint32_t)n;
+            ne_agent_stat_inc(NE_STAT_ENCRYPT_FULL);
+            {
+                char det[128];
+                snprintf(det, sizeof(det), "path=ENCRYPT_FULL wire_len=%d split=no", n);
+                ne_agent_policy_trace("LAN", "ENCRYPT_FULL", cp, profile_idx,
+                                      src_ip, dst_ip, src_port, dst_port, proto, len,
+                                      det, 0);
+            }
             return 0;
         }
         if (push_split_to_wan(fwd, job, l1, &tail, l2, wan_dp) != 0)
@@ -291,48 +292,88 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         mac_learn(fwd, li, pkt, job.len);
 
         if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                                &profile_idx, &cp) != 0)
+                                &profile_idx, &cp) != 0) {
+            char det[96];
+            snprintf(det, sizeof(det), "local_idx=%d flow_ok=%d", li, flow_ok);
+            ne_agent_stat_inc(NE_STAT_NO_POLICY_DROP);
+            ne_agent_policy_trace("LAN", "DROP_NO_POLICY", NULL, -1,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  det, 1);
             goto drop;
+        }
         wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                         src_port, dst_port, proto, job.len);
-        if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))
+        if (wan_dp < 0) {
+            ne_agent_policy_trace("LAN", "DROP_NO_WAN", cp, profile_idx,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  "wan_dp=-1 no route", 1);
             goto drop;
+        }
+        if (!fwd_wan_has_tx_room(fwd, wan_dp)) {
+            ne_agent_policy_trace("LAN", "DROP_WAN_TX_FULL", cp, profile_idx,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  "wan TX ring full", 1);
+            goto drop;
+        }
 
         if (cp->action == POLICY_ACTION_BYPASS) {
+            ne_agent_policy_trace("LAN", "BYPASS_FORWARD", cp, profile_idx,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  "policy action=BYPASS plaintext forward", 1);
+            ne_agent_stat_inc(NE_STAT_BYPASS_TX);
+            ne_agent_stat_inc(NE_STAT_WIRE_FRAG_TX);
             (void)push_to_wan(fwd, &job, wan_dp);
+            ne_agent_stat_maybe_dump();
             return;
         }
-        if (!fwd->cfg->crypto_enabled)
+        if (!fwd->cfg->crypto_enabled) {
+            ne_agent_policy_trace("LAN", "DROP_CRYPTO_DISABLED", cp, profile_idx,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  "cfg.crypto_enabled=0", 1);
             goto drop;
+        }
 
         pi = (int)(cp - fwd->cfg->policies);
-        if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
+        if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
+            char det[64];
+            snprintf(det, sizeof(det), "policy_idx=%d ready=%d",
+                     pi, (pi >= 0 && pi < MAX_CRYPTO_POLICIES) ? fwd_crypto_policy_ready(pi) : 0);
+            ne_agent_policy_trace("LAN", "DROP_POLICY_NOT_READY", cp, profile_idx,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  det, 1);
             goto drop;
+        }
         pctx = fwd_crypto_policy_ctx(pi);
-        if (!pctx)
+        if (!pctx) {
+            ne_agent_policy_trace("LAN", "DROP_NO_CRYPTO_CTX", cp, profile_idx,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  "fwd_crypto_policy_ctx NULL", 1);
             goto drop;
+        }
         pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
         pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
         crypto_apply_from_policy(cp);
-        enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
+        enc = encrypt_to_wan(fwd, &job, cp, profile_idx, wan_dp, pctx,
                             src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
         if (enc < 0) {
-            /* #region agent log */
-            {
-                char dj[192];
-                snprintf(dj, sizeof(dj),
-                         "{\"pkt_len\":%u,\"action\":%d,\"mode\":%d,\"wan_dp\":%d,"
-                         "\"need_split_l3\":%d}",
-                         job.len, cp->action, packet_crypto_get_mode(), wan_dp,
-                         (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(job.len)) ? 1 : 0);
-                ne_agent_debug_log("A", "dataplane_local.c:dataplane_process_local",
-                                   "encrypt_drop", dj);
-            }
-            /* #endregion */
+            char det[192];
+            snprintf(det, sizeof(det),
+                     "encrypt_failed action=%d mode=%s wan_dp=%d need_split_l2=%d",
+                     cp->action,
+                     cp->crypto_mode == CRYPTO_MODE_GCM ? "GCM" :
+                     (cp->crypto_mode == CRYPTO_MODE_CTR ? "CTR" : "PQC"),
+                     wan_dp,
+                     (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(job.len)) ? 1 : 0);
+            ne_agent_stat_inc(NE_STAT_ENCRYPT_DROP);
+            ne_agent_policy_trace("LAN", "DROP_ENCRYPT_FAIL", cp, profile_idx,
+                                  src_ip, dst_ip, src_port, dst_port, proto, job.len,
+                                  det, 1);
             goto drop;
         }
+        ne_agent_stat_maybe_dump();
         if (enc > 0)
             return;
+        ne_agent_stat_inc(NE_STAT_WIRE_FRAG_TX);
         (void)push_to_wan(fwd, &job, wan_dp);
         return;
 

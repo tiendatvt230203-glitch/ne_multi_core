@@ -183,7 +183,6 @@ static int frag_pick_slot_l2(struct frag_table *ft, uint16_t pkt_id, uint32_t fr
     if (oldest_idx >= 0) {
         struct frag_entry *oe = &ft->entries[oldest_idx];
         if (oe->got_first || oe->got_second) {
-            /* #region agent log */
             static atomic_uint evict_n;
             uint32_t en = atomic_fetch_add(&evict_n, 1);
             if (en < 30 || (en % 512 == 0)) {
@@ -194,7 +193,7 @@ static int frag_pick_slot_l2(struct frag_table *ft, uint16_t pkt_id, uint32_t fr
                 ne_agent_debug_log("L2", "fragment.c:frag_pick_slot_l2",
                                    "l2_slot_evicted", dj);
             }
-            /* #endregion */
+            ne_agent_stat_inc(NE_STAT_REASM_TIMEOUT);
         }
         return oldest_idx;
     }

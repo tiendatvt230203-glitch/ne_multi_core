@@ -170,6 +170,7 @@ static void *local_rx_thread(void *arg)
             int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
                                                  batch[i].len);
             if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
+                ne_agent_stat_inc(NE_STAT_RING_DROP_LOCAL);
                 ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
                                    ne_ring_count(&fwd->local_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
@@ -231,20 +232,15 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
-                /* #region agent log */
-                {
-                    static atomic_uint wan_ring_drop_n;
-                    uint32_t dn = atomic_fetch_add(&wan_ring_drop_n, 1);
-                    if (dn < 20 || (dn % 256 == 0)) {
-                        char dj[128];
-                        snprintf(dj, sizeof(dj),
-                                 "{\"wi\":%d,\"ring_cnt\":%u,\"n\":%u}",
-                                 wi, ne_ring_count(&fwd->wan_to_mid[wi]), dn);
-                        ne_agent_debug_log("L2", "forwarder.c:wan_rx_thread",
-                                           "wan_crypto_ring_drop", dj);
-                    }
-                }
-                /* #endregion */
+                char dj[128];
+                static atomic_uint wan_ring_drop_n;
+                uint32_t dn = atomic_fetch_add(&wan_ring_drop_n, 1);
+                snprintf(dj, sizeof(dj),
+                         "{\"wi\":%d,\"ring_cnt\":%u,\"n\":%u}",
+                         wi, ne_ring_count(&fwd->wan_to_mid[wi]), dn);
+                ne_agent_stat_inc(NE_STAT_RING_DROP_WAN_RX);
+                ne_agent_drop_log("L2", "forwarder.c:wan_rx_thread",
+                                  "wan_crypto_ring_drop", dj);
                 ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
                                    ne_ring_count(&fwd->wan_to_mid[wi]));
                 ne_frame_free(&fwd->pair, batch[i].addr);
