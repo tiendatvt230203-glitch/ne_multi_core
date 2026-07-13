@@ -172,6 +172,33 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     return (int)(l2_enc_start + payload_len);
 }
 
+static inline int l2_wire_frag_tag_off(int nonce_size) {
+    return l2_frag_magic_offset(nonce_size) + 1;
+}
+
+int crypto_layer2_has_wire_frag_marker(const uint8_t *packet, uint32_t pkt_len)
+{
+    int ns = PACKET_CRYPTO_NONCE_BYTES;
+    int mark = l2_frag_magic_offset(ns);
+    int tag = l2_wire_frag_tag_off(ns);
+    uint16_t fake;
+
+    if (!packet || pkt_len < (uint32_t)(tag + CRYPTO_L2_FRAG_TAG_SIZE))
+        return 0;
+    fake = packet_crypto_get_fake_ethertype_ipv4();
+    if (!fake)
+        return 0;
+    if ((((uint16_t)packet[12] << 8) | packet[13]) != fake)
+        return 0;
+    if (packet[mark] != L2_FRAG_MAGIC)
+        return 0;
+    if (packet[tag + 2] > 1)
+        return 0;
+    if (packet[tag + 3] != 0)
+        return 0;
+    return 1;
+}
+
 int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
     if (unlikely(!ctx || !ctx->initialized || !packet))
         return -1;
@@ -184,8 +211,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (!l2_has_fake_ethertype(packet))
         return (int)pkt_len;
 
-    if (pkt_len >= (size_t)(l2_frag_magic_offset(wire_ns) + 1) &&
-        packet[l2_frag_magic_offset(wire_ns)] == L2_FRAG_MAGIC)
+    if (crypto_layer2_has_wire_frag_marker(packet, (uint32_t)pkt_len))
         return (int)pkt_len;
 
     if (crypto_mode_is_pqc()) {
@@ -392,7 +418,7 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
     if (pkt_len < (size_t)enc_off || !l2_has_fake_ethertype(packet))
         return -1;
-    if (packet[l2_frag_magic_offset(wire_ns)] != L2_FRAG_MAGIC)
+    if (!crypto_layer2_has_wire_frag_marker(packet, (uint32_t)pkt_len))
         return -1;
 
     l2_read_frag_tag(packet + l2_frag_magic_offset(wire_ns) + 1,

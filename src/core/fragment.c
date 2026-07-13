@@ -8,7 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-// 
+
 static atomic_uint_fast32_t g_pkt_id_counter = 0;
 
 uint16_t frag_next_pkt_id(void) {
@@ -83,6 +83,32 @@ static int frag_store_second(struct frag_entry *entry, uint16_t pkt_id,
     memcpy(entry->second, data, data_len);
     entry->got_second = 1;
     return 0;
+}
+
+static int frag_l2_entry_live(const struct frag_entry *e, uint64_t now)
+{
+    if (!e->got_first && !e->got_second)
+        return 0;
+    if ((now - e->timestamp_ns) > FRAG_TIMEOUT_NS)
+        return 0;
+    return 1;
+}
+
+static struct frag_entry *frag_l2_acquire(struct frag_table *ft, uint16_t pkt_id,
+                                          uint64_t now)
+{
+    int base = pkt_id % FRAG_TABLE_SIZE;
+
+    for (int step = 0; step < FRAG_TABLE_SIZE; step++) {
+        int idx = (base + step) % FRAG_TABLE_SIZE;
+        struct frag_entry *e = &ft->entries[idx];
+
+        if (!frag_l2_entry_live(e, now))
+            return e;
+        if (e->pkt_id == pkt_id)
+            return e;
+    }
+    return NULL;
 }
 
 static int frag_emit_join(struct frag_entry *entry, uint8_t *out_buf, uint32_t *out_len, int eth_len) {
@@ -333,7 +359,7 @@ int frag_is_fragment_l2(const struct app_config *cfg,
         return 0;
 
     /* Non-frag L2 crypto hits this on every WAN packet — bail before policy scan. */
-    if (pkt_data[tag_off] != CRYPTO_L2_FRAG_MAGIC)
+    if (!crypto_layer2_has_wire_frag_marker(pkt_data, pkt_len))
         return 0;
 
     wire_pol = pkt_data[CRYPTO_L2_POLICY_OFF];
@@ -362,9 +388,11 @@ int frag_try_reassemble_l2(struct frag_table *ft,
     const uint8_t *inner = pkt_data + wire_eth;
     uint32_t inner_len = pkt_len - (uint32_t)wire_eth;
 
-    int idx = pkt_id % FRAG_TABLE_SIZE;
-    struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
+    struct frag_entry *entry = frag_l2_acquire(ft, pkt_id, now);
+
+    if (!entry)
+        return -1;
 
     if (frag_index == 0) {
         if (inner_len < 20 || (inner[0] >> 4) != 4)

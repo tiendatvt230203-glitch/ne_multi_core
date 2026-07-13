@@ -198,7 +198,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 
         wan_apply_l2_policy(fwd, pkt);
         if (len > (uint32_t)mark_off)
-            frag_mark = (pkt[mark_off] == CRYPTO_L2_FRAG_MAGIC);
+            frag_mark = crypto_layer2_has_wire_frag_marker(pkt, len);
 
         int need_backup = frag_mark ||
             frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx);

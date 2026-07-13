@@ -1,16 +1,22 @@
 CC     = gcc
 CLANG  = clang
 
-# frag_table x MAX_PROFILES x NE_CRYPTO_WORKERS exceeds ~2GiB .bss; medium model
-# avoids "relocation truncated to fit: R_X86_64_PC32 against .bss" at link time.
+# -mcmodel=medium: frag_table x profiles x workers exceeds default .bss relocation limit
 CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 -mcmodel=medium $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
-LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
+
+XDP_LIB_FILE := $(shell find ./lib -name "libxdp.so*" | head -n 1)
+ifeq ($(XDP_LIB_FILE),)
+    XDP_LINK_FLAGS := -lxdp
+else
+    XDP_LINK_FLAGS := $(XDP_LIB_FILE)
+endif
+
+LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/lib' $(XDP_LINK_FLAGS) -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
 BPF_CFLAGS     = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
 
-BIN_DIR = bin
-TARGET  = $(BIN_DIR)/network-encryptor
+TARGET  = network-encryptor
 
 APP_SRC = main.c \
           src/core/main_diag.c \
@@ -50,12 +56,9 @@ BPF_SRC = bpf/xdp_redirect.c \
 BPF_OBJ = bpf/xdp_redirect.o \
           bpf/xdp_wan_redirect.o
 
-.PHONY: all clean dirs
+.PHONY: all clean
 
-all: dirs $(BPF_OBJ) $(TARGET)
-
-dirs:
-	@mkdir -p $(BIN_DIR)
+all: $(BPF_OBJ) $(TARGET)
 
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
@@ -67,4 +70,4 @@ bpf/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)
+	rm -f $(TARGET) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)

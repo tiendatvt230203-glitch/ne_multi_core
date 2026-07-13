@@ -36,4 +36,7 @@ int crypto_layer2_decrypt_fragment(struct packet_crypto_ctx *ctx,
     uint8_t *packet, size_t pkt_len,
     uint16_t *out_pkt_id, uint8_t *out_frag_index);
 
+/* True only for wire L2 fragment layout (magic + valid 4-byte frag tag). */
+int crypto_layer2_has_wire_frag_marker(const uint8_t *packet, uint32_t pkt_len);
+
 #endif
