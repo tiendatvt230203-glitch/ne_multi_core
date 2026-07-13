@@ -7,7 +7,40 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <stdatomic.h>
+
+/* #region agent log */
+#define NE_AGENT_DEBUG_LOG_PATH "/var/log/network-encryptor.log"
+#define NE_AGENT_DEBUG_MAX 800
+
+void ne_agent_debug_log(const char *hypothesis_id, const char *location,
+                        const char *message, const char *data_json)
+{
+    static atomic_uint log_n;
+
+    if (!hypothesis_id || !location || !message)
+        return;
+    if (atomic_fetch_add(&log_n, 1) >= NE_AGENT_DEBUG_MAX)
+        return;
+
+    FILE *f = fopen(NE_AGENT_DEBUG_LOG_PATH, "a");
+    if (!f)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long long ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    fprintf(f,
+            "{\"sessionId\":\"0173da\",\"timestamp\":%lld,\"hypothesisId\":\"%s\","
+            "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s}\n",
+            ms, hypothesis_id, location, message,
+            data_json ? data_json : "{}");
+    fclose(f);
+}
+/* #endregion */
 
 int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
                   uint32_t *src_ip, uint32_t *dst_ip,

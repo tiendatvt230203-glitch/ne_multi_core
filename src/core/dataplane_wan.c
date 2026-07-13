@@ -15,6 +15,8 @@
 #include "../../inc/core/mac_learn.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdatomic.h>
 
 static const struct crypto_policy *fwd_l2_policy_by_wire_id(struct forwarder *fwd, uint8_t wire_id)
 {
@@ -148,15 +150,48 @@ static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     if (slot < 0)
         return -1;
     nd = crypto_layer3_decrypt_fragment(ctx, pkt, *len, &opid, &ofidx);
-    if (nd < 0)
+    if (nd < 0) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"wire_len\":%u,\"mode\":%d,\"policy\":%u}",
+                     *len, packet_crypto_get_mode(), policy_id);
+            ne_agent_debug_log("D", "dataplane_wan.c:reassemble_l3",
+                               "decrypt_frag_failed", dj);
+        }
+        /* #endregion */
         return -1;
+    }
     rr = frag_try_reassemble(fwd_crypto_frag_l3(slot), pkt, (uint32_t)nd, opid, ofidx, buf, &blen);
     if (rr == 0) {
+        static atomic_uint pend_n;
+        uint32_t pn = atomic_fetch_add(&pend_n, 1);
+        /* #region agent log */
+        if (pn < 30 || (pn % 128 == 0)) {
+            char dj[96];
+            snprintf(dj, sizeof(dj), "{\"pkt_id\":%u,\"frag_idx\":%u,\"n\":%u}",
+                     opid, ofidx, pn);
+            ne_agent_debug_log("C", "dataplane_wan.c:reassemble_l3",
+                               "frag_pending", dj);
+        }
+        /* #endregion */
         *pending = 1;
         return 0;
     }
-    if (rr != 1)
+    if (rr != 1) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj),
+                     "{\"pkt_id\":%u,\"frag_idx\":%u,\"rr\":%d,\"nd\":%d}",
+                     opid, ofidx, rr, nd);
+            ne_agent_debug_log("C", "dataplane_wan.c:reassemble_l3",
+                               "reassemble_failed", dj);
+        }
+        /* #endregion */
         return -1;
+    }
     memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
@@ -475,8 +510,18 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         ne_frame_free(&fwd->pair, job.addr);
         return;
     }
-    if (dec != 0)
+    if (dec != 0) {
+        /* #region agent log */
+        {
+            char dj[128];
+            snprintf(dj, sizeof(dj), "{\"wire_len\":%u,\"dec\":%d,\"mode\":%d}",
+                     wire_len, dec, packet_crypto_get_mode());
+            ne_agent_debug_log("C", "dataplane_wan.c:dataplane_process_wan",
+                               "wan_decrypt_drop", dj);
+        }
+        /* #endregion */
         goto drop;
+    }
 
     if (forward_wan_to_local(fwd, &job, wire_buf, wire_len) != 0)
         goto drop;
